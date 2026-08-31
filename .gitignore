@@ -2,3 +2,4 @@ msi-picasso.egg-info/
 __pycache__/
 target/
 catboost_info/
+.rawquery_cache/
