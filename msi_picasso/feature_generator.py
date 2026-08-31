@@ -234,6 +234,22 @@ MOB_QUALITY_FEATURES = [
     "mob_peak_snr",
 ]
 
+# Mass-normalized isotope-envelope features (PROGRESS.md H-decoy-7a): theo_isotope_kl and
+# siblings build the theoretical envelope from the candidate's OWN mass, which leaks under
+# mz_shuffle because the derangement deliberately places a decoy far away in mass from its
+# assigned feature (F-020, Spearman 0.70-0.80 with the construction mass gap). These
+# variants rescale the candidate's elemental composition to the mass IMPLIED BY THE ASSIGNED
+# FEATURE before building the theoretical envelope, removing the raw mass confound while
+# retaining whatever composition-type signal remains. Experimental: may prove
+# symmetric-but-uninformative like MOB_QUALITY_FEATURES rather than genuinely discriminative
+# — kept OUT of MALDI_INTRINSIC_FEATURES and gated to mz_shuffle only in pipeline.py, mirroring
+# how MOB_QUALITY_FEATURES is gated to _MOB_QUALITY_DEFAULT_DECOYS.
+MZ_SHUFFLE_MASSNORM_ISOTOPE_FEATURES = [
+    "theo_isotope_kl_massnorm",
+    "theo_m1_ratio_diff_massnorm",
+    "theo_m2_ratio_diff_massnorm",
+]
+
 # Alias kept separate so LDA-specific feature selection can diverge later.
 LDA_FEATURES = MALDI_INTRINSIC_FEATURES
 
@@ -293,6 +309,13 @@ FEATURE_NAN_FILL: dict[str, float | str] = {
     "mob_peak_snr": "col_min",        # no peak → lowest observed signal contrast
     "mob_k0_spread": "col_max",       # no peak → widest (worst) mobility spread
     "mob_mz_spread_ppm": "col_max",   # no peak → widest (worst) m/z spread
+    # Mass-normalized isotope envelope (H-decoy-7a): no observed envelope at the assigned
+    # feature → worst-case, matching theo_m1_ratio_diff/theo_m2_ratio_diff's existing
+    # col_max treatment. theo_isotope_kl_massnorm defaults to 0.0 (perfect match) when no
+    # envelope exists, same as the unnormalized theo_isotope_kl -- that is a pre-existing
+    # asymmetry in the original feature, not introduced here.
+    "theo_m1_ratio_diff_massnorm": "col_max",
+    "theo_m2_ratio_diff_massnorm": "col_max",
 }
 
 # ---------------------------------------------------------------------------

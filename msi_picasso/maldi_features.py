@@ -15,7 +15,7 @@ import pandas as pd
 
 from msi_picasso.utils import (
     AVERAGINE_C, AVERAGINE_H, AVERAGINE_N, AVERAGINE_O,
-    NEUTRON, theoretical_isotope_distribution,
+    NEUTRON, PROTON, theoretical_isotope_distribution,
 )
 
 logger = logging.getLogger(__name__)
@@ -1060,6 +1060,71 @@ def compute_theoretical_isotope_features(
     df["theo_m1_ratio_diff"] = theo_m1_diff
     df["theo_m2_ratio_diff"] = theo_m2_diff
     df["monoisotopic_confidence"] = mono_conf
+
+    # --- Mass-normalized variant, for mz_shuffle only (PROGRESS.md H-decoy-7a) ---
+    #
+    # theo_isotope_kl above leaks under mz_shuffle (F-020, Spearman 0.70-0.80 with the
+    # derangement's construction mass gap): it builds the theoretical envelope from the
+    # candidate's OWN mass, then compares it to the observed envelope at the assigned
+    # feature, which mz_shuffle deliberately places far away in mass. Since isotope shape
+    # scales with mass, that comparison is dominated by the raw mass mismatch rather than
+    # by any chemical evidence.
+    #
+    # Here the candidate's elemental composition is rescaled (n_C, n_H, n_N, n_O, n_S all
+    # scaled by the same factor) so its THEORETICAL envelope is built for the mass IMPLIED
+    # BY THE FEATURE it is placed on, not its own mass. For a co-located mz_shuffle pair,
+    # feature_mz is shared, so the scale factor differs between the target and decoy only
+    # through their own composition-to-mass ratio -- the raw mass confound is removed while
+    # whatever composition-type signal remains (sulfur content, C:H:N:O ratio) is kept. This
+    # is a genuinely new, more experimental feature, not a drop-in fix: it may turn out to be
+    # symmetric-but-uninformative (AUC ~0.5, like the intrinsic mob_* family) rather than
+    # informative. Measure before trusting; see PROGRESS.md H-decoy-7 for the readout.
+    theo_kl_mn = np.zeros(n)
+    theo_m1_diff_mn = np.full(n, np.nan)
+    theo_m2_diff_mn = np.full(n, np.nan)
+
+    if maldi_envelopes:
+        implied_mass = feature_mzs - PROTON  # charge 1, standard for MALDI singly-protonated ions
+        own_mass = pep_mass
+        safe_own_mass = np.where(own_mass > 0, own_mass, 1.0)
+        scale = np.clip(implied_mass / safe_own_mass, 0.05, 20.0)  # guard against divide-by-~0
+
+        nc_mn = np.round(comp_arr[:, 0] * scale).astype(int)
+        nh_mn = np.round(comp_arr[:, 1] * scale).astype(int)
+        nn_mn = np.round(comp_arr[:, 2] * scale).astype(int)
+        no_mn = np.round(comp_arr[:, 3] * scale).astype(int)
+        ns_mn = np.round(comp_arr[:, 4] * scale).astype(int)
+        mn_comps = list(zip(
+            np.clip(nc_mn, 0, None).tolist(), np.clip(nh_mn, 0, None).tolist(),
+            np.clip(nn_mn, 0, None).tolist(), np.clip(no_mn, 0, None).tolist(),
+            np.clip(ns_mn, 0, None).tolist(),
+        ))
+        unique_mn = set(mn_comps)
+        mn_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in unique_mn}
+        mn_dist = np.array([mn_cache[k] for k in mn_comps])  # (n, 3)
+        mn_m0, mn_m1, mn_m2 = mn_dist[:, 0], mn_dist[:, 1], mn_dist[:, 2]
+        norm_mn = np.sqrt(mn_m0**2 + mn_m1**2 + mn_m2**2)
+
+        for i in range(n):
+            maldi_env = maldi_envelopes.get(feature_mzs[i])
+            if maldi_env is None or len(maldi_env) < 3:
+                continue
+            obs = np.array(maldi_env[:3], dtype=np.float64)
+            obs_s = obs.sum()
+            if obs_s <= 0:
+                continue
+            obs_norm = obs / obs_s
+            t = np.array([mn_m0[i], mn_m1[i], mn_m2[i]])
+            theo_safe = np.clip(t, 1e-10, None)
+            obs_safe = np.clip(obs_norm, 1e-10, None)
+            theo_kl_mn[i] = np.sum(obs_safe * np.log(obs_safe / theo_safe))
+            if obs[0] > 0 and t[0] > 0:
+                theo_m1_diff_mn[i] = abs(obs[1] / obs[0] - t[1] / t[0])
+                theo_m2_diff_mn[i] = abs(obs[2] / obs[0] - t[2] / t[0])
+
+    df["theo_isotope_kl_massnorm"] = theo_kl_mn
+    df["theo_m1_ratio_diff_massnorm"] = theo_m1_diff_mn
+    df["theo_m2_ratio_diff_massnorm"] = theo_m2_diff_mn
 
     logger.info(f"Theoretical isotope features: {(theo_cosine > 0).sum()}/{n} scored")
     return df

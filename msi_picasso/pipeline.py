@@ -24,6 +24,7 @@ from msi_picasso.feature_generator import (
     MAIN_FEATURES,
     MALDI_INTRINSIC_FEATURES,
     MOB_QUALITY_FEATURES,
+    MZ_SHUFFLE_MASSNORM_ISOTOPE_FEATURES,
     REGION_COLOCALIZATION_FEATURES,
     WITHIN_REGION_COLOCALIZATION_FEATURES,
     PROTEIN_LEVEL_FEATURES,
@@ -2892,6 +2893,20 @@ def rescore(
         logger.info(
             f"  2D peak-quality features enabled ({len(MOB_QUALITY_FEATURES)} features) "
             f"with decoy_method='{decoy_method}'"
+        )
+    # Mass-normalized isotope-envelope features (H-decoy-7a): the safe replacement for
+    # theo_isotope_kl/theo_m1_ratio_diff/theo_m2_ratio_diff, which F-020 found leak the
+    # mz_shuffle construction mass gap and are excluded under mz_shuffle by
+    # _mz_shuffle_leaking_features. Gated to mz_shuffle only -- other decoy methods already
+    # have a working, non-leaking theo_isotope_kl and do not need this experimental variant.
+    if decoy_method == "mz_shuffle" and any(
+        f in features_df.columns for f in MZ_SHUFFLE_MASSNORM_ISOTOPE_FEATURES
+    ):
+        _pool += MZ_SHUFFLE_MASSNORM_ISOTOPE_FEATURES
+        logger.info(
+            f"  Mass-normalized isotope-envelope features enabled "
+            f"({len(MZ_SHUFFLE_MASSNORM_ISOTOPE_FEATURES)} features) with "
+            f"decoy_method='{decoy_method}' (H-decoy-7a)"
         )
     _seen: set[str] = set()
     _intrinsic_pool = [
