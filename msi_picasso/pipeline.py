@@ -64,7 +64,30 @@ _MOB_QUALITY_DEFAULT_DECOYS = frozenset(["substitution", "mz_shuffle"])
 # Features that use the candidate's PREDICTED CCS/mobility to gate or compare against
 # the observed feature. For mz_shuffle (peptide relocated far in mass; CCS/1-K0 ∝ m/z)
 # these leak the m/z baseline rather than testing identity, so they are dropped from
-# the ranker — the m/z-detrended *_resid CCS features replace them.
+# the ranker.
+#
+# This used to be an enumerated list covering only the isotope_*_mob and adduct_*_mob
+# families, and it went stale: PROGRESS.md F-016 measured protein_colocalization_mob_max at
+# target/decoy AUC 0.0003 on kidney E005 (top-importance ranker feature, 5070/5070 targets
+# passing at 1% FDR), plus fraction_detected_mob, log_mean_intensity_mob, spatial_morans_i_mob
+# and intensity_cv_mob at 0.001-0.010. Mechanism: a mz_shuffle decoy keeps its own predicted
+# CCS but sits on a feature at an unrelated m/z, so the predicted 1/K0 gate selects an empty
+# slice and every mobility-gated column becomes a label proxy by construction.
+#
+# The same measurement also refutes the old "keep only the m/z-detrended *_resid CCS
+# features" rule: im2deep_ccs_rank_resid and im2deep_abs_delta_ccs_pct_resid measured AUC
+# 0.76-0.86. Detrending removes a linear m/z trend, but CCS-vs-m/z is not linear and
+# mz_shuffle relocates decoys far enough in mass that the residual still carries the baseline.
+#
+# So the rule is now BY CONSTRUCTION rather than by enumeration: under mz_shuffle, exclude
+# every column that is either mobility-gated or derived from predicted CCS. Matching on
+# suffix/prefix means a newly added mobility-gated feature is covered on the day it is added,
+# which an explicit list demonstrably does not achieve.
+_MZ_SHUFFLE_LEAK_SUFFIXES = ("_mob", "_mob_max", "_mob_n_partners")
+_MZ_SHUFFLE_LEAK_PREFIXES = ("im2deep_",)
+
+# Retained only as a documented floor, so the by-construction rule can be asserted to be a
+# superset of what was previously excluded. Not used for matching.
 _MZ_SHUFFLE_CCS_LEAK_FEATURES = frozenset([
     "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
     "im2deep_ccs_zscore", "im2deep_ccs_rank",
@@ -73,6 +96,19 @@ _MZ_SHUFFLE_CCS_LEAK_FEATURES = frozenset([
     "adduct_colocalization_na_mob", "adduct_colocalization_k_mob",
     "adduct_colocalization_chca_mob",
 ])
+
+
+def _mz_shuffle_leaking_features(columns) -> set[str]:
+    """Columns that leak the m/z baseline under ``mz_shuffle`` decoys.
+
+    Any mobility-gated column (a predicted-1/K0 gate applied to a decoy sitting on an
+    unrelated m/z selects an empty slice) or any predicted-CCS-derived column, ``*_resid``
+    variants included. See the module comment above and PROGRESS.md F-016.
+    """
+    return {
+        c for c in columns
+        if c.endswith(_MZ_SHUFFLE_LEAK_SUFFIXES) or c.startswith(_MZ_SHUFFLE_LEAK_PREFIXES)
+    }
 
 
 def _resolve_spatial_ranker_features(
@@ -2653,12 +2689,17 @@ def rescore(
     # applies, and reused (not recomputed) when assembling the pool.
     _exclude_set = set(features_exclude or [])
     if decoy_method == "mz_shuffle":
-        _ccs_mz_leak_feats = set(_MZ_SHUFFLE_CCS_LEAK_FEATURES)
+        _ccs_mz_leak_feats = _mz_shuffle_leaking_features(features_df.columns)
+        # The by-construction rule must never exclude less than the old explicit list did.
+        _missed = (_MZ_SHUFFLE_CCS_LEAK_FEATURES & set(features_df.columns)) - _ccs_mz_leak_feats
+        assert not _missed, f"mz_shuffle leak guard regressed; missed {sorted(_missed)}"
         if _ccs_mz_leak_feats - _exclude_set:
             logger.info(
-                "  decoy_method='mz_shuffle': excluding raw CCS + mobility-gated "
-                "colocalization features from the ranker (they leak the m/z baseline); "
-                "keeping only the m/z-detrended *_resid CCS features."
+                "  decoy_method='mz_shuffle': excluding %d mobility-gated and predicted-CCS "
+                "features from the ranker (they leak the m/z baseline, PROGRESS.md F-016). "
+                "The *_resid CCS variants are excluded too: detrending does NOT make them "
+                "safe (measured AUC 0.76-0.86). Excluded: %s",
+                len(_ccs_mz_leak_feats), sorted(_ccs_mz_leak_feats),
             )
         _exclude_set |= _ccs_mz_leak_feats
     if _exclude_set:
