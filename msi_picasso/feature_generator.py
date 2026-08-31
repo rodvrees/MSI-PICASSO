@@ -15,6 +15,7 @@ from psm_utils.peptidoform import Peptidoform
 
 from msi_picasso.maldi_features import (
     _pearson_r_matrix,
+    _median_thresholded_cosine_matrix,
     compute_tissue_mask,
     compute_region_colocalization_features,
     compute_within_region_colocalization_features,
@@ -23,6 +24,7 @@ from msi_picasso.maldi_features import (
     compute_candidate_ambiguity_features,
     compute_chca_cluster_features,
     compute_colocalization_features,
+    compute_cosine_colocalization_features,
     compute_im2deep_features,
     compute_lcms_ccs_features,
     compute_isotopologue_colocalization,
@@ -132,6 +134,21 @@ PROTEIN_LEVEL_FEATURES = [
 # Appended to the ranker pool at runtime in pipeline.py when the flag is set.
 REGION_COLOCALIZATION_FEATURES = [
     "protein_region_colocalization",
+]
+
+# Median-thresholded cosine colocalization (opt-in via --cosine-coloc, requires
+# ion_images). Ovchinnikova et al. (2020, ColocML): median-thresholded cosine
+# similarity of raw ion images, validated at Spearman 0.794 against 42 expert
+# raters (matching a trained deep model), as a replacement for the
+# Pearson-plus-TIC-mask colocalization above (PROGRESS.md H-feat-3 / H-decoy-9).
+# Takes only the observed ion images -- no candidate mass or composition -- so it
+# is safe by construction under every decoy method, mz_shuffle included: there is
+# no F-020-style leak vector to audit for. Protein-level, so valid only because
+# decoys occupy a separate protein namespace (see PROTEIN_LEVEL_FEATURES above).
+COSINE_COLOCALIZATION_FEATURES = [
+    "protein_colocalization_cosine",
+    "protein_colocalization_cosine_max",
+    "protein_colocalization_cosine_median",
 ]
 
 # Within-region and dominant-region Pearson-r colocalization (opt-in via
@@ -432,6 +449,7 @@ def compute_all_features(
     region_coloc_debug: dict | None = None,
     within_region_coloc: bool = False,
     within_region_coloc_debug: dict | None = None,
+    cosine_coloc: bool = False,
 ) -> pd.DataFrame:
     """
     Compute all features on the candidate DataFrame.
@@ -578,6 +596,9 @@ def compute_all_features(
         else:
             protein_corr_cache = corr_cache
         df = compute_colocalization_features(df, ion_images, ion_image_mzs, _corr_cache=protein_corr_cache)
+        if cosine_coloc:
+            cosine_corr_cache = _median_thresholded_cosine_matrix(ion_images, ion_image_mzs, pixel_mask=pixel_mask)
+            df = compute_cosine_colocalization_features(df, ion_images, ion_image_mzs, _corr_cache=cosine_corr_cache)
         df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images, pixel_mask=pixel_mask)  # E1
         df = compute_adduct_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images, pixel_mask=pixel_mask)        # E2
         df = compute_spatial_autocorrelation_full(df, ion_images, ion_image_mzs)                         # E5/E6

@@ -1311,6 +1311,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--cosine-coloc",
+        action="store_true",
+        default=None,
+        help=(
+            "Compute median-thresholded cosine within-protein colocalization features "
+            "(protein_colocalization_cosine*; PROGRESS.md H-feat-3/H-decoy-9). Each on-tissue "
+            "ion image is thresholded at its own median, then compared by cosine similarity — "
+            "Ovchinnikova et al. 2020 (ColocML) validated this at Spearman 0.794 against 42 "
+            "expert raters, matching a trained deep model. Takes only the observed ion images, "
+            "so it is safe by construction under every decoy method including mz_shuffle. "
+            "Requires ion images; protein-level, so also needs --use-protein-level-feats. "
+            "Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
         "--coloc-tic-normalize",
         action="store_true",
         default=None,
@@ -1501,7 +1516,7 @@ def main() -> None:
         "only_main_features", "use_protein_level_feats", "match_ccs",
         "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc", "mob_protein_coloc",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
-        "region_coloc", "within_region_coloc", "coloc_tic_normalize", "coloc_common_mode",
+        "region_coloc", "within_region_coloc", "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
         "substitution_no_collision_filter",
     })
 
@@ -1529,7 +1544,7 @@ def main() -> None:
         "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_protein_coloc", "mob_window_multiplier",
         "mob_quality_mz_window_ppm", "mob_quality_k0_tol",
         "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
-        "coloc_tic_normalize", "coloc_common_mode",
+        "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
         "calibration_percentile", "maldi_query_raw", "raw_query_cache_dir",
@@ -2007,6 +2022,7 @@ def main() -> None:
         region_coloc=bool(_ms1cfg.get("region_coloc", False)),
         region_coloc_k=_ms1cfg["region_coloc_k"],
         within_region_coloc=bool(_ms1cfg.get("within_region_coloc", False)),
+        cosine_coloc=bool(_ms1cfg.get("cosine_coloc", False)),
         drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),
         entrapment=bool(_ms1cfg.get("entrapment", False)),
         substitution_n_residues=_ms1cfg["substitution_n_residues"],

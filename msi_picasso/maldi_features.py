@@ -369,6 +369,57 @@ def _pearson_r_matrix(
     return corr_matrix, valid_mz_arr, mz_to_idx
 
 
+def _median_thresholded_cosine_matrix(
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Full (n_valid x n_valid) median-thresholded cosine similarity matrix
+    (Ovchinnikova et al. 2020, ColocML — median-thresholded cosine scored
+    Spearman 0.794 against 42 expert raters, matching a trained deep model
+    with a one-line metric; see PROGRESS.md H-feat-3).
+
+    Each on-tissue image is thresholded at its OWN median (values <= the
+    image's median are zeroed, keeping only its above-median signal), then
+    L2-normalised; the pairwise similarity is the cosine of the thresholded
+    vectors. This asks whether two images' *bright regions* overlap, which is
+    a different (and per Ovchinnikova et al., better-validated) question than
+    Pearson r's "do the raw intensities co-vary everywhere".
+
+    Contract matches ``_pearson_r_matrix`` exactly so it plugs directly into
+    ``_aggregate_protein_pairwise_corr``. Takes only the observed ion images —
+    no candidate mass, composition, or ``is_decoy`` — so it is safe by
+    construction under every decoy method, including ``mz_shuffle`` (no
+    F-020-style construction-leak vector exists for it to be audited for).
+    """
+    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
+    n_feat = len(mz_arr)
+    n_pix = ion_images.shape[1] * ion_images.shape[2]
+
+    flat_all = ion_images.reshape(n_feat, n_pix)
+    if pixel_mask is not None:
+        flat_all = flat_all[:, np.asarray(pixel_mask, dtype=bool)]
+
+    X = flat_all.astype(np.float32, copy=True)
+    medians = np.median(X, axis=1, keepdims=True)
+    X[X <= medians] = 0.0
+
+    stds = X.std(axis=1)
+    valid_mask = stds > 1e-10
+    valid_mz_arr = mz_arr[valid_mask]
+
+    X = X[valid_mask]
+    norms = np.sqrt((X * X).sum(axis=1, keepdims=True))
+    X /= np.where(norms > 1e-10, norms, 1.0)
+
+    cos_matrix = X @ X.T
+    del X
+
+    mz_to_idx = {float(mz): i for i, mz in enumerate(valid_mz_arr)}
+    return cos_matrix, valid_mz_arr, mz_to_idx
+
+
 def _find_partner_indices(
     source_mzs: np.ndarray,
     targets: np.ndarray,
@@ -603,6 +654,46 @@ def _aggregate_protein_pairwise_corr(
     for col in cols:
         df[col] = df[col].fillna(fill_value)
     return df
+
+
+_COSINE_COLOC_COLS = [
+    "protein_colocalization_cosine",
+    "protein_colocalization_cosine_max",
+    "protein_colocalization_cosine_median",
+]
+
+
+def compute_cosine_colocalization_features(
+    df: pd.DataFrame,
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+    _corr_cache: tuple | None = None,
+) -> pd.DataFrame:
+    """Within-protein median-thresholded cosine colocalization (opt-in, ``--cosine-coloc``).
+
+    Mirrors ``compute_colocalization_features`` but the pairwise quantity is
+    the median-thresholded cosine similarity of the raw ion images (see
+    ``_median_thresholded_cosine_matrix``) instead of Pearson r. Ovchinnikova
+    et al. (2020, ColocML) validated this metric against 42 expert raters
+    (Spearman 0.794, matching a trained deep model) as a replacement for
+    Pearson-plus-TIC-mask colocalization (PROGRESS.md H-feat-3).
+
+    Features added: ``protein_colocalization_cosine`` (mean), ``_max``,
+    ``_median`` — the within-protein mean/max/median pairwise cosine
+    similarity. Pass ``_corr_cache`` (the return of
+    ``_median_thresholded_cosine_matrix``) to reuse one already computed for
+    the same ion images.
+    """
+    if _corr_cache is not None:
+        cos_matrix, valid_mz_arr, mz_to_idx = _corr_cache
+    else:
+        cos_matrix, valid_mz_arr, mz_to_idx = _median_thresholded_cosine_matrix(
+            ion_images, ion_image_mzs, pixel_mask=pixel_mask,
+        )
+    return _aggregate_protein_pairwise_corr(
+        df, cos_matrix, valid_mz_arr, mz_to_idx, "protein_colocalization_cosine",
+    )
 
 
 def _region_profile_corr_matrix(

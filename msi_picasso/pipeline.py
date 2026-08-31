@@ -25,6 +25,7 @@ from msi_picasso.feature_generator import (
     MALDI_INTRINSIC_FEATURES,
     MOB_QUALITY_FEATURES,
     MZ_SHUFFLE_MASSNORM_ISOTOPE_FEATURES,
+    COSINE_COLOCALIZATION_FEATURES,
     REGION_COLOCALIZATION_FEATURES,
     WITHIN_REGION_COLOCALIZATION_FEATURES,
     PROTEIN_LEVEL_FEATURES,
@@ -1699,6 +1700,7 @@ def rescore(
     region_coloc: bool = False,
     region_coloc_k: int = 20,
     within_region_coloc: bool = False,
+    cosine_coloc: bool = False,
     drop_zero_signal: bool = False,
     entrapment: bool = False,
     substitution_n_residues: int = 1,
@@ -2668,6 +2670,7 @@ def rescore(
         region_coloc_k=region_coloc_k,
         region_coloc_debug=region_coloc_debug,
         within_region_coloc=within_region_coloc,
+        cosine_coloc=cosine_coloc,
     )
     # Worst-case fill of protein-colocalization NaNs for zero-signal candidates, so a
     # feature with no MALDI signal is penalised rather than median-imputed to an average
@@ -2881,6 +2884,12 @@ def rescore(
         logger.info(
             f"  Within-region colocalization features enabled "
             f"({len(WITHIN_REGION_COLOCALIZATION_FEATURES)} features, experimental — O3)"
+        )
+    if cosine_coloc:
+        _pool += COSINE_COLOCALIZATION_FEATURES
+        logger.info(
+            f"  Median-thresholded cosine colocalization features enabled "
+            f"({len(COSINE_COLOCALIZATION_FEATURES)} features, H-feat-3/H-decoy-9)"
         )
     # Intrinsic 2D peak-quality features: default-on for the decoy methods where they
     # are valid/safe (see _MOB_QUALITY_DEFAULT_DECOYS).  Only present when extracted

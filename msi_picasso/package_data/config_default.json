@@ -70,6 +70,7 @@
     "region_coloc": false,
     "region_coloc_k": 20,
     "within_region_coloc": false,
+    "cosine_coloc": false,
     "coloc_tic_normalize": false,
     "coloc_common_mode": false,
     "drop_zero_signal": false,
