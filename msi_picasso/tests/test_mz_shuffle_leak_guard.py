@@ -3,8 +3,17 @@
 PROGRESS.md F-016: the previous enumerated `_MZ_SHUFFLE_CCS_LEAK_FEATURES` covered only the
 isotope_*_mob and adduct_*_mob families. `protein_colocalization_mob_max` (target/decoy AUC
 0.0003) reached the ranker as its top feature and passed 5070/5070 kidney targets at 1% FDR.
+
+PROGRESS.md F-020: theo_isotope_kl and siblings build their theoretical isotope pattern from
+the candidate's OWN mass and compare it against the OBSERVED envelope at the assigned
+feature. Under mz_shuffle's mass-sorted derangement that assigned feature is deliberately far
+from the decoy's own mass (median 429-480 Da measured across three datasets, up to 2109 Da),
+and isotope envelope shape scales with mass, so these leak the construction mass-gap at
+Spearman 0.70-0.80 within a co-located pair. Confirmed on amyloidosis, kidney and her2, and
+via a 20-trial is_decoy label-permutation test (true seed ~1000, permutation-null max 21).
 """
 
+from msi_picasso.maldi_features import MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES
 from msi_picasso.pipeline import (
     _MZ_SHUFFLE_CCS_LEAK_FEATURES,
     _mz_shuffle_leaking_features,
@@ -25,11 +34,19 @@ MEASURED_LEAKS = [
     "im2deep_delta_ccs_resid",
 ]
 
+# theo_isotope_kl and siblings (F-020): must now be EXCLUDED, not kept, under mz_shuffle.
+# This is the opposite of what an earlier version of this test file asserted — that version
+# had theo_isotope_kl in MUST_SURVIVE, which was correct only because the leak had not yet
+# been found. Keep the two lists (MEASURED_LEAKS above vs this one) separate rather than
+# merging them: they were discovered by different mechanisms (direct AUC measurement vs a
+# permutation test + mass-gap correlation) and are worth being able to tell apart in a
+# failing test.
+ISOTOPE_ENVELOPE_LEAKS = sorted(MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES)
+
 # Symmetric under mz_shuffle because target and decoy share the observation, so they must
 # survive the guard or the ranker is left with nothing to work with.
 MUST_SURVIVE = [
     "ppm_error_pct",
-    "theo_isotope_kl",
     "isotope_image_colocalization_m1",
     "protein_colocalization_weighted",
     "log_protein_n_features",
@@ -38,16 +55,35 @@ MUST_SURVIVE = [
     "mob_k0_spread",
     "mob_peak_snr",
     "mob_mz_spread_ppm",
+    # Compare the candidate's own theoretical pattern against a generic averagine model or
+    # against itself — never against maldi_envelopes/feature_mz — so unlike their siblings
+    # above they carry no feature-dependent information and cannot leak this way (verified
+    # by source inspection of compute_theoretical_isotope_features, not by measurement: they
+    # are excluded from the ranker in every current config for unrelated reasons, so there
+    # is no debug table to measure them against).
+    "averagine_deviation",
+    "averagine_deviation_sulfur",
+    "monoisotopic_confidence",
 ]
 
 
+ALL_COLUMNS = MEASURED_LEAKS + ISOTOPE_ENVELOPE_LEAKS + MUST_SURVIVE
+
+
 def test_catches_every_measured_leak():
-    got = _mz_shuffle_leaking_features(MEASURED_LEAKS + MUST_SURVIVE)
+    got = _mz_shuffle_leaking_features(ALL_COLUMNS)
     assert set(MEASURED_LEAKS) <= got, f"missed {sorted(set(MEASURED_LEAKS) - got)}"
 
 
+def test_catches_every_isotope_envelope_leak():
+    got = _mz_shuffle_leaking_features(ALL_COLUMNS)
+    assert set(ISOTOPE_ENVELOPE_LEAKS) <= got, (
+        f"missed {sorted(set(ISOTOPE_ENVELOPE_LEAKS) - got)}"
+    )
+
+
 def test_keeps_the_symmetric_features():
-    got = _mz_shuffle_leaking_features(MEASURED_LEAKS + MUST_SURVIVE)
+    got = _mz_shuffle_leaking_features(ALL_COLUMNS)
     assert not (set(MUST_SURVIVE) & got), f"over-excluded {sorted(set(MUST_SURVIVE) & got)}"
 
 
@@ -93,3 +129,11 @@ def test_guard_must_see_columns_added_by_mob_coloc_not_a_pre_mob_coloc_snapshot(
     assert "protein_colocalization_mob" in caught_late
     assert "protein_colocalization_mob_max" in caught_late
     assert "fraction_detected_mob" in caught_late
+
+
+def test_isotope_envelope_leak_set_matches_maldi_features_module():
+    """The two copies of this list (pipeline.py's guard, maldi_features.py's computation
+    block) must never drift apart — that drift is exactly how F-016 happened the first time.
+    """
+    assert MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES == frozenset(ISOTOPE_ENVELOPE_LEAKS)
+    assert _mz_shuffle_leaking_features(ISOTOPE_ENVELOPE_LEAKS) == set(ISOTOPE_ENVELOPE_LEAKS)

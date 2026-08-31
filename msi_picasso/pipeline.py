@@ -102,13 +102,26 @@ def _mz_shuffle_leaking_features(columns) -> set[str]:
     """Columns that leak the m/z baseline under ``mz_shuffle`` decoys.
 
     Any mobility-gated column (a predicted-1/K0 gate applied to a decoy sitting on an
-    unrelated m/z selects an empty slice) or any predicted-CCS-derived column, ``*_resid``
-    variants included. See the module comment above and PROGRESS.md F-016.
+    unrelated m/z selects an empty slice), any predicted-CCS-derived column (``*_resid``
+    variants included), or any own-mass-vs-observed-envelope isotope feature (see
+    ``maldi_features.MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES``: theo_isotope_kl and siblings
+    build their theoretical envelope from the candidate's own mass and compare it against
+    the observed envelope at the assigned feature, which under mz_shuffle's mass-sorted
+    derangement is deliberately far away — PROGRESS.md F-020 measured Spearman 0.70-0.80
+    between that mass gap and the isotope-feature difference within a co-located pair,
+    confirmed on all three ground-truth datasets and via a label-permutation test). See the
+    module comment above and PROGRESS.md F-016/F-020.
     """
-    return {
-        c for c in columns
-        if c.endswith(_MZ_SHUFFLE_LEAK_SUFFIXES) or c.startswith(_MZ_SHUFFLE_LEAK_PREFIXES)
-    }
+    from msi_picasso.maldi_features import MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES
+
+    columns = set(columns)
+    return (
+        {
+            c for c in columns
+            if c.endswith(_MZ_SHUFFLE_LEAK_SUFFIXES) or c.startswith(_MZ_SHUFFLE_LEAK_PREFIXES)
+        }
+        | (columns & MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES)
+    )
 
 
 def _resolve_spatial_ranker_features(
@@ -2783,12 +2796,25 @@ def rescore(
                 "mz_shuffle leak guard ran before mobility colocalization columns were "
                 "visible; see PROGRESS.md F-016/E007"
             )
+        # theo_isotope_kl and siblings (MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES) are always
+        # present once compute_theoretical_isotope_features has run, unconditionally on
+        # any config, so this assert is not gated the way the mob_coloc one is.
+        from msi_picasso.maldi_features import MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES
+        _iso_present = set(features_df.columns) & MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES
+        if _iso_present:
+            assert _iso_present <= _ccs_mz_leak_feats, (
+                "mz_shuffle leak guard missed the own-mass isotope-envelope features "
+                f"{sorted(_iso_present - _ccs_mz_leak_feats)}; see PROGRESS.md F-020"
+            )
         if _ccs_mz_leak_feats - _exclude_set:
             logger.info(
-                "  decoy_method='mz_shuffle': excluding %d mobility-gated and predicted-CCS "
-                "features from the ranker (they leak the m/z baseline, PROGRESS.md F-016). "
-                "The *_resid CCS variants are excluded too: detrending does NOT make them "
-                "safe (measured AUC 0.76-0.86). Excluded: %s",
+                "  decoy_method='mz_shuffle': excluding %d mobility-gated, predicted-CCS, "
+                "and own-mass isotope-envelope features from the ranker (they leak the m/z "
+                "baseline, PROGRESS.md F-016/F-020). The *_resid CCS variants are excluded "
+                "too: detrending does NOT make them safe (measured AUC 0.76-0.86). "
+                "theo_isotope_kl and siblings correlate with the decoy's construction mass "
+                "gap at Spearman 0.70-0.80 (measured on all three ground-truth datasets). "
+                "Excluded: %s",
                 len(_ccs_mz_leak_feats), sorted(_ccs_mz_leak_feats),
             )
         _exclude_set |= _ccs_mz_leak_feats

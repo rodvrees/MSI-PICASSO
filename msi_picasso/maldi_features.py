@@ -931,6 +931,35 @@ def compute_within_region_colocalization_features(
     return df
 
 
+# Columns set in the "MALDI envelope comparison" block below: candidate's OWN theoretical
+# isotope pattern (from its OWN mass) compared against the OBSERVED envelope at feature_mz.
+# Under mz_shuffle, feature_mz is the co-located TARGET's feature, not the decoy's own mass
+# — and the derangement deliberately creates a large mass-rank gap (PROGRESS.md F-020
+# measured median 429-480 Da, up to 2109 Da). Isotope envelope shape scales with mass, so
+# these leak the mass-gap construction artifact under mz_shuffle at Spearman 0.70-0.80
+# (theo_isotope_kl), the same class of trivial "small error = target, huge error = decoy"
+# leak ppm_error is deliberately protected against (see candidates.py,
+# generate_mz_shuffle_candidates docstring, and pipeline.py's mz_shuffle exclusion).
+# Excluded from the ranker under mz_shuffle by pipeline._mz_shuffle_leaking_features.
+#
+# averagine_deviation / averagine_deviation_sulfur / monoisotopic_confidence are NOT in this
+# set: they compare the candidate's own theoretical pattern against a generic averagine
+# model or against itself, never against maldi_envelopes/feature_mz, so they carry no
+# feature-dependent information and cannot leak this way. Verified by inspection (no
+# feature_mz or maldi_envelopes reference in their computation), not by measurement — they
+# are already excluded from the ranker in every current config for unrelated reasons, so
+# there is no debug table to measure them against.
+#
+# If you add a new column to the "MALDI envelope comparison" block below, add it here too.
+MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES = frozenset([
+    "theo_isotope_cosine",
+    "theo_isotope_chi2",
+    "theo_isotope_kl",
+    "theo_m1_ratio_diff",
+    "theo_m2_ratio_diff",
+])
+
+
 def compute_theoretical_isotope_features(
     df: pd.DataFrame,
     maldi_envelopes: dict | None = None,
@@ -940,6 +969,11 @@ def compute_theoretical_isotope_features(
 
     Vectorized: uses pre-computed n_C/n_H/n_N/n_O/n_S and mass columns
     from the digest DataFrame. No pyteomics calls in the hot path.
+
+    The five columns set in the "MALDI envelope comparison" block compare the candidate's
+    own theoretical isotope pattern (from its own mass) against the *observed* envelope at
+    feature_mz. See MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES above — under mz_shuffle decoys
+    this leaks the derangement's mass gap (PROGRESS.md F-020).
     """
     n = len(df)
 
