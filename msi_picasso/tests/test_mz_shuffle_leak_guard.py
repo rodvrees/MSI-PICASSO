@@ -60,3 +60,36 @@ def test_is_a_superset_of_the_old_enumerated_list():
 def test_a_newly_added_mobility_feature_is_covered_automatically():
     """The point of the rewrite: no list to update when a feature is added."""
     assert "some_future_coloc_mob" in _mz_shuffle_leaking_features(["some_future_coloc_mob"])
+
+
+def test_guard_must_see_columns_added_by_mob_coloc_not_a_pre_mob_coloc_snapshot():
+    """Regression for the bug introduced by the by-construction rewrite itself.
+
+    F-016/E007: `_exclude_set` was originally resolved from `features_df.columns` BEFORE
+    `compute_mobility_colocalization_features` (pipeline.py step 6c) added the *_mob
+    colocalization columns, so the by-construction rule matched them fine in isolation but
+    never saw them in the real pipeline. Measured: 2555/2583 amyloidosis targets passed at
+    1% FDR with `protein_colocalization_mob` at target/decoy AUC 0.0009 as the top ranker
+    feature. The old literal frozenset didn't have this failure mode, since a fixed set of
+    names doesn't care when it is constructed, only when it is checked.
+
+    This models that two-stage column arrival directly, without touching the real pipeline
+    or a `.d` file: pre-mob-coloc columns, then post-mob-coloc columns, and asserts the
+    guard must be evaluated against the LATTER for the *_mob columns to be caught at all.
+    """
+    pre_mob_coloc_columns = ["im2deep_predicted_ccs", "im2deep_abs_delta_ccs_pct", "ppm_error_pct"]
+    post_mob_coloc_columns = pre_mob_coloc_columns + [
+        "protein_colocalization_mob", "protein_colocalization_mob_max",
+        "fraction_detected_mob", "log_mean_intensity_mob", "spatial_morans_i_mob",
+    ]
+
+    caught_early = _mz_shuffle_leaking_features(pre_mob_coloc_columns)
+    caught_late = _mz_shuffle_leaking_features(post_mob_coloc_columns)
+
+    assert "protein_colocalization_mob" not in caught_early, (
+        "sanity check: the *_mob columns must genuinely be absent pre-mob-coloc, or this "
+        "test is not modeling the bug"
+    )
+    assert "protein_colocalization_mob" in caught_late
+    assert "protein_colocalization_mob_max" in caught_late
+    assert "fraction_detected_mob" in caught_late

@@ -2681,30 +2681,6 @@ def rescore(
             )
         else:
             logger.info("  drop_zero_signal: no zero-signal candidates found.")
-    # Resolve the set of features explicitly excluded from the ranker: the
-    # user-supplied features_exclude plus, for mz_shuffle, the raw CCS + mobility-
-    # gated colocalization features that leak the m/z baseline (see the ranker
-    # feature-pool assembly below for the rationale). Computed here so the
-    # 13_debug_features.tsv table reflects exactly the same exclusions the ranker
-    # applies, and reused (not recomputed) when assembling the pool.
-    _exclude_set = set(features_exclude or [])
-    if decoy_method == "mz_shuffle":
-        _ccs_mz_leak_feats = _mz_shuffle_leaking_features(features_df.columns)
-        # The by-construction rule must never exclude less than the old explicit list did.
-        _missed = (_MZ_SHUFFLE_CCS_LEAK_FEATURES & set(features_df.columns)) - _ccs_mz_leak_feats
-        assert not _missed, f"mz_shuffle leak guard regressed; missed {sorted(_missed)}"
-        if _ccs_mz_leak_feats - _exclude_set:
-            logger.info(
-                "  decoy_method='mz_shuffle': excluding %d mobility-gated and predicted-CCS "
-                "features from the ranker (they leak the m/z baseline, PROGRESS.md F-016). "
-                "The *_resid CCS variants are excluded too: detrending does NOT make them "
-                "safe (measured AUC 0.76-0.86). Excluded: %s",
-                len(_ccs_mz_leak_feats), sorted(_ccs_mz_leak_feats),
-            )
-        _exclude_set |= _ccs_mz_leak_feats
-    if _exclude_set:
-        logger.info(f"  Excluding {len(_exclude_set)} features: {sorted(_exclude_set)}")
-
     # --- CCS-based candidate filtering (optional) ---
     # IM2Deep finetuning (inside compute_all_features) uses the calibration-peptide
     # set as its CCS reference.  After finetuning, im2deep_abs_delta_ccs_pct is
@@ -2775,6 +2751,50 @@ def rescore(
         except Exception as exc:
             logger.warning(f"Per-candidate mobility colocalization failed: {exc}. Skipping.")
 
+    # Resolve the set of features explicitly excluded from the ranker: the
+    # user-supplied features_exclude plus, for mz_shuffle, the raw CCS + mobility-
+    # gated colocalization features that leak the m/z baseline (see the ranker
+    # feature-pool assembly below for the rationale). Computed HERE, after
+    # compute_mobility_colocalization_features above, not earlier: the mz_shuffle rule
+    # matches by column name (_mz_shuffle_leaking_features), and the *_mob
+    # colocalization columns (protein_colocalization_mob, adduct_colocalization_*_mob,
+    # isotope_colocalization_*_mob, fraction_detected_mob, log_mean_intensity_mob,
+    # spatial_morans_i_mob, intensity_cv_mob) do not exist in features_df.columns until
+    # step 6c runs. Computing this earlier — as a prior version of this code did —
+    # silently missed every one of them (PROGRESS.md F-016/E007: measured target/decoy
+    # AUC as low as 0.0009 on the *_mob columns, with protein_colocalization_mob the
+    # top-importance ranker feature and 2555/2583 amyloidosis targets passing at 1% FDR).
+    # Computed once here so 13_debug_features.tsv reflects exactly the same exclusions
+    # the ranker applies, and reused (not recomputed) when assembling the pool below.
+    _exclude_set = set(features_exclude or [])
+    if decoy_method == "mz_shuffle":
+        _ccs_mz_leak_feats = _mz_shuffle_leaking_features(features_df.columns)
+        # The by-construction rule must never exclude less than the old explicit list did.
+        _missed = (_MZ_SHUFFLE_CCS_LEAK_FEATURES & set(features_df.columns)) - _ccs_mz_leak_feats
+        assert not _missed, f"mz_shuffle leak guard regressed; missed {sorted(_missed)}"
+        # If mobility colocalization ran (step 6c, immediately above), at least one *_mob
+        # column must be present and caught. This is the exact failure this block once had
+        # silently: the guard ran before the *_mob columns existed and excluded nothing.
+        # Re-ordering this block again in the future would reproduce that bug; this assert
+        # turns it back into a loud failure instead of a silent one (F-016/E007).
+        if _has_mob_coloc:
+            _mob_cols_present = {c for c in features_df.columns if c.endswith("_mob")}
+            assert _mob_cols_present & _ccs_mz_leak_feats, (
+                "mz_shuffle leak guard ran before mobility colocalization columns were "
+                "visible; see PROGRESS.md F-016/E007"
+            )
+        if _ccs_mz_leak_feats - _exclude_set:
+            logger.info(
+                "  decoy_method='mz_shuffle': excluding %d mobility-gated and predicted-CCS "
+                "features from the ranker (they leak the m/z baseline, PROGRESS.md F-016). "
+                "The *_resid CCS variants are excluded too: detrending does NOT make them "
+                "safe (measured AUC 0.76-0.86). Excluded: %s",
+                len(_ccs_mz_leak_feats), sorted(_ccs_mz_leak_feats),
+            )
+        _exclude_set |= _ccs_mz_leak_feats
+    if _exclude_set:
+        logger.info(f"  Excluding {len(_exclude_set)} features: {sorted(_exclude_set)}")
+
     if verbose:
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
         _debug_cols = [c for c in features_df.columns if c not in _exclude_set]
@@ -2808,8 +2828,9 @@ def rescore(
     )
 
     # _exclude_set (features_exclude + the mz_shuffle CCS/mobility leak features) was
-    # resolved earlier (and 13_debug_features.tsv written after mob_coloc), so the debug
-    # table and the ranker apply identical exclusions. See that block for the mz_shuffle rationale.
+    # resolved above, after mob_coloc and after 13_debug_features.tsv was written, so
+    # the debug table and the ranker apply identical exclusions. See that block for the
+    # mz_shuffle rationale and why the resolution point matters.
     # Assemble the intrinsic feature pool: base + optional protein-level + optional
     # spatial-ranker.  protein_colocalization_* appear in both PROTEIN_LEVEL_FEATURES
     # and SPATIAL_RANKER_FEATURES; the order-preserving dedup below prevents
