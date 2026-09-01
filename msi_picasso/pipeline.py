@@ -1895,6 +1895,7 @@ def rescore(
     within_region_coloc: bool = False,
     cosine_coloc: bool = False,
     decoy_split: bool = False,
+    decoy_split_final_only: bool = False,
     train_fdr_escalate: bool = False,
     pseudo_label_growth_cap: float | None = None,
     drop_zero_signal: bool = False,
@@ -2133,12 +2134,24 @@ def rescore(
         iteration. Use ``train_fdr`` for LDA/QDA.
     decoy_split
         H-fdr-2 (Percolator-RESET, Freestone et al. 2025), opt-in. Splits
-        decoys into a training half and a held-out half; every seed/pseudo-
-        label decision and the model fit use only the training half, and the
-        final reported FDR is estimated against the held-out half only — the
-        same decoy never both teaches the discriminant and gets counted
-        against it. Only wired for the {lda, svm, gbt, rbf_svm} backends
+        decoys into a training half and a held-out half; the final reported
+        FDR is always estimated against the held-out half only — the same
+        decoy never both teaches the discriminant and gets counted against
+        it. Whether the training half *also* restricts the seed search and
+        pseudo-label iteration is controlled by ``decoy_split_final_only``.
+        Only wired for the {lda, svm, gbt, rbf_svm} backends
         (``_rescore_linear``); the ``qda`` backend is unaffected.
+    decoy_split_final_only
+        H-fdr-2b, opt-in, only meaningful when ``decoy_split=True``. F-024
+        (E011/E012) found the full split — restricting the seed search and
+        every pseudo-label iteration to the training half too — costs more
+        statistical power than it buys back at kidney/her2's candidate
+        counts, inflating the permutation-null ceiling faster than the true
+        seed grows. When this flag is set, the split is applied ONLY to the
+        final reported FDR (still computed against the held-out half only);
+        the seed search and iteration loop see the FULL, unsplit decoy pool,
+        exactly as without ``decoy_split`` at all. ``False`` (default)
+        reproduces H-fdr-2's original full-split behaviour.
     train_fdr_escalate
         H-fdr-2, opt-in. If ``init_fdr``/``train_fdr`` would otherwise yield
         zero pseudo-positives, retries at increasing thresholds (steps of
@@ -3226,6 +3239,11 @@ def rescore(
                     f"  decoy_split: {int(decoy_split_mask_r1.sum())} training decoys, "
                     f"{int((features_df['is_decoy'].values & ~decoy_split_mask_r1).sum())} held-out for FDR estimation"
                 )
+        # H-fdr-2b (F-024 follow-up): decoy_split_final_only restricts the split's
+        # effect to the final reported FDR (below) — the seed search and iteration
+        # loop keep the FULL, unsplit decoy pool, avoiding the power loss F-024
+        # measured from halving it throughout training.
+        _train_split_mask_r1 = None if decoy_split_final_only else decoy_split_mask_r1
 
         # --- Round 1: score all candidates ---
         scores1, _imp_r1_lda, _struct_coefs_r1_lda, _struct_names_r1_lda, _imp_names_lda = _linear(
@@ -3239,7 +3257,7 @@ def rescore(
             min_seed_positives=min_seed_positives,
             seed_features=seed_features,
             fitted_out=_r1_fitted,
-            decoy_split_mask=decoy_split_mask_r1,
+            decoy_split_mask=_train_split_mask_r1,
             train_fdr_escalate=train_fdr_escalate,
             pseudo_label_growth_cap=pseudo_label_growth_cap,
             **_svm_kwargs,
@@ -3272,6 +3290,9 @@ def rescore(
         decoy_split_mask_w = (
             decoy_split_mask_r1[winner_pos] if decoy_split_mask_r1 is not None else None
         )
+        # See _train_split_mask_r1 above: H-fdr-2b keeps R2 training on the full
+        # decoy pool too, only the final block (below) uses decoy_split_mask_w.
+        _train_split_mask_w = None if decoy_split_final_only else decoy_split_mask_w
 
         # --- Round 2: retrain on winner subset (skipped when single_round) ---
         if single_round:
@@ -3330,7 +3351,7 @@ def rescore(
                 r1_seed_percentile=r1_seed_percentile,
                 min_seed_positives=min_seed_positives,
                 fitted_out=_r2_fitted,
-                decoy_split_mask=decoy_split_mask_w,
+                decoy_split_mask=_train_split_mask_w,
                 train_fdr_escalate=train_fdr_escalate,
                 pseudo_label_growth_cap=pseudo_label_growth_cap,
                 **_svm_kwargs,

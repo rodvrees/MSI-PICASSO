@@ -1138,11 +1138,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "H-fdr-2 (Percolator-RESET, Freestone et al. 2025): split decoys into a "
-            "training half and a held-out half. Every seed/pseudo-label decision and "
-            "the model fit use only the training half; the final reported FDR is "
+            "training half and a held-out half. The final reported FDR is always "
             "estimated against the held-out half only, so the same decoy never both "
-            "teaches the discriminant and gets counted against it. {lda,svm,gbt,rbf_svm} "
-            "backends only. Disabled by default."
+            "teaches the discriminant and gets counted against it. Whether the seed "
+            "search and pseudo-label iteration ALSO see only the training half is "
+            "controlled by --decoy-split-final-only. {lda,svm,gbt,rbf_svm} backends "
+            "only. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--decoy-split-final-only",
+        action="store_true",
+        default=None,
+        help=(
+            "H-fdr-2b, only meaningful with --decoy-split. PROGRESS.md F-024: splitting "
+            "the decoy pool for the ENTIRE seed-search-and-training procedure (the "
+            "default when --decoy-split is set alone) costs more statistical power than "
+            "it buys back at small candidate counts. With this flag, the split applies "
+            "ONLY to the final reported FDR; the seed search and iteration loop use the "
+            "full, unsplit decoy pool, exactly as without --decoy-split at all. Disabled "
+            "by default (reproduces H-fdr-2's original full-split behaviour)."
         ),
     )
     rescore_grp.add_argument(
@@ -1554,7 +1569,8 @@ def main() -> None:
         "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc", "mob_protein_coloc",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "region_coloc", "within_region_coloc", "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
-        "substitution_no_collision_filter", "decoy_split", "train_fdr_escalate",
+        "substitution_no_collision_filter", "decoy_split", "decoy_split_final_only",
+        "train_fdr_escalate",
     })
 
     # Only pass top-level configurable params (not file paths or extraction params)
@@ -1582,7 +1598,7 @@ def main() -> None:
         "mob_quality_mz_window_ppm", "mob_quality_k0_tol",
         "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
         "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
-        "decoy_split", "train_fdr_escalate", "pseudo_label_growth_cap",
+        "decoy_split", "decoy_split_final_only", "train_fdr_escalate", "pseudo_label_growth_cap",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
         "calibration_percentile", "maldi_query_raw", "raw_query_cache_dir",
@@ -2062,6 +2078,7 @@ def main() -> None:
         within_region_coloc=bool(_ms1cfg.get("within_region_coloc", False)),
         cosine_coloc=bool(_ms1cfg.get("cosine_coloc", False)),
         decoy_split=bool(_ms1cfg.get("decoy_split", False)),
+        decoy_split_final_only=bool(_ms1cfg.get("decoy_split_final_only", False)),
         train_fdr_escalate=bool(_ms1cfg.get("train_fdr_escalate", False)),
         pseudo_label_growth_cap=_ms1cfg.get("pseudo_label_growth_cap"),
         drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),

@@ -35,6 +35,7 @@
     "max_iter": 5,
     "min_seed_positives": 50,
     "decoy_split": false,
+    "decoy_split_final_only": false,
     "train_fdr_escalate": false,
     "pseudo_label_growth_cap": null,
     "protein_fdr": 0.01,
