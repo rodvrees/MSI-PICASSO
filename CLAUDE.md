@@ -39,10 +39,19 @@ the only part of this file that is genuinely load-bearing.
    through identical code paths. This is enforced at the API level — grep for `is_decoy` in
    `maldi_features.py`, `feature_generator.py`, `lcms_evidence.py`, `utils.py` and
    `maldi_query.py` returns nothing.
-2. **A decoy row's `feature_mz` must be the decoy's own m/z** — for `substitution` the
-   substituted peptide's [M+H]+, for `mz_shift` the shifted m/z. Never the source target's.
-   Load-bearing for raw-query mode, which extracts each candidate's ion image at its own
-   anchor.
+2. **A decoy row's `feature_mz` must be the anchor that decoy was actually scored at** —
+   for `substitution` the substituted peptide's [M+H]+, for `mz_shift` the shifted m/z.
+   Never *another candidate's* anchor. Load-bearing for raw-query mode, which extracts each
+   candidate's ion image at its own anchor.
+
+   **`mz_shuffle` is the deliberate exception and must not be "fixed".** Its decoys are
+   co-located on a target's feature by design, so a `mz_shuffle` decoy's `feature_mz` *is*
+   its paired target's — measured at spread exactly 0 across 5077/5077 kidney and 3131/3131
+   her2 pairs. That co-location is what restores the target-decoy competition F-010 found
+   missing (F-021), and computing `ppm_error` against the decoy's own mass instead would
+   make the null anti-conservative (F-019, and `generate_mz_shuffle_candidates`' docstring).
+   In feature-list mode the anchor is the matched detected peak's m/z, which is likewise the
+   candidate's own match.
 3. **Composition features stay out of `_BEST_FEAT_SKIP` and out of the seed.** Several decoy
    methods alter elemental composition, so composition features separate target from decoy
    as an artifact of decoy construction. Seeding on them makes the FDR anti-conservative.
@@ -73,21 +82,20 @@ MSI-PICASSO/
 ├── pyproject.toml              # testpaths = ["msi_picasso/tests"]
 ├── CLAUDE.md                   # this file
 ├── msi_picasso/
-│   ├── cli.py             2030 # argparse CLI (`picasso` / `msi-picasso`), MALDI input dispatch
+│   ├── cli.py             1807 # argparse CLI (`picasso` / `msi-picasso`), MALDI input dispatch
 │   ├── config_parser.py    144 # cascade_config merge + jsonschema validation
 │   ├── candidates.py      1987 # FASTA digest, all decoy generators, match_to_maldi_features
 │   ├── lcms_ids.py         722 # parse LC-MS/MS IDs -> identified proteins + peptides
 │   ├── lcms_evidence.py    965 # raw LC-MS/MS evidence features (MS2PIP, DeepLC-anchored MS1)
-│   ├── maldi_extraction.py 1237# raw Bruker .d extraction via imzy: ion images, spatial feats
-│   ├── maldi_query.py      391 # raw-query mode + observed centroids/CCS (alphatims) + disk cache
-│   ├── maldi_imzml.py     1174 # SCiLS-style interval extraction from imzML via pyimzml (legacy)
+│   ├── maldi_extraction.py 976 # ion images + spatial feats at a GIVEN feature list (imzy)
+│   ├── maldi_query.py      465 # raw-query mode + observed centroids/CCS (alphatims) + disk cache
 │   ├── maldi_features.py  2657 # all MALDI-side features: mass accuracy, colocalization, isotope
 │   ├── feature_generator.py 591# feature-group constants + compute_all_features
 │   ├── pipeline.py        3324 # rescore() orchestrator, scoring backends, TDC q-values, PEP
 │   ├── debug_viz.py       4049 # debug figures (--verbose)
 │   ├── utils.py             99 # shared math (brainpy isotopes, spectral angle, mass constants)
 │   ├── package_data/           # config_default.json + config_schema.json
-│   └── tests/                  # 50 test modules
+│   └── tests/                  # 41 test modules
 └── msi-picasso-rs/             # PyO3 + rayon extension, crate "MSI-PICASSO-rs"
     └── src/{lib,digest,features,ion_image,isotope,maldi_isotope,mob_coloc,spectral,xic}.rs
 ```
@@ -104,7 +112,7 @@ package. Every call site wraps it in `try/except ImportError` with a Python fall
    JSON/TOML → explicit CLI args. `store_true` flags are converted `False → None`
    (`cli.py:1479`) so argparse defaults do not clobber config-file values.
 3. **MALDI input dispatch** (`cli.py:1613`), mutually exclusive:
-   `maldi_npz | maldi_mzs | maldi_raw | maldi_imzml | maldi_d`.
+   `maldi_npz | maldi_mzs | maldi_raw | maldi_d`.
    With `maldi_d` + `maldi_query_raw=true` extraction is **deferred** into `rescore()`.
    This is what every current config uses.
 4. **`rescore()`** (`pipeline.py:1555`):
@@ -133,15 +141,22 @@ semantics are identical; only the final discriminant refit is dropped.
 
 ## Reading MALDI data
 
-Two readers exist. Only the first is on the active path.
-
-**imzy (active).** `maldi_extraction.py:200` — `imzy.get_reader(d_path)` dispatches Bruker
-`.d` (TDF/TSF, bundled `libtimsdata.so`) and `.imzML`. `extract_maldi_data()`
-(`maldi_extraction.py:865`) is the single public entry, returning
+`imzy.get_reader(d_path)` dispatches Bruker `.d` (TDF/TSF, bundled `libtimsdata.so`) and
+`.imzML`. `extract_maldi_data()` is the single public entry, returning
 `(feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes)`.
 
-**pyimzml (legacy).** `maldi_imzml.extract_scils_features()`, reached only via
-`--maldi-imzml`. SCiLS-style interval extraction. No current config uses it.
+**This package no longer finds features.** `extract_maldi_data()` requires `feature_mzs`
+and only extracts ion images and spatial statistics at that list; passing none is a
+`ValueError`. Peak picking is done in 2D (m/z, 1/K0) by the **TIMSImaging fork** at
+`/home/robbe/TIMSImaging` (branch `feat/msi-picasso-feature-finding`), which writes a
+feature list consumed here via `--feature-mzs`. The interface is that file, not an import:
+`_read_feature_mzs` (`cli.py:37`) reads m/z plus optional CCS and intensity from the
+semicolon layout, and the fork has a round-trip test against this reader.
+
+The former in-package detectors (`detect_features`, and `maldi_imzml.py`'s SCiLS-style
+interval extraction with its deisotoping and mass-defect filtering) were **deleted**, not
+deprecated, along with their 22 config knobs — a second, m/z-only implementation was worth
+less than the confusion of having two.
 
 Performance-relevant details:
 
@@ -168,6 +183,13 @@ CCS, and the mobility peak-quality descriptors. Mobility colocalization
 
 **This second pass dominates runtime** (roughly 40 minutes of a ~69 minute amyloidosis run,
 streaming ~4e9 raw peaks) while producing only a handful of arrays of `len(query_mzs)`.
+
+**Feature-list mode does not pay it at all.** Observed CCS comes from the feature list's own
+CCS column and the peak-shape descriptors come from the resolved peak, so
+`extract_observed_feature_stats_raw` is not called. The fork's whole peak-finding pass over
+the same `.d` measured 135 s (kidney, 5% frame sampling, 4.6e9 peaks), against the ~40 min
+this replaces. Both caches below therefore apply to raw-query mode only.
+
 Two caches exist for it:
 
 - **`raw_query_cache`** (`pipeline.py:1566`, logic at `2292`) — an in-process dict covering
