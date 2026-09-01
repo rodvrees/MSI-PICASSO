@@ -1133,6 +1133,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     rescore_grp.add_argument(
+        "--decoy-split",
+        action="store_true",
+        default=None,
+        help=(
+            "H-fdr-2 (Percolator-RESET, Freestone et al. 2025): split decoys into a "
+            "training half and a held-out half. Every seed/pseudo-label decision and "
+            "the model fit use only the training half; the final reported FDR is "
+            "estimated against the held-out half only, so the same decoy never both "
+            "teaches the discriminant and gets counted against it. {lda,svm,gbt,rbf_svm} "
+            "backends only. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--train-fdr-escalate",
+        action="store_true",
+        default=None,
+        help=(
+            "H-fdr-2: if init_fdr/train_fdr would otherwise yield zero pseudo-positives "
+            "at the seed step or a pseudo-label iteration, retry at increasing "
+            "thresholds (steps of 0.005, capped at 0.5) instead of giving up. A no-op "
+            "whenever the configured threshold already succeeds. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--pseudo-label-growth-cap",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "H-fdr-5: stop the self-training loop (keeping the previous iteration's "
+            "model) once the pseudo-positive count exceeds this multiple of the "
+            "initial seed size, regardless of convergence. Guards against the loop "
+            "amplifying a weak or leaking seed into a runaway positive set. Unset "
+            "(default) disables the cap."
+        ),
+    )
+    rescore_grp.add_argument(
         "--fragment-tol-da",
         type=float,
         default=None,
@@ -1517,7 +1554,7 @@ def main() -> None:
         "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc", "mob_protein_coloc",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "region_coloc", "within_region_coloc", "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
-        "substitution_no_collision_filter",
+        "substitution_no_collision_filter", "decoy_split", "train_fdr_escalate",
     })
 
     # Only pass top-level configurable params (not file paths or extraction params)
@@ -1545,6 +1582,7 @@ def main() -> None:
         "mob_quality_mz_window_ppm", "mob_quality_k0_tol",
         "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
         "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
+        "decoy_split", "train_fdr_escalate", "pseudo_label_growth_cap",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
         "calibration_percentile", "maldi_query_raw", "raw_query_cache_dir",
@@ -2023,6 +2061,9 @@ def main() -> None:
         region_coloc_k=_ms1cfg["region_coloc_k"],
         within_region_coloc=bool(_ms1cfg.get("within_region_coloc", False)),
         cosine_coloc=bool(_ms1cfg.get("cosine_coloc", False)),
+        decoy_split=bool(_ms1cfg.get("decoy_split", False)),
+        train_fdr_escalate=bool(_ms1cfg.get("train_fdr_escalate", False)),
+        pseudo_label_growth_cap=_ms1cfg.get("pseudo_label_growth_cap"),
         drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),
         entrapment=bool(_ms1cfg.get("entrapment", False)),
         substitution_n_residues=_ms1cfg["substitution_n_residues"],

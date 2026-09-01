@@ -504,6 +504,54 @@ def _encode_labels(is_decoy, positive_mask):
     ).astype(np.int8)
 
 
+def _split_decoys_for_reset(is_decoy: np.ndarray, seed: int = 0) -> np.ndarray | None:
+    """Percolator-RESET-style decoy split (H-fdr-2, Freestone et al. 2025).
+
+    Partitions decoys into a training half (used to fit/seed the discriminant)
+    and a held-out half (used only for the final reported FDR), so the same
+    decoy is never both taught to the model and counted against it — the
+    self-selection bias Freestone et al. measure as a 0.0189 violation of a
+    nominal 1% threshold when the same decoys serve both roles.
+
+    Deterministic (fixed ``seed``) and blind to every feature/score — a pure
+    structural split of row positions. Returns a boolean array aligned to
+    ``is_decoy``, True for decoys assigned to the TRAINING half (meaningless
+    for target rows). Returns ``None`` when there are too few decoys (< 4) to
+    split meaningfully, so the caller can fall back to unsplit behaviour.
+    """
+    is_decoy = np.asarray(is_decoy, dtype=bool)
+    decoy_idx = np.where(is_decoy)[0]
+    if len(decoy_idx) < 4:
+        return None
+    rng = np.random.default_rng(seed)
+    train_idx = rng.choice(decoy_idx, size=len(decoy_idx) // 2, replace=False)
+    mask = np.zeros(len(is_decoy), dtype=bool)
+    mask[train_idx] = True
+    return mask
+
+
+def _tdc_qvalues_masked(
+    scores: np.ndarray,
+    is_decoy: np.ndarray,
+    estimate_mask: np.ndarray | None = None,
+    **kwargs,
+) -> np.ndarray:
+    """``_tdc_qvalues`` restricted to an estimation subset (H-fdr-2 decoy holdout).
+
+    When ``estimate_mask`` is given, only rows inside it (targets + held-out
+    decoys under decoy-split) contribute to and receive a q-value; rows outside
+    it (decoys used for training) get NaN — harmless, since reported ID counts
+    are always gated on ``~is_decoy`` and a training decoy is never counted as
+    an ID regardless of its own q-value. ``estimate_mask=None`` reproduces
+    plain ``_tdc_qvalues`` exactly (unsplit behaviour, the default).
+    """
+    if estimate_mask is None:
+        return _tdc_qvalues(scores, is_decoy, **kwargs)
+    out = np.full(len(scores), np.nan)
+    out[estimate_mask] = _tdc_qvalues(scores[estimate_mask], is_decoy[estimate_mask], **kwargs)
+    return out
+
+
 def _find_best_feature_labels(
     X: np.ndarray,
     is_decoy: np.ndarray,
@@ -511,6 +559,7 @@ def _find_best_feature_labels(
     init_fdr: float = 0.2,
     min_seed_positives: int = 50,
     seed_features: list[str] | None = None,
+    include_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, str, int] | None:
     """
     Mokapot-style best-feature seed initialization.
@@ -542,17 +591,32 @@ def _find_best_feature_labels(
     colocalization features are non-discriminative (heterogeneous tissue). ``None``
     or ``[]`` (default) uses every eligible feature, i.e. unchanged behaviour.
 
+    When ``include_mask`` is given (H-fdr-2 decoy-split), every row outside it
+    is invisible to the entire search — excluded from the per-feature/pairwise/
+    tree TDC computations and from the eligible-feature std check — and always
+    gets label 0 in the returned array. This is how a Percolator-RESET-style
+    held-out decoy half is firewalled out of the seed decision: it never
+    influences which feature is picked or what counts as a pseudo-positive.
+
     NaN values in X are filled with the column median before ranking.
 
     Returns
     -------
     (labels, best_feature_name, n_passing) or None when n_passing == 0.
-        labels: int8 array aligned to X rows.
+        labels: int8 array aligned to the ORIGINAL (full-length) X rows, even
+            when ``include_mask`` was given.
             +1  — pseudo-positive: target at q <= init_fdr under best feature
             -1  — pseudo-negative: decoy
-             0  — excluded: target at q > init_fdr
+             0  — excluded: target at q > init_fdr, or outside ``include_mask``
     """
     is_decoy = np.asarray(is_decoy, dtype=bool)
+
+    if include_mask is not None:
+        include_mask = np.asarray(include_mask, dtype=bool)
+        _orig_n = len(is_decoy)
+        _orig_idx = np.where(include_mask)[0]
+        X = X[include_mask]
+        is_decoy = is_decoy[include_mask]
 
     # Optional allowlist: restrict seeding to a chosen feature subset (R2).
     _seed_allow = set(seed_features) if seed_features else None
@@ -681,7 +745,52 @@ def _find_best_feature_labels(
 
     if result is None or result[2] == 0:
         return None
+    if include_mask is not None:
+        full_labels = np.zeros(_orig_n, dtype=np.int8)
+        full_labels[_orig_idx] = result[0]
+        result = (full_labels, result[1], result[2])
     return result
+
+
+def _find_best_feature_labels_escalating(
+    X: np.ndarray,
+    is_decoy: np.ndarray,
+    feature_names: list[str],
+    init_fdr: float,
+    min_seed_positives: int = 50,
+    seed_features: list[str] | None = None,
+    include_mask: np.ndarray | None = None,
+    escalate: bool = False,
+    step: float = 0.005,
+    ceiling: float = 0.5,
+) -> tuple[tuple[np.ndarray, str, int] | None, float]:
+    """``_find_best_feature_labels`` with H-fdr-2's training-FDR escalation.
+
+    If ``init_fdr`` yields nothing (``None``), retries at increasing thresholds
+    (steps of ``step``, capped at ``ceiling``) until a non-empty seed is found
+    or the ceiling is reached — Freestone et al. (2025)'s Percolator-RESET
+    escalates from 0.01 in steps of 0.005; here it escalates from whichever
+    ``init_fdr`` was actually configured, since that is already the analogous
+    "how strict is a seed candidate" threshold in this pipeline. A no-op when
+    ``escalate`` is False or the configured threshold already succeeds.
+
+    Returns ``(bf_result, fdr_used)`` — ``fdr_used`` equals ``init_fdr`` unless
+    escalation actually fired.
+    """
+    fdr = init_fdr
+    result = _find_best_feature_labels(
+        X, is_decoy, feature_names, fdr,
+        min_seed_positives=min_seed_positives, seed_features=seed_features,
+        include_mask=include_mask,
+    )
+    while result is None and escalate and fdr < ceiling:
+        fdr += step
+        result = _find_best_feature_labels(
+            X, is_decoy, feature_names, fdr,
+            min_seed_positives=min_seed_positives, seed_features=seed_features,
+            include_mask=include_mask,
+        )
+    return result, fdr
 
 
 def _make_fold_ids(is_decoy: np.ndarray, cv_folds: int) -> np.ndarray | None:
@@ -760,6 +869,9 @@ def _rescore_linear(
     make_clf=None,
     clf_name: str = "lda",
     fitted_out: dict | None = None,
+    decoy_split_mask: np.ndarray | None = None,
+    train_fdr_escalate: bool = False,
+    pseudo_label_growth_cap: float | None = None,
 ) -> np.ndarray:
     """
     Semi-supervised rescoring on MALDI-intrinsic features with a linear,
@@ -795,6 +907,33 @@ def _rescore_linear(
     When ``n_interaction_features > 0`` and R1 importances are supplied, the
     top-k features are expanded with pairwise interaction terms before LDA.
 
+    ``decoy_split_mask`` (H-fdr-2, Percolator-RESET, opt-in): a boolean array
+    aligned to ``features_df`` rows, True for decoys assigned to the training
+    half (see ``_split_decoys_for_reset``). When given, decoys outside it are
+    firewalled out of every internal decision in this function — the R1/seed_mask
+    label assignment, every ``_find_best_feature_labels`` call, and every
+    iteration's pseudo-label update — always receiving label 0 (excluded from
+    training, still scored via CV out-of-fold). The final external FDR estimate
+    (in ``rescore()``, after winner selection) is what actually gets computed
+    against those held-out decoys instead; this function only ever sees/uses the
+    training half.
+
+    ``train_fdr_escalate`` (H-fdr-2, opt-in): if the seed search or an iteration
+    would otherwise yield zero pseudo-positives at the configured ``init_fdr``/
+    ``train_fdr``, retries at increasing thresholds (steps of 0.005, capped at
+    0.5) until a non-empty discovery set is found or the cap is reached, instead
+    of falling back to the weaker ppm-based heuristic or stopping early. A no-op
+    whenever the configured threshold already succeeds.
+
+    ``pseudo_label_growth_cap`` (H-fdr-5, opt-in): if an iteration's pseudo-
+    positive count exceeds this multiple of the initial seed size, the loop
+    stops *without* accepting that iteration's label update — the returned
+    scores come from the model trained on the last iteration within the cap.
+    Guards against the self-training loop amplifying a leak or a noisy seed
+    into a runaway positive set (F-020's amplification mechanism, independent
+    of whether the seed itself is trustworthy). ``None`` (default) disables it,
+    reproducing the unbounded-growth behaviour exactly.
+
     Returns ``(scores, importances, feature_names_used)``.
     """
     from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -815,6 +954,18 @@ def _rescore_linear(
 
     is_decoy = df["is_decoy"].values.astype(bool)
     is_target = ~is_decoy
+
+    # H-fdr-2 decoy split: rows visible to every internal seed/pseudo-label
+    # decision are targets plus training-half decoys only. Held-out decoys are
+    # excluded (label 0) throughout this function; the caller estimates the
+    # final FDR against them separately. include_mask=None (decoy_split_mask
+    # not given) is all-True, reproducing unsplit behaviour exactly.
+    if decoy_split_mask is not None:
+        include_mask = is_target | (is_decoy & decoy_split_mask)
+        is_decoy_train = is_decoy & decoy_split_mask
+    else:
+        include_mask = None
+        is_decoy_train = is_decoy
 
     # --- Polynomial interaction setup (R2 only when importances supplied) ---
     use_poly = (
@@ -850,16 +1001,18 @@ def _rescore_linear(
     n_init_positives: int | None = None  # for post-loop comparison (R1 only)
 
     if seed_mask is None:
-        bf_result = _find_best_feature_labels(
+        bf_result, _bf_fdr = _find_best_feature_labels_escalating(
             X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives,
-            seed_features=seed_features
+            seed_features=seed_features, include_mask=include_mask,
+            escalate=train_fdr_escalate,
         )
         if bf_result is not None:
             labels, _best_feat, _n_init = bf_result
             n_init_positives = _n_init
+            _esc_note = f" (escalated from {init_fdr:.3g})" if _bf_fdr != init_fdr else ""
             logger.info(
                 f"  {_tag}: best-feature init on '{_best_feat}', "
-                f"{_n_init} targets at q≤{init_fdr:.3g}"
+                f"{_n_init} targets at q≤{_bf_fdr:.3g}{_esc_note}"
             )
         else:
             logger.warning(
@@ -876,10 +1029,10 @@ def _rescore_linear(
                 init_mask = (
                     is_target & (ppm_col < ppm_col[is_target].quantile(r1_seed_percentile))
                 ).values
-            labels = _encode_labels(is_decoy, init_mask)
+            labels = _encode_labels(is_decoy_train, init_mask)
     else:
         seed_arr = seed_mask.values if hasattr(seed_mask, "values") else np.asarray(seed_mask)
-        labels = _encode_labels(is_decoy, seed_arr)
+        labels = _encode_labels(is_decoy_train, seed_arr)
 
     n_seed = int((labels == 1).sum())
     logger.info(f"  {_tag}: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
@@ -916,7 +1069,7 @@ def _rescore_linear(
 
     for iteration in range(max_iter):
         pos_idx = np.where(labels == 1)[0]
-        neg_idx = np.where(labels == -1)[0]  # all decoys
+        neg_idx = np.where(labels == -1)[0]  # training-half decoys only under decoy-split
 
         if len(pos_idx) == 0:
             logger.warning(f"  {_tag} iter {iteration + 1}: no positives — stopping early")
@@ -929,16 +1082,56 @@ def _rescore_linear(
         with threadpool_limits(limits=1, user_api="blas"):
             scores, pipe = _cv_semisup_scores(X_fit, labels, fold_ids, _make_pipe)
 
-        q_values = _tdc_qvalues(scores, is_decoy)
-        new_labels = _encode_labels(is_decoy, q_values <= train_fdr)
-        n_new = int((new_labels == 1).sum())
+        # H-fdr-2 decoy split: q-values (and therefore which targets become
+        # pseudo-positives) are computed over targets + training-decoys only.
+        # Held-out decoys are excluded from this population entirely, never
+        # just relabelled -- keeping them in as fake "not is_decoy" rows would
+        # inflate the apparent target count.
+        if include_mask is not None:
+            q_masked = _tdc_qvalues(scores[include_mask], is_decoy[include_mask])
+        else:
+            q_masked = _tdc_qvalues(scores, is_decoy)
+
+        def _labels_at(fdr, _q=q_masked):
+            if include_mask is not None:
+                nl = np.zeros(len(is_decoy), dtype=np.int8)
+                nl[include_mask] = _encode_labels(is_decoy[include_mask], _q <= fdr)
+            else:
+                nl = _encode_labels(is_decoy, _q <= fdr)
+            return nl, int((nl == 1).sum())
+
+        # H-fdr-2 training-FDR escalation: retry at increasing thresholds
+        # rather than giving up the moment a strict train_fdr yields nothing.
+        _iter_fdr = train_fdr
+        new_labels, n_new = _labels_at(_iter_fdr)
+        while n_new == 0 and train_fdr_escalate and _iter_fdr < 0.5:
+            _iter_fdr += 0.005
+            new_labels, n_new = _labels_at(_iter_fdr)
+        _esc_note = f" (escalated to {_iter_fdr:.3g})" if _iter_fdr != train_fdr else ""
 
         logger.info(
-            f"  {_tag} iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size})"
+            f"  {_tag} iter {iteration + 1}: pseudo-positives = {n_new} "
+            f"(prev = {prev_pos_size}){_esc_note}"
         )
 
         if n_new == 0:
-            logger.warning(f"  {_tag}: no pseudo-positives at q≤{train_fdr:.3g} — stopping early")
+            logger.warning(f"  {_tag}: no pseudo-positives at q≤{_iter_fdr:.3g} — stopping early")
+            break
+
+        # H-fdr-5: cap self-training growth relative to the initial seed size —
+        # stop (keeping THIS iteration's scores, from the last trustworthy label
+        # set) rather than accept a pseudo-positive set that ran away regardless
+        # of convergence. Independent of decoy-split; guards the same amplify-
+        # whatever-the-seed-hands-it behaviour F-020 found exploiting a leak.
+        if (
+            pseudo_label_growth_cap is not None
+            and n_seed > 0
+            and n_new > pseudo_label_growth_cap * n_seed
+        ):
+            logger.warning(
+                f"  {_tag}: pseudo-positive growth capped — {n_new} > "
+                f"{pseudo_label_growth_cap}x seed ({n_seed}); stopping, keeping previous model"
+            )
             break
 
         change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
@@ -1701,6 +1894,9 @@ def rescore(
     region_coloc_k: int = 20,
     within_region_coloc: bool = False,
     cosine_coloc: bool = False,
+    decoy_split: bool = False,
+    train_fdr_escalate: bool = False,
+    pseudo_label_growth_cap: float | None = None,
     drop_zero_signal: bool = False,
     entrapment: bool = False,
     substitution_n_residues: int = 1,
@@ -1935,6 +2131,24 @@ def rescore(
     pseudo_label_fdr
         Legacy parameter (SVM/CatBoost): FDR threshold for pseudo-label
         iteration. Use ``train_fdr`` for LDA/QDA.
+    decoy_split
+        H-fdr-2 (Percolator-RESET, Freestone et al. 2025), opt-in. Splits
+        decoys into a training half and a held-out half; every seed/pseudo-
+        label decision and the model fit use only the training half, and the
+        final reported FDR is estimated against the held-out half only — the
+        same decoy never both teaches the discriminant and gets counted
+        against it. Only wired for the {lda, svm, gbt, rbf_svm} backends
+        (``_rescore_linear``); the ``qda`` backend is unaffected.
+    train_fdr_escalate
+        H-fdr-2, opt-in. If ``init_fdr``/``train_fdr`` would otherwise yield
+        zero pseudo-positives, retries at increasing thresholds (steps of
+        0.005, capped at 0.5) before giving up. A no-op whenever the
+        configured threshold already succeeds.
+    pseudo_label_growth_cap
+        H-fdr-5, opt-in. Stops the self-training loop (without accepting that
+        iteration's label update) once the pseudo-positive count exceeds this
+        multiple of the initial seed size, regardless of convergence. ``None``
+        (default) disables it.
     r1_seed_percentile
         Percentile of target R1 scores used as the seed threshold for R2
         (LDA/QDA). The top ``(1 - r1_seed_percentile)`` fraction of target
@@ -2996,6 +3210,23 @@ def rescore(
         _r1_fitted: dict = {}
         _r2_fitted: dict = {}
 
+        # H-fdr-2 decoy split (Percolator-RESET): computed once, aligned to
+        # features_df's row order. R2's/the final report's view of it is
+        # re-indexed through winner_pos below, since _select_feature_winners
+        # subsets and reorders rows.
+        decoy_split_mask_r1 = None
+        if decoy_split:
+            decoy_split_mask_r1 = _split_decoys_for_reset(features_df["is_decoy"].values)
+            if decoy_split_mask_r1 is None:
+                logger.warning(
+                    "  decoy_split requested but too few decoys (<4) to split — proceeding unsplit"
+                )
+            else:
+                logger.info(
+                    f"  decoy_split: {int(decoy_split_mask_r1.sum())} training decoys, "
+                    f"{int((features_df['is_decoy'].values & ~decoy_split_mask_r1).sum())} held-out for FDR estimation"
+                )
+
         # --- Round 1: score all candidates ---
         scores1, _imp_r1_lda, _struct_coefs_r1_lda, _struct_names_r1_lda, _imp_names_lda = _linear(
             features_df,
@@ -3008,6 +3239,9 @@ def rescore(
             min_seed_positives=min_seed_positives,
             seed_features=seed_features,
             fitted_out=_r1_fitted,
+            decoy_split_mask=decoy_split_mask_r1,
+            train_fdr_escalate=train_fdr_escalate,
+            pseudo_label_growth_cap=pseudo_label_growth_cap,
             **_svm_kwargs,
         )
         # Output importances
@@ -3032,6 +3266,11 @@ def rescore(
         logger.info(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
+        )
+        # Re-index the decoy split onto the winner subset's row order for R2
+        # training and for the final held-out FDR estimate below.
+        decoy_split_mask_w = (
+            decoy_split_mask_r1[winner_pos] if decoy_split_mask_r1 is not None else None
         )
 
         # --- Round 2: retrain on winner subset (skipped when single_round) ---
@@ -3091,6 +3330,9 @@ def rescore(
                 r1_seed_percentile=r1_seed_percentile,
                 min_seed_positives=min_seed_positives,
                 fitted_out=_r2_fitted,
+                decoy_split_mask=decoy_split_mask_w,
+                train_fdr_escalate=train_fdr_escalate,
+                pseudo_label_growth_cap=pseudo_label_growth_cap,
                 **_svm_kwargs,
             )
             # Output importances
@@ -3112,7 +3354,19 @@ def rescore(
 
         # --- Standard TDC FDR on winners ---
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
-        q2 = _tdc_qvalues(scores2, is_decoy_w)
+        # H-fdr-2: the reported q-value is the actual RESET firewall — computed
+        # against targets + held-out decoys only, never the training-half decoys
+        # that taught the discriminant. A training-decoy winner row gets NaN
+        # here (harmless: reported ID counts are always gated on ~is_decoy, and
+        # a decoy is never counted as an ID regardless of its own q-value).
+        # Storey pi0 and PEP are NOT masked (scope: H-fdr-2's deliverable is the
+        # primary q-value/discovery-set count; both remain computed against the
+        # full decoy population when decoy_split is enabled).
+        _estimate_mask_w = (
+            (~is_decoy_w) | (is_decoy_w & ~decoy_split_mask_w)
+            if decoy_split_mask_w is not None else None
+        )
+        q2 = _tdc_qvalues_masked(scores2, is_decoy_w, estimate_mask=_estimate_mask_w)
         pep_w = estimate_pep(scores2, is_decoy_w)
         pep_q_w = _pep_qvalues(pep_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
@@ -3128,7 +3382,7 @@ def rescore(
             + lcms_prior_weight * np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
             + spatial_prior_weight * np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
-        rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+        rw_q2 = _tdc_qvalues_masked(reweighted2, is_decoy_w, estimate_mask=_estimate_mask_w)
 
         # --- Optional Storey pi0 correction ---
         if storey_pi0:

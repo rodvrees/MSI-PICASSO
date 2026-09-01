@@ -54,6 +54,9 @@
         "r2_seed_percentile":     {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_iter":               {"type": ["integer", "null"], "minimum": 1},
         "min_seed_positives":     {"type": ["integer", "null"], "minimum": 0},
+        "decoy_split":            {"type": ["boolean", "null"]},
+        "train_fdr_escalate":     {"type": ["boolean", "null"]},
+        "pseudo_label_growth_cap": {"type": ["number", "null"], "exclusiveMinimum": 0},
         "init_ppm_threshold":     {"type": ["number", "null"], "minimum": 0},
         "init_isotope_threshold": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
 
