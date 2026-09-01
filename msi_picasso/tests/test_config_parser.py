@@ -95,7 +95,22 @@ def test_maldi_extraction_section_preserved(tmp_path):
     toml.write_text('[MSI-PICASSO.maldi_extraction]\nmatching_ppm = 15.0\n')
     config = parse_configurations([str(toml)])["MSI-PICASSO"]
     assert config["maldi_extraction"]["matching_ppm"] == pytest.approx(15.0)
-    assert config["maldi_extraction"]["ppm_bin"] == pytest.approx(5.0)
+    # the untouched sibling key still comes from the packaged defaults
+    assert config["maldi_extraction"]["extraction_ppm"] == pytest.approx(25.0)
+
+
+def test_removed_feature_detection_keys_are_rejected(tmp_path):
+    """Feature finding moved to the TIMSImaging fork, so its knobs are gone.
+
+    The schema rejects unknown keys, so a config still carrying one fails loudly
+    instead of silently ignoring a setting the user believes is in effect. This
+    is the check that catches a stale config from before the move.
+    """
+    for dead_key in ("ppm_bin = 5.0", "deisotope = true", "peak_prominence = 0.01"):
+        toml = tmp_path / f"cfg_{dead_key.split()[0]}.toml"
+        toml.write_text(f"[MSI-PICASSO.maldi_extraction]\n{dead_key}\n")
+        with pytest.raises(Exception):
+            parse_configurations([str(toml)])
 
 
 def test_im2deep_section_preserved(tmp_path):

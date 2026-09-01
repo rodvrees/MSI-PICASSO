@@ -171,11 +171,11 @@ class TestWeightedMeanInvK0:
         assert out[1] == pytest.approx(1.0)
 
     def test_ccs_conversion_propagates_nan(self):
-        from msi_picasso.maldi_imzml import one_over_k0_to_ccs
+        from im2deep.utils import im2ccs
 
         query = np.array([1000.0, 1500.0], dtype=np.float64)
         mean_k0 = np.array([0.9, np.nan])
-        ccs = np.asarray(one_over_k0_to_ccs(mean_k0, query, charge=1), dtype=float)
+        ccs = np.asarray(im2ccs(mean_k0, query, 1), dtype=float)
         assert np.isfinite(ccs[0]) and ccs[0] > 0
         assert np.isnan(ccs[1])
 

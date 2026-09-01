@@ -355,23 +355,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     maldi_exc.add_argument(
-        "--maldi-imzml",
-        metavar="PATH",
-        help=(
-            "imzML file (.imzML + .ibd). SCiLS Lab-style interval-based "
-            "feature extraction is performed automatically. Ion images and "
-            "spatial features are reconstructed from the interval intensity "
-            "matrix. Use --maldi-d instead when the raw Bruker .d directory "
-            "is available to obtain full adduct/isotope extra images."
-        ),
-    )
-    maldi_exc.add_argument(
         "--maldi-d",
         metavar="PATH",
         help=(
             "Bruker .d directory (preferred raw path; provides full ion image "
-            "extraction including adduct and isotopologue extra images). Use "
-            "instead of --maldi-imzml when the raw data is available. "
+            "extraction including adduct and isotopologue extra images). "
             "Functionally equivalent to --maldi-raw."
         ),
     )
@@ -419,13 +407,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     raw_grp.add_argument(
-        "--ppm-bin",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="Peak-binning tolerance for feature detection (ppm). Default: 5.0.",
-    )
-    raw_grp.add_argument(
         "--extraction-ppm",
         type=float,
         default=None,
@@ -444,203 +425,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "m/z window for candidate matching (ppm). Applied when linking "
             "peptide candidates to detected MALDI features. Default: 20.0."
-        ),
-    )
-    raw_grp.add_argument(
-        "--min-fraction",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Minimum fraction of pixels a peak must be detected in to be "
-            "kept as a feature. Default: 0.01 (1%%)."
-        ),
-    )
-    raw_grp.add_argument(
-        "--peak-prominence",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Minimum peak prominence for SCiLS-style feature detection on profile "
-            "data, as a fraction of the mean-spectrum maximum. Lower values detect "
-            "more (weaker) features; higher values are more conservative. "
-            "Default: 0.01. Typical range: 0.001–0.05."
-        ),
-    )
-    raw_grp.add_argument(
-        "--smoothing-window",
-        type=int,
-        default=None,
-        metavar="INT",
-        help=(
-            "Savitzky-Golay smoothing window length (odd integer ≥ 3) applied to "
-            "the mean spectrum before peak detection (profile mode only). "
-            "Larger values smooth more but can shift peak apices. Default: 11."
-        ),
-    )
-    raw_grp.add_argument(
-        "--smoothing-polyorder",
-        type=int,
-        default=None,
-        metavar="INT",
-        help=(
-            "Savitzky-Golay polynomial order for mean-spectrum smoothing "
-            "(must be < --smoothing-window). Default: 2."
-        ),
-    )
-    raw_grp.add_argument(
-        "--interval-ppm-tolerance",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Fallback interval half-width (ppm) used when no valley flanks a "
-            "detected peak in the mean spectrum (profile mode only). Default: 5.0."
-        ),
-    )
-    raw_grp.add_argument(
-        "--min-interval-width-ppm",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Minimum interval full-width (ppm). Intervals narrower than this are "
-            "symmetrically expanded around the apex (profile mode only). Default: 1.0."
-        ),
-    )
-    raw_grp.add_argument(
-        "--normalize-rms",
-        action="store_true",
-        help=(
-            "RMS-normalize each pixel spectrum before mean spectrum accumulation "
-            "(profile mode only). Takes priority over the default TIC normalization. "
-            "Matches the SCiLS Lab default normalization."
-        ),
-    )
-    raw_grp.add_argument(
-        "--baseline-correction",
-        action="store_true",
-        help=(
-            "Apply rolling-minimum baseline subtraction to the mean spectrum before "
-            "peak detection (profile mode only)."
-        ),
-    )
-    raw_grp.add_argument(
-        "--baseline-window-ppm",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="Half-width (ppm) of the rolling-minimum baseline window. Default: 500.0.",
-    )
-    raw_grp.add_argument(
-        "--calibrant-mzs",
-        type=float,
-        nargs="*",
-        default=None,
-        metavar="MZ",
-        help=(
-            "Theoretical m/z values of internal calibrants (e.g. trypsin autolysis "
-            "peaks). When provided, detected apices are used to fit a linear ppm "
-            "correction and all intervals are recalibrated (profile mode only). "
-            "Example: --calibrant-mzs 842.51 870.54 1045.56"
-        ),
-    )
-    raw_grp.add_argument(
-        "--calibrant-tol-ppm",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="Search window (ppm) for matching detected apices to calibrant m/z. Default: 200.0.",
-    )
-    raw_grp.add_argument(
-        "--deisotope",
-        action="store_true",
-        help=(
-            "Remove isotope satellite peaks using ms_deisotope after interval "
-            "detection, retaining only monoisotopic peaks (profile mode only)."
-        ),
-    )
-    raw_grp.add_argument(
-        "--deisotope-error-ppm",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="PPM error tolerance for isotope envelope fitting. Default: 15.0.",
-    )
-    raw_grp.add_argument(
-        "--deisotope-min-score",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="Minimum MSDeconV fit score to accept an isotope envelope. Default: 10.0.",
-    )
-    raw_grp.add_argument(
-        "--deisotope-averagine",
-        default=None,
-        choices=["peptide", "glycopeptide", "glycan", "heparin"],
-        metavar="MODEL",
-        help="Averagine model for isotope envelope prediction. Default: peptide.",
-    )
-    raw_grp.add_argument(
-        "--deisotope-scorer",
-        default=None,
-        choices=["MSDeconVFitter", "PenalizedMSDeconVFitter"],
-        metavar="SCORER",
-        help="ms_deisotope scoring function. Default: MSDeconVFitter.",
-    )
-    raw_grp.add_argument(
-        "--deisotope-charge-range",
-        type=int,
-        nargs=2,
-        default=None,
-        metavar=("MIN", "MAX"),
-        help="Charge range for deconvolution. Default: 1 1 (MALDI [M+H]+).",
-    )
-    raw_grp.add_argument(
-        "--filter-mass-defect",
-        action="store_true",
-        help=(
-            "Apply Senko-plot peptide corridor mass defect filter after interval "
-            "detection (profile mode only). Removes lipids and matrix clusters."
-        ),
-    )
-    raw_grp.add_argument(
-        "--mass-defect-halfwidth",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Half-width of the mass defect corridor. Default 0.5 passes all peaks "
-            "(effectively disabled). Use 0.15–0.20 for a meaningful peptide filter."
-        ),
-    )
-    raw_grp.add_argument(
-        "--picking-height",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Picking height for apex m/z centroid refinement (mMass-style). "
-            "The apex is reported as the midpoint of the two interpolated "
-            "crossing points at this fraction of the peak maximum. "
-            "Default 0.75 matches the mMass 75%% setting. Use 0.0 to disable "
-            "(raw smoothed-spectrum apex)."
-        ),
-    )
-    raw_grp.add_argument(
-        "--local-prominence-window-da",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Half-width in Da of the sliding-window local maximum used as the "
-            "reference for the peak height threshold. When > 0, the threshold "
-            "for each peak is peak_prominence × local_max(±window) instead of "
-            "peak_prominence × global_max. This reduces the effective threshold "
-            "in low-signal m/z regions (e.g. >1600 Da) where genuine peptide "
-            "peaks would otherwise fall below the global threshold. "
-            "Default 0 (global max, disabled). Suggested value: 200."
         ),
     )
     raw_grp.add_argument(
@@ -1320,8 +1104,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Restrict colocalization to pixels that were actually rastered, using the "
             "pixel coordinate list from the MALDI data source rather than the TIC > 0 "
             "heuristic. Useful for partial-raster acquisitions where only a sub-region "
-            "of the slide was scanned. Supported for --maldi-raw/--maldi-d and "
-            "--maldi-imzml inputs; no-op for NPZ/m/z-list inputs."
+            "of the slide was scanned. Supported for --maldi-raw/--maldi-d inputs; "
+            "no-op for NPZ/m/z-list inputs."
         ),
     )
     rescore_grp.add_argument(
@@ -1498,7 +1282,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="METHOD",
         help=(
             "CCS calibration strategy for IM2Deep predictions when observed CCS "
-            "values are provided (via --feature-mzs or --maldi-imzml). "
+            "values are provided (via --feature-mzs). "
             "'linear' applies a global additive shift (default); "
             "'spline' fits a piecewise spline for non-linear bias correction; "
             "'finetune' adapts the neural network weights to the observed MALDI CCS "
@@ -1604,7 +1388,7 @@ def main() -> None:
         "calibration_percentile", "maldi_query_raw", "raw_query_cache_dir",
         # file paths
         "fasta", "extra_fasta", "entrapment_fasta", "mzml",
-        "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d",
+        "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_d",
         "feature_mzs", "save_npz", "save_spatial", "spatial_features",
         "lcms_peptides", "lcms_proteins", "lcms_psms", "msf",
         "debug_gt", "psm_utils_reader",
@@ -1620,22 +1404,11 @@ def main() -> None:
 
     # Extraction params: config defaults overridden by non-None CLI args.
     _extraction = dict(_ms1cfg.get("maldi_extraction", {}))
-    _EXTRACTION_SCALAR_ATTRS = (
-        "ppm_bin", "extraction_ppm", "matching_ppm", "min_fraction",
-        "peak_prominence", "smoothing_window", "smoothing_polyorder",
-        "interval_ppm_tolerance", "min_interval_width_ppm", "baseline_window_ppm",
-        "calibrant_tol_ppm", "deisotope_error_ppm", "deisotope_min_score",
-        "deisotope_averagine", "deisotope_scorer", "deisotope_charge_range",
-        "mass_defect_halfwidth", "picking_height", "local_prominence_window_da",
-        "calibrant_mzs",
-    )
+    _EXTRACTION_SCALAR_ATTRS = ("extraction_ppm", "matching_ppm")
     for _attr in _EXTRACTION_SCALAR_ATTRS:
         _val = getattr(args, _attr, None)
         if _val is not None:
             _extraction[_attr] = _val
-    for _bkey in ("normalize_rms", "baseline_correction", "deisotope", "filter_mass_defect"):
-        if getattr(args, _bkey, False):
-            _extraction[_bkey] = True
 
     # Convenience aliases from config
     output_dir = _ms1cfg["output_dir"]
@@ -1672,7 +1445,7 @@ def main() -> None:
         parser.error("--digest requires --fasta.")
 
     # Validate mutually exclusive MALDI inputs (argparse enforces CLI; check config too)
-    _maldi_input_keys = ("maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d")
+    _maldi_input_keys = ("maldi_npz", "maldi_mzs", "maldi_raw", "maldi_d")
     _active_maldi = [k for k in _maldi_input_keys if _ms1cfg.get(k)]
     if len(_active_maldi) > 1:
         parser.error(
@@ -1681,7 +1454,7 @@ def main() -> None:
     if len(_active_maldi) == 0:
         parser.error(
             "No MALDI input specified. Provide one of: --maldi-npz, --maldi-mzs, "
-            "--maldi-raw, --maldi-imzml, --maldi-d (or set the equivalent key in "
+            "--maldi-raw, --maldi-d (or set the equivalent key in "
             "the config file)."
         )
 
@@ -1703,7 +1476,6 @@ def main() -> None:
     _measured_pixel_mask: "np.ndarray | None" = None  # built when --coloc-measured-mask is set
 
     _maldi_raw_path: str | None = _ms1cfg.get("maldi_raw") or _ms1cfg.get("maldi_d")
-    _maldi_imzml_path: str | None = _ms1cfg.get("maldi_imzml")
     _feature_mzs_path: str | None = _ms1cfg.get("feature_mzs")
     _maldi_query_raw = bool(_ms1cfg.get("maldi_query_raw"))
     if _maldi_raw_path and _maldi_query_raw:
@@ -1741,30 +1513,8 @@ def main() -> None:
         maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes, _raw_pixel_coords = extract_maldi_data(
             _maldi_raw_path,
             feature_mzs=precomputed_mzs,
-            ppm_bin=_extraction["ppm_bin"],
             extraction_ppm=_extraction["extraction_ppm"],
             matching_ppm=_extraction["matching_ppm"],
-            min_fraction=_extraction["min_fraction"],
-            peak_prominence=_extraction["peak_prominence"],
-            smoothing_window=_extraction["smoothing_window"],
-            smoothing_polyorder=_extraction["smoothing_polyorder"],
-            ppm_tolerance=_extraction["interval_ppm_tolerance"],
-            min_interval_width_ppm=_extraction["min_interval_width_ppm"],
-            normalize_rms=_extraction["normalize_rms"],
-            baseline_correction=_extraction["baseline_correction"],
-            baseline_window_ppm=_extraction["baseline_window_ppm"],
-            calibrant_mzs=_extraction["calibrant_mzs"],
-            calibrant_tol_ppm=_extraction["calibrant_tol_ppm"],
-            deisotope=_extraction["deisotope"],
-            deisotope_averagine=_extraction["deisotope_averagine"],
-            deisotope_scorer=_extraction["deisotope_scorer"],
-            deisotope_min_score=_extraction["deisotope_min_score"],
-            deisotope_charge_range=tuple(_extraction["deisotope_charge_range"]),
-            deisotope_error_ppm=_extraction["deisotope_error_ppm"],
-            filter_mass_defect=_extraction["filter_mass_defect"],
-            mass_defect_halfwidth=_extraction["mass_defect_halfwidth"],
-            picking_height=_extraction["picking_height"],
-            local_prominence_window_da=_extraction["local_prominence_window_da"],
             output_npz=_ms1cfg.get("save_npz"),
             output_spatial_tsv=_ms1cfg.get("save_spatial"),
             output_dir=output_dir,
@@ -1780,78 +1530,6 @@ def main() -> None:
             _H, _W = ion_images.shape[1], ion_images.shape[2]
             _measured_pixel_mask = np.zeros(_H * _W, dtype=bool)
             _measured_pixel_mask[np.asarray(_yc, dtype=np.int64) * _W + np.asarray(_xc, dtype=np.int64)] = True
-            logger.info(f"  Measured-pixel mask: {int(_measured_pixel_mask.sum())}/{_measured_pixel_mask.size} pixels rastered")
-    elif _maldi_imzml_path:
-        from msi_picasso.maldi_imzml import (
-            SCiLSConfig, extract_scils_features,
-            reconstruct_ion_images_from_intervals, build_envelopes_from_intervals,
-        )
-
-        logger.info(
-            "MALDI features extracted from imzML data (SCiLS Lab-style interval extraction). "
-            "Ion images reconstructed from interval intensity matrix."
-        )
-        logger.info(f"Extracting MALDI features from imzML: {_maldi_imzml_path}")
-        cfg = SCiLSConfig(
-            min_pixel_fraction=_extraction["min_fraction"],
-            peak_prominence=_extraction["peak_prominence"],
-            smoothing_window=_extraction["smoothing_window"],
-            smoothing_polyorder=_extraction["smoothing_polyorder"],
-            ppm_tolerance=_extraction["interval_ppm_tolerance"],
-            min_interval_width_ppm=_extraction["min_interval_width_ppm"],
-            normalize_rms=_extraction["normalize_rms"],
-            baseline_correction=_extraction["baseline_correction"],
-            baseline_window_ppm=_extraction["baseline_window_ppm"],
-            calibrant_mzs=_extraction.get("calibrant_mzs") or [],
-            calibrant_tol_ppm=_extraction["calibrant_tol_ppm"],
-            deisotope=_extraction["deisotope"],
-            deisotope_averagine=_extraction["deisotope_averagine"],
-            deisotope_scorer=_extraction["deisotope_scorer"],
-            deisotope_min_score=_extraction["deisotope_min_score"],
-            deisotope_charge_range=tuple(_extraction["deisotope_charge_range"]),
-            deisotope_error_ppm=_extraction["deisotope_error_ppm"],
-            filter_mass_defect=_extraction["filter_mass_defect"],
-            mass_defect_halfwidth=_extraction["mass_defect_halfwidth"],
-            picking_height=_extraction["picking_height"],
-            local_prominence_window_da=_extraction["local_prominence_window_da"],
-        )
-        intervals, intensity_matrix, pixel_coords, mean_1_over_k0 = extract_scils_features(
-            _maldi_imzml_path,
-            config=cfg,
-            output_dir=output_dir,
-            visualize=False,
-        )
-        maldi_mzs = np.array([apex for _, _, apex in intervals])
-
-        # Reconstruct 3D ion images from the flat interval intensity matrix
-        ion_images = reconstruct_ion_images_from_intervals(
-            intensity_matrix, pixel_coords, len(intervals)
-        )
-        ion_image_mzs = maldi_mzs if len(intervals) > 0 else None
-        extra_ion_images = None  # adduct images unavailable from pre-integrated intervals
-
-        # Compute spatial features from reconstructed ion images
-        if len(intervals) > 0:
-            from msi_picasso.maldi_extraction import compute_spatial_features as _csf
-            spatial_features = _csf(ion_images, maldi_mzs, len(pixel_coords))
-
-        # Build approximate isotope envelopes from interval mean intensities
-        maldi_envelopes = build_envelopes_from_intervals(intervals, intensity_matrix)
-
-        logger.info(
-            f"  {len(maldi_mzs)} intervals extracted"
-            + (f", ion images {ion_images.shape[1:]}" if len(intervals) > 0 else "")
-        )
-        if mean_1_over_k0 is not None and len(mean_1_over_k0) == len(maldi_mzs):
-            from msi_picasso.maldi_imzml import one_over_k0_to_ccs
-            _ccs_arr = one_over_k0_to_ccs(mean_1_over_k0, maldi_mzs)
-            logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
-        if bool(_ms1cfg.get("coloc_measured_mask", False)) and ion_images is not None and len(intervals) > 0:
-            _coords_arr = np.asarray(pixel_coords, dtype=np.int64)
-            _xs_c, _ys_c = _coords_arr[:, 0], _coords_arr[:, 1]
-            _H, _W = ion_images.shape[1], ion_images.shape[2]
-            _measured_pixel_mask = np.zeros(_H * _W, dtype=bool)
-            _measured_pixel_mask[_ys_c * _W + _xs_c] = True
             logger.info(f"  Measured-pixel mask: {int(_measured_pixel_mask.sum())}/{_measured_pixel_mask.size} pixels rastered")
     else:
         maldi_mzs, ion_images, ion_image_mzs, _ccs_arr, extra_ion_images, _mzs_intensities = _load_maldi(

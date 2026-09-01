@@ -1,12 +1,15 @@
 """
 Extract MALDI-MSI features from raw Bruker .d/TSF data via imzy.
 
-Three steps:
-  1. detect_features   — find consensus m/z peaks across all pixels
-  2. extract_ion_images — extract a 3D ion image array for those peaks
-  3. compute_spatial_features — fraction_detected, mean_intensity, CV, Moran's I
+Two steps:
+  1. extract_ion_images — extract a 3D ion image array for a given feature list
+  2. compute_spatial_features — fraction_detected, mean_intensity, CV, Moran's I
 
-All three are orchestrated by extract_maldi_data(), which is the public entry point.
+Both are orchestrated by extract_maldi_data(), which is the public entry point.
+
+Feature *finding* is deliberately not here. It lives in the TIMSImaging fork,
+which picks peaks in 2D (m/z, 1/K0) rather than on an m/z axis alone; this module
+consumes the feature list it produces via ``--feature-mzs``.
 """
 
 import logging
@@ -18,175 +21,6 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Feature detection
-# ---------------------------------------------------------------------------
-
-
-def detect_features(
-    reader,
-    ppm_bin: float = 5.0,
-    min_fraction: float = 0.01,
-) -> np.ndarray:
-    """
-    Detect consensus m/z features by per-pixel logarithmic histogram binning.
-
-    Uses O(n_bins) memory regardless of the total number of peaks across all
-    pixels.  Each pixel's peaks are accumulated into fine bins (ppm_bin/4 wide)
-    in a single streaming pass.  A greedy merge step then re-applies the
-    ppm_bin grouping rule on the (small) set of non-empty bin centroids,
-    matching the semantics of the original collect-then-sort algorithm while
-    avoiding the large intermediate peak arrays.
-
-    Parameters
-    ----------
-    reader
-        An imzy reader object.  Must support ``reader.n_pixels``,
-        ``reader.mz_min``, ``reader.mz_max``, and
-        ``reader.spectra_iter(silent=False)``.
-    ppm_bin
-        Feature grouping tolerance in ppm.  Default 5.0.
-    min_fraction
-        Minimum fraction of pixels a feature must be detected in.
-        Default 0.01 (1 %).
-
-    Returns
-    -------
-    np.ndarray
-        Sorted 1D float64 array of feature m/z values.
-    """
-    n_pixels = reader.n_pixels
-    min_count = max(1, int(min_fraction * n_pixels))
-
-    mz_ref = float(getattr(reader, "mz_min", 100.0))
-    if mz_ref <= 0:
-        mz_ref = 100.0
-    mz_top = float(getattr(reader, "mz_max", 4000.0))
-
-    # Fine bins at ppm_bin/4 resolution: each real feature spans ≤4 fine bins,
-    # preventing the original ppm_bin-wide bins from splitting features at edges.
-    fine_ppm = ppm_bin / 4.0
-    fine_log_width = np.log1p(fine_ppm * 1e-6)
-    n_bins = int(np.ceil(np.log(mz_top / mz_ref) / fine_log_width)) + 2
-    log_mz_ref = np.log(mz_ref)
-
-    # Three arrays at O(n_bins × 8 bytes) — ~26 MB for a typical MALDI range.
-    bin_pixel_count = np.zeros(n_bins, dtype=np.int32)
-    bin_intensity_sum = np.zeros(n_bins, dtype=np.float64)
-    bin_mz_int_sum = np.zeros(n_bins, dtype=np.float64)
-
-    n_total_peaks = 0
-    for _px, (mzs, ints) in enumerate(reader.spectra_iter(silent=False)):
-        if len(mzs) == 0:
-            continue
-        mzs_f = np.asarray(mzs, dtype=np.float64)
-        ints_f = np.asarray(ints, dtype=np.float64)
-        valid = mzs_f > 0
-        if not valid.all():
-            mzs_f = mzs_f[valid]
-            ints_f = ints_f[valid]
-        if len(mzs_f) == 0:
-            continue
-
-        n_total_peaks += len(mzs_f)
-        bin_idx = np.floor((np.log(mzs_f) - log_mz_ref) / fine_log_width).astype(np.int32)
-        np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
-
-        # unique_bins: distinct bins hit this pixel; inverse: maps each peak → position in unique_bins.
-        # bincount on inverse is O(n_peaks), not O(n_bins) — avoids 1M-element array per pixel.
-        unique_bins, inverse = np.unique(bin_idx, return_inverse=True)
-        n_uniq = len(unique_bins)
-
-        bin_pixel_count[unique_bins] += 1
-        bin_intensity_sum[unique_bins] += np.bincount(inverse, weights=ints_f, minlength=n_uniq)
-        bin_mz_int_sum[unique_bins] += np.bincount(inverse, weights=mzs_f * ints_f, minlength=n_uniq)
-
-    logger.info(
-        f"  Processed {n_total_peaks:,} peaks from {n_pixels:,} pixels "
-        f"({n_total_peaks / max(n_pixels, 1):.0f} peaks/pixel average)"
-    )
-
-    # Candidate bins: any bin that received at least one pixel contribution.
-    cand_idx = np.where(bin_pixel_count > 0)[0]
-    if len(cand_idx) == 0:
-        logger.warning("No peaks found in any pixel — returning empty feature list.")
-        return np.array([], dtype=np.float64)
-
-    cand_int = bin_intensity_sum[cand_idx]
-    cand_mz_int = bin_mz_int_sum[cand_idx]
-    cand_cnt = bin_pixel_count[cand_idx]
-    cand_mzs = np.where(
-        cand_int > 0,
-        cand_mz_int / cand_int,
-        mz_ref * np.exp((cand_idx + 0.5) * fine_log_width),
-    )
-
-    # Greedy merge: group candidate-bin centroids within ppm_bin of each other
-    # (same rule as the original algorithm).  Centroided spectra have at most
-    # one peak per feature per pixel, so pixel counts sum without double-counting.
-    feature_mzs: list[float] = []
-    n = len(cand_mzs)
-    i = 0
-    while i < n:
-        anchor = cand_mzs[i]
-        j = i + 1
-        while j < n and (cand_mzs[j] - anchor) / anchor * 1e6 <= ppm_bin:
-            j += 1
-
-        if int(cand_cnt[i:j].sum()) >= min_count:
-            grp_int = cand_int[i:j].sum()
-            grp_mz_int = cand_mz_int[i:j].sum()
-            feature_mzs.append(
-                float(grp_mz_int / grp_int) if grp_int > 0 else float(cand_mzs[i:j].mean())
-            )
-        i = j
-
-    result = np.array(feature_mzs, dtype=np.float64)
-    logger.info(
-        f"  {len(result)} features detected "
-        f"(ppm_bin={ppm_bin}, min_fraction={min_fraction})"
-    )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Profile mean spectrum (for SCiLS-style feature detection)
-# ---------------------------------------------------------------------------
-
-
-def _build_profile_mean_spectrum(reader, normalize_rms: bool = False, normalize_tic: bool = False) -> tuple[np.ndarray, np.ndarray]:
-    """Return (mz_grid, mean_intensities) for aligned profile data.
-
-    All pixels must share the same m/z axis (verified upstream via
-    reader.is_centroid == False and imzy's aligned profile guarantee).
-    """
-    mz_grid = None
-    acc = None
-    count = 0
-    for mzs, ints in reader.spectra_iter(silent=False):
-        mzs = np.asarray(mzs, dtype=np.float64)
-        ints = np.asarray(ints, dtype=np.float64)
-        if normalize_rms:
-            rms = float(np.sqrt(np.mean(ints ** 2)))
-            if rms > 0.0:
-                ints = ints / rms
-        elif normalize_tic:
-            tic = float(ints.sum())
-            if tic > 0.0:
-                ints = ints / tic
-        if mz_grid is None:
-            mz_grid = mzs
-            acc = ints.copy()
-        else:
-            acc += ints
-        count += 1
-    if mz_grid is None or count == 0:
-        return np.array([]), np.array([])
-    return mz_grid, (acc / count).astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Ion image extraction
 # ---------------------------------------------------------------------------
 
 
@@ -869,48 +703,10 @@ def _find_col(df: "pd.DataFrame", *candidates: str) -> "str | None":
     return None
 
 
-def _deduplicate_mzs(mzs: np.ndarray, merge_ppm: float = 1.0) -> np.ndarray:
-    """Merge m/z values within ``merge_ppm`` of each other (take group mean)."""
-    mzs = np.sort(mzs)
-    groups: list[list[float]] = [[float(mzs[0])]]
-    for mz in mzs[1:]:
-        if abs(mz - groups[-1][-1]) / groups[-1][-1] * 1e6 < merge_ppm:
-            groups[-1].append(float(mz))
-        else:
-            groups.append([float(mz)])
-    return np.array([np.mean(g) for g in groups], dtype=np.float64)
-
-# ---------------------------------------------------------------------------
-# Top-level entry point
-# ---------------------------------------------------------------------------
-
-
 def extract_maldi_data(
     d_path: str,
-    ppm_bin: float = 5.0,
     extraction_ppm: float = 25.0,
     matching_ppm: float = 20.0,
-    min_fraction: float = 0.01,
-    peak_prominence: float = 0.01,
-    smoothing_window: int = 7,
-    smoothing_polyorder: int = 2,
-    ppm_tolerance: float = 10.0,
-    min_interval_width_ppm: float = 2.0,
-    normalize_rms: bool = False,
-    baseline_correction: bool = False,
-    baseline_window_ppm: float = 500.0,
-    calibrant_mzs: list | None = None,
-    calibrant_tol_ppm: float = 200.0,
-    deisotope: bool = False,
-    deisotope_averagine: str = "peptide",
-    deisotope_scorer: str = "MSDeconVFitter",
-    deisotope_min_score: float = 10.0,
-    deisotope_charge_range: tuple = (1, 1),
-    deisotope_error_ppm: float = 15.0,
-    filter_mass_defect: bool = False,
-    mass_defect_halfwidth: float = 0.5,
-    picking_height: float = 0.75,
-    local_prominence_window_da: float = 0.0,
     feature_mzs: np.ndarray | None = None,
     drop_zero_signal: bool = True,
     images_path: str | None = None,
@@ -924,10 +720,11 @@ def extract_maldi_data(
     Extract MALDI features, ion images, and spatial statistics from a raw
     Bruker ``.d`` directory.
 
-    Features are always detected from raw centroided spectra via
-    ``detect_features``.  Pass ``feature_mzs`` only to reuse a cached feature
-    set from a previous run; do not populate it from LC-MS/MS identifications
-    (that is circular — see ``_features_from_lcms_file_diagnostic``).
+    ``feature_mzs`` is required: this function no longer finds features, it only
+    extracts ion images and spatial statistics for a feature list produced
+    elsewhere (the TIMSImaging fork's 2D (m/z, 1/K0) peak picking).  Do not
+    populate it from LC-MS/MS identifications — that is circular, see
+    ``_features_from_lcms_file_diagnostic``.
     Features with zero MALDI signal are removed after extraction.
 
     By default ion images are loaded fully into RAM (fast, single pass).
@@ -942,9 +739,6 @@ def extract_maldi_data(
     ----------
     d_path
         Path to Bruker ``.d`` directory.
-    ppm_bin
-        Peak-binning tolerance for feature detection (ppm).  Ignored when
-        ``feature_mzs`` is provided.
     extraction_ppm
         m/z window for raw ion image extraction.  Controls which raw data
         points contribute to each ion image.  Should be slightly wider than
@@ -956,14 +750,10 @@ def extract_maldi_data(
         Should reflect the accuracy of the centroid estimate.  Default 20.0 ppm.
         This value is stored in the returned ``spatial_df`` as metadata but is
         not used internally — pass it to ``match_to_maldi_features``.
-    min_fraction
-        Minimum fraction of pixels a peak must be detected in.  Ignored when
-        ``feature_mzs`` is provided.
     feature_mzs
-        If given, use these m/z values instead of running ``detect_features``.
-        Intended for reuse of a cached feature set from a previous run, not
-        for LC-MS/MS guided feature selection.  Must be a sorted 1D float64
-        array.
+        **Required.**  The detected feature m/z values to extract at, from the
+        TIMSImaging fork's peak picking.  Not for LC-MS/MS guided feature
+        selection.  Must be a sorted 1D float64 array.
     drop_zero_signal
         When ``True`` (default), features whose ion image has no detected
         pixels are removed after extraction.  Set ``False`` in raw-query mode
@@ -988,6 +778,15 @@ def extract_maldi_data(
         ``ion_images``  — float32 array or memmap, shape ``(n_features, H, W)``
         ``spatial_df``  — DataFrame with per-feature spatial statistics
     """
+    # Checked before any I/O: a missing feature list is a caller error, and the
+    # reader would otherwise raise something unrelated first.
+    if feature_mzs is None:
+        raise ValueError(
+            f"No feature m/z values supplied for {d_path!r}. Feature finding now lives "
+            "in the TIMSImaging fork (2D (m/z, 1/K0) peak picking); build a feature list "
+            "there and pass it via --feature-mzs."
+        )
+
     try:
         import imzy
     except ImportError as exc:
@@ -1003,101 +802,20 @@ def extract_maldi_data(
         f"m/z range {reader.mz_min:.1f}–{reader.mz_max:.1f}"
     )
 
-    if feature_mzs is not None:
-        logger.info(
-            f"Step 1/3: Using {len(feature_mzs)} provided feature m/z values "
-            f"(skipping detection)."
-        )
-    elif not reader.is_centroid:
-        logger.info(
-            "Step 1/3: Profile data detected — building mean spectrum for "
-            "SCiLS-style interval detection..."
-        )
-        from msi_picasso.maldi_imzml import (
-            SCiLSConfig, _detect_intervals,
-            _recalibrate_intervals, _merge_duplicate_intervals,
-            _deisotope_intervals, _filter_mass_defect,
-        )
-
-        scils_cfg = SCiLSConfig(
-            min_pixel_fraction=min_fraction,
-            peak_prominence=peak_prominence,
-            smoothing_window=smoothing_window,
-            smoothing_polyorder=smoothing_polyorder,
-            ppm_tolerance=ppm_tolerance,
-            min_interval_width_ppm=min_interval_width_ppm,
-            normalize_rms=normalize_rms,
-            baseline_correction=baseline_correction,
-            baseline_window_ppm=baseline_window_ppm,
-            calibrant_mzs=calibrant_mzs or [],
-            calibrant_tol_ppm=calibrant_tol_ppm,
-            deisotope=deisotope,
-            deisotope_averagine=deisotope_averagine,
-            deisotope_scorer=deisotope_scorer,
-            deisotope_min_score=deisotope_min_score,
-            deisotope_charge_range=deisotope_charge_range,
-            deisotope_error_ppm=deisotope_error_ppm,
-            filter_mass_defect=filter_mass_defect,
-            mass_defect_halfwidth=mass_defect_halfwidth,
-            picking_height=picking_height,
-            local_prominence_window_da=local_prominence_window_da,
-        )
-        mz_grid, mean_ints = _build_profile_mean_spectrum(
-            reader, normalize_rms=normalize_rms, normalize_tic=not normalize_rms
-        )
-        intervals = _detect_intervals(mz_grid, mean_ints, scils_cfg)
-        if calibrant_mzs:
-            intervals = _recalibrate_intervals(intervals, calibrant_mzs, calibrant_tol_ppm)
-        if deisotope:
-            apex_ints = np.array(
-                [float(mean_ints[np.argmin(np.abs(mz_grid - iv[2]))]) for iv in intervals],
-                dtype=np.float64,
-            )
-            intervals, apex_ints = _merge_duplicate_intervals(intervals, apex_ints)
-            intervals = _deisotope_intervals(
-                intervals, apex_ints,
-                averagine=deisotope_averagine,
-                scorer=deisotope_scorer,
-                min_score=deisotope_min_score,
-                charge_range=deisotope_charge_range,
-                error_ppm=deisotope_error_ppm,
-            )
-        if filter_mass_defect:
-            intervals = _filter_mass_defect(intervals, mass_defect_halfwidth)
-        feature_mzs = np.array(
-            [iv[2] for iv in intervals], dtype=np.float64
-        )
-        logger.info(f"  {len(feature_mzs)} intervals detected from mean spectrum")
-        if verbose:
-            logger.info(f"  Detected feature m/z values:\n  {feature_mzs}")
-            if output_dir:
-                features_txt = os.path.join(output_dir, "1_detected_features.txt")
-                np.savetxt(features_txt, feature_mzs, fmt="%.6f")
-                logger.info(f"  Saved detected features → {features_txt}")
-    else:
-        logger.info("Step 1/3: Detecting features...")
-        feature_mzs = detect_features(
-            reader, ppm_bin=ppm_bin, min_fraction=min_fraction
-        )
-        if verbose:
-            logger.info(f"  Detected feature m/z values:\n  {feature_mzs}")
-            # Save detected features to a text file for debugging.
-            if output_dir:
-                features_txt = os.path.join(output_dir, "1_detected_features.txt")
-                np.savetxt(features_txt, feature_mzs, fmt="%.6f")
-                logger.info(f"  Saved detected features → {features_txt}")
+    logger.info(
+        f"Using {len(feature_mzs)} provided feature m/z values."
+    )
 
     if len(feature_mzs) == 0:
         raise ValueError(
             f"No features for {d_path!r}. "
-            "If using detect_features, try lowering min_fraction. "
-            "If using feature_mzs, ensure the sequences are valid and in range."
+            "The supplied feature list is empty."
         )
 
     x_coords = reader.x_coordinates
     y_coords = reader.y_coordinates
 
-    logger.info("Step 2/3: Extracting ion images...")
+    logger.info("Step 1/2: Extracting ion images...")
     _NEUTRON = 1.003355
     _ADDUCT_DELTAS = {"na": 21.9819, "k": 37.9559, "chca": 171.0320}
     _extra_keys = ["m1", "m2", "na", "k", "chca"]
@@ -1128,7 +846,7 @@ def extract_maldi_data(
                 np.save(images_npy, ion_images)
                 logger.info(f"  Saved ion images → {images_npy}")
 
-        logger.info("Step 3/3: Computing spatial features...")
+        logger.info("Step 2/2: Computing spatial features...")
         spatial_df = compute_spatial_features(
             ion_images, feature_mzs, reader.n_pixels
         )
@@ -1162,7 +880,7 @@ def extract_maldi_data(
                 silent=True,
             ).astype(np.float32)
             ion_images[batch_start:batch_end] = batch_images
-            logger.info("Step 3/3: Computing spatial features...")
+            logger.info("Step 2/2: Computing spatial features...")
             spatial_chunks.append(
                 compute_spatial_features(batch_images, batch_mzs, reader.n_pixels)
             )

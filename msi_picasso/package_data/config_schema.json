@@ -96,7 +96,6 @@
         "maldi_npz":        {"type": ["string", "null"]},
         "maldi_mzs":        {"type": ["string", "null"]},
         "maldi_raw":        {"type": ["string", "null"]},
-        "maldi_imzml":      {"type": ["string", "null"]},
         "maldi_d":          {"type": ["string", "null"]},
         "feature_mzs":      {"type": ["string", "null"]},
         "save_npz":         {"type": ["string", "null"]},
@@ -157,41 +156,8 @@
           "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "ppm_bin":                   {"type": "number", "exclusiveMinimum": 0},
             "extraction_ppm":            {"type": "number", "exclusiveMinimum": 0},
-            "matching_ppm":              {"type": "number", "minimum": 0},
-            "min_fraction":              {"type": "number", "minimum": 0, "maximum": 1},
-            "peak_prominence":           {"type": "number", "minimum": 0},
-            "smoothing_window":          {"type": "integer", "minimum": 1},
-            "smoothing_polyorder":       {"type": "integer", "minimum": 0},
-            "interval_ppm_tolerance":    {"type": "number", "exclusiveMinimum": 0},
-            "min_interval_width_ppm":    {"type": "number", "minimum": 0},
-            "normalize_rms":             {"type": "boolean"},
-            "baseline_correction":       {"type": "boolean"},
-            "baseline_window_ppm":       {"type": "number", "exclusiveMinimum": 0},
-            "calibrant_mzs":             {"type": "array", "items": {"type": "number"}},
-            "calibrant_tol_ppm":         {"type": "number", "exclusiveMinimum": 0},
-            "deisotope":                 {"type": "boolean"},
-            "deisotope_error_ppm":       {"type": "number", "exclusiveMinimum": 0},
-            "deisotope_min_score":       {"type": "number"},
-            "deisotope_averagine":       {
-              "type": "string",
-              "enum": ["peptide", "glycopeptide", "glycan", "heparin"]
-            },
-            "deisotope_scorer":          {
-              "type": "string",
-              "enum": ["MSDeconVFitter", "PenalizedMSDeconVFitter"]
-            },
-            "deisotope_charge_range":    {
-              "type": "array",
-              "items": {"type": "integer", "minimum": 1},
-              "minItems": 2,
-              "maxItems": 2
-            },
-            "filter_mass_defect":        {"type": "boolean"},
-            "mass_defect_halfwidth":     {"type": "number", "minimum": 0, "maximum": 0.5},
-            "picking_height":            {"type": "number", "minimum": 0, "maximum": 1},
-            "local_prominence_window_da":{"type": "number", "minimum": 0}
+            "matching_ppm":              {"type": "number", "minimum": 0}
           }
         }
       }

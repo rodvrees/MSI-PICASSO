@@ -384,11 +384,9 @@ def extract_observed_feature_stats_raw(
         mean_inv_k0 = _weighted_mean_in_windows(
             peak_mzs, peak_ints, peak_mob, query_mzs, extraction_ppm
         )
-        from msi_picasso.maldi_imzml import one_over_k0_to_ccs
+        from im2deep.utils import im2ccs
 
-        ccs = np.asarray(
-            one_over_k0_to_ccs(mean_inv_k0, query_mzs, charge=charge), dtype=np.float64
-        )
+        ccs = np.asarray(im2ccs(mean_inv_k0, query_mzs, charge), dtype=np.float64)
         # Intrinsic joint (m/z, intensity, 1/K0) peak-quality descriptors.
         peak_quality = _peak_quality_in_windows(
             peak_mzs, peak_ints, peak_mob, query_mzs,
