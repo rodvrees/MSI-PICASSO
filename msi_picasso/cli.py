@@ -1494,9 +1494,10 @@ def main() -> None:
         from msi_picasso.maldi_extraction import extract_maldi_data
 
         logger.info(
-            "MALDI features detected from raw data (detect_features). "
-            "LC-MS/MS identifications will be used for candidate generation and "
-            "prior features only, not for feature selection."
+            "Feature-list mode: ion images and spatial features are extracted at the "
+            "m/z values supplied via --feature-mzs (from the TIMSImaging fork's 2D "
+            "peak picking). LC-MS/MS identifications are used for candidate generation "
+            "and prior features only, not for feature selection."
         )
         precomputed_mzs = None
         if _feature_mzs_path:
