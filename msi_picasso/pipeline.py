@@ -1764,6 +1764,85 @@ def _select_feature_winners(
     return winner_pos, winners_df
 
 
+def _peptide_level_qvalues(
+    scores: np.ndarray,
+    is_decoy: np.ndarray,
+    peptides: np.ndarray,
+    estimate_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """TDC q-values at peptide level: best match per peptide, then TDC over those.
+
+    In feature-list extraction a peptide is matched to every detected feature
+    within tolerance, so it contributes one row per (peptide, feature) pair --
+    measured at 4.8 rows per peptide on amyloidosis (max 15) and 2.1 on kidney.
+    Computing TDC over those rows counts the same peptide as many separate
+    discoveries on both the target and the decoy side, which inflates the
+    reported count and breaks the exchangeability TDC assumes across discoveries
+    (Savitski et al. 2015: count the pair once, not both members independently).
+
+    This is the peptide-level analogue of :func:`_select_feature_winners`, and it
+    runs *after* it so feature-level target-decoy competition still happens first:
+    a candidate must win its feature, and only then does its peptide compete for
+    a place in the reported set.
+
+    Aggregating a peptide's features *before* scoring would instead destroy that
+    competition, since each peptide would occupy its own aggregated pseudo-feature
+    with nothing to compete against.
+
+    The representative is the best-scoring match, the same rule Percolator and
+    mokapot use to roll PSMs up to peptides. That is a maximum over k draws, so
+    it is only unbiased while targets and decoys have the same multiplicity
+    distribution -- checked and warned about below rather than assumed.
+
+    :returns: ``(peptide_q, is_representative)`` aligned with the input rows.
+        ``peptide_q`` is broadcast to every row of a peptide;
+        ``is_representative`` marks the single row that carries it.
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    is_decoy = np.asarray(is_decoy, dtype=bool)
+    frame = pd.DataFrame({"score": scores, "decoy": is_decoy, "peptide": np.asarray(peptides)})
+
+    # Grouping on (peptide, decoy) rather than peptide alone only keeps a target
+    # and a decoy that happen to share a sequence from collapsing into each other.
+    # Both classes are reduced by the identical rule, so the rollup introduces no
+    # asymmetry -- it does not branch on the label, it only avoids merging across it.
+    positions = np.arange(len(frame))
+    rep = frame.assign(_pos=positions).groupby(["peptide", "decoy"])["score"].idxmax()
+    rep_pos = np.sort(rep.to_numpy())
+
+    is_representative = np.zeros(len(frame), dtype=bool)
+    is_representative[rep_pos] = True
+
+    # Multiplicity must be symmetric or the best-of-k maximum favours one class.
+    mult = frame.groupby(["peptide", "decoy"]).size()
+    mult_t = mult[mult.index.get_level_values("decoy") == False]  # noqa: E712
+    mult_d = mult[mult.index.get_level_values("decoy") == True]  # noqa: E712
+    if len(mult_t) and len(mult_d):
+        ratio = mult_d.mean() / mult_t.mean() if mult_t.mean() else 1.0
+        logger.info(
+            "  Peptide-level rollup: %d rows -> %d peptides "
+            "(%.2f matches/target-peptide, %.2f per decoy)",
+            len(frame), len(rep_pos), mult_t.mean(), mult_d.mean(),
+        )
+        if not 0.8 <= ratio <= 1.25:
+            logger.warning(
+                "  Target and decoy match multiplicity differ by %.2fx "
+                "(%.2f vs %.2f matches per peptide). The peptide-level rollup takes a "
+                "maximum over matches, so asymmetric multiplicity biases the null. "
+                "Check the peak list and the matching tolerance before trusting "
+                "peptide-level q-values.",
+                ratio, mult_t.mean(), mult_d.mean(),
+            )
+
+    sub_mask = None if estimate_mask is None else np.asarray(estimate_mask, dtype=bool)[rep_pos]
+    q_rep = _tdc_qvalues_masked(scores[rep_pos], is_decoy[rep_pos], estimate_mask=sub_mask)
+
+    # broadcast each peptide's q back onto all of its rows
+    key = pd.MultiIndex.from_arrays([frame["peptide"], frame["decoy"]])
+    peptide_q = pd.Series(q_rep, index=key[rep_pos]).reindex(key).to_numpy()
+    return peptide_q, is_representative
+
+
 def _report_entrapment(result_df: "pd.DataFrame", features_df: "pd.DataFrame", output_dir: str) -> None:
     """Count entrapment pseudo-target survivals and write entrapment_result.tsv."""
     if "source" not in features_df.columns:
@@ -3404,6 +3483,10 @@ def rescore(
             + spatial_prior_weight * np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
         rw_q2 = _tdc_qvalues_masked(reweighted2, is_decoy_w, estimate_mask=_estimate_mask_w)
+        peptide_q2, is_pep_rep2 = _peptide_level_qvalues(
+            reweighted2, is_decoy_w, winners_df["peptide"].to_numpy(),
+            estimate_mask=_estimate_mask_w,
+        )
 
         # --- Optional Storey pi0 correction ---
         if storey_pi0:
@@ -3429,6 +3512,10 @@ def rescore(
         rw_full[winner_pos] = reweighted2
         rw_q_full = np.full(len(features_df), np.nan)
         rw_q_full[winner_pos] = rw_q2
+        peptide_q_full = np.full(len(features_df), np.nan)
+        peptide_q_full[winner_pos] = peptide_q2
+        is_pep_winner_full = np.zeros(len(features_df), dtype=bool)
+        is_pep_winner_full[winner_pos] = is_pep_rep2
 
         is_decoy = features_df["is_decoy"].values.astype(bool)
         result_df = pd.DataFrame(
@@ -3448,6 +3535,13 @@ def rescore(
                 "is_tdc_winner": is_winner_full,
                 "reweighted_score": rw_full,
                 "reweighted_q_value": rw_q_full,
+                # Peptide-level FDR: one hypothesis per peptide, not per
+                # (peptide, feature) match. `peptide_q_value` is broadcast to
+                # every match of a peptide; `is_peptide_winner` marks the single
+                # best-scoring match that represents it. Count IDs as
+                # `is_peptide_winner & ~is_decoy & peptide_q_value <= alpha`.
+                "peptide_q_value": peptide_q_full,
+                "is_peptide_winner": is_pep_winner_full,
             }
         )
         _ccs_map = observed_ccs_per_feature or {}
@@ -3469,9 +3563,19 @@ def rescore(
             if storey_pi0 and _pi0 is not None:
                 n_st = (is_winner_full & ~is_decoy & (storey_q_full <= fdr_threshold)).sum()
                 extra = f", {n_st} (Storey π₀={_pi0:.3f})"
+            n_pep = (
+                is_pep_winner_full & ~is_decoy & (peptide_q_full <= fdr_threshold)
+            ).sum()
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
                 f"{n_rw} target features (reweighted){extra}"
+            )
+            # The line above counts (peptide, feature) matches. In feature-list
+            # extraction one peptide matches several features, so that is not a
+            # count of identified peptides -- this is.
+            logger.info(
+                f"  At {fdr_threshold*100:.0f}% FDR: {n_pep} target PEPTIDES "
+                f"(peptide-level FDR)"
             )
 
         if debug_dir is not None:
@@ -3625,6 +3729,9 @@ def rescore(
             + spatial_prior_weight * np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+        peptide_q2, is_pep_rep2 = _peptide_level_qvalues(
+            reweighted2, is_decoy_w, winners_df["peptide"].to_numpy()
+        )
 
         # --- Optional Storey pi0 correction ---
         if storey_pi0:
@@ -3650,6 +3757,10 @@ def rescore(
         rw_full[winner_pos] = reweighted2
         rw_q_full = np.full(len(features_df), np.nan)
         rw_q_full[winner_pos] = rw_q2
+        peptide_q_full = np.full(len(features_df), np.nan)
+        peptide_q_full[winner_pos] = peptide_q2
+        is_pep_winner_full = np.zeros(len(features_df), dtype=bool)
+        is_pep_winner_full[winner_pos] = is_pep_rep2
 
         is_decoy = features_df["is_decoy"].values.astype(bool)
         result_df = pd.DataFrame(
@@ -3669,6 +3780,13 @@ def rescore(
                 "is_tdc_winner": is_winner_full,
                 "reweighted_score": rw_full,
                 "reweighted_q_value": rw_q_full,
+                # Peptide-level FDR: one hypothesis per peptide, not per
+                # (peptide, feature) match. `peptide_q_value` is broadcast to
+                # every match of a peptide; `is_peptide_winner` marks the single
+                # best-scoring match that represents it. Count IDs as
+                # `is_peptide_winner & ~is_decoy & peptide_q_value <= alpha`.
+                "peptide_q_value": peptide_q_full,
+                "is_peptide_winner": is_pep_winner_full,
             }
         )
         _ccs_map = observed_ccs_per_feature or {}
@@ -3690,9 +3808,19 @@ def rescore(
             if storey_pi0 and _pi0 is not None:
                 n_st = (is_winner_full & ~is_decoy & (storey_q_full <= fdr_threshold)).sum()
                 extra = f", {n_st} (Storey π₀={_pi0:.3f})"
+            n_pep = (
+                is_pep_winner_full & ~is_decoy & (peptide_q_full <= fdr_threshold)
+            ).sum()
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
                 f"{n_rw} target features (reweighted){extra}"
+            )
+            # The line above counts (peptide, feature) matches. In feature-list
+            # extraction one peptide matches several features, so that is not a
+            # count of identified peptides -- this is.
+            logger.info(
+                f"  At {fdr_threshold*100:.0f}% FDR: {n_pep} target PEPTIDES "
+                f"(peptide-level FDR)"
             )
 
         if debug_dir is not None:
