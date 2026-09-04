@@ -103,6 +103,8 @@
     "maldi_raw": null,
     "maldi_d": null,
     "feature_mzs": null,
+    "images_path": null,
+    "image_batch_size": 100,
     "save_npz": null,
     "save_spatial": null,
     "spatial_features": null,

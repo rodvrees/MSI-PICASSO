@@ -126,3 +126,25 @@ def test_dict_source_overrides(tmp_path):
     config = parse_configurations([override])["MSI-PICASSO"]
     assert config["n_interaction_features"] == 3
     assert config["model"] == "lda"
+
+
+def test_images_path_and_batch_size_round_trip(tmp_path):
+    """Memmapped ion images are reachable from a config.
+
+    `extract_maldi_data` has taken `images_path` all along and CLAUDE.md
+    documented it, but it was never wired through the CLI or the config, so it
+    was unreachable — and feature-list extraction is where it became necessary
+    (54326 features x 52019 pixels is 42 GB for the main array alone).
+    """
+    toml = tmp_path / "cfg.toml"
+    toml.write_text('[MSI-PICASSO]\nimages-path = "/tmp/ion.dat"\nimage-batch-size = 50\n')
+    config = parse_configurations([str(toml)])["MSI-PICASSO"]
+    assert config["images_path"] == "/tmp/ion.dat"
+    assert config["image_batch_size"] == 50
+
+
+def test_images_path_defaults_to_ram():
+    """Absent the key, images stay in RAM — the prior behaviour."""
+    config = parse_configurations([{}])["MSI-PICASSO"]
+    assert config["images_path"] is None
+    assert config["image_batch_size"] == 100

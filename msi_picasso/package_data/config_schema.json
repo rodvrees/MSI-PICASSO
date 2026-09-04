@@ -98,6 +98,8 @@
         "maldi_raw":        {"type": ["string", "null"]},
         "maldi_d":          {"type": ["string", "null"]},
         "feature_mzs":      {"type": ["string", "null"]},
+        "images_path":      {"type": ["string", "null"]},
+        "image_batch_size": {"type": ["integer", "null"], "exclusiveMinimum": 0},
         "save_npz":         {"type": ["string", "null"]},
         "save_spatial":     {"type": ["string", "null"]},
         "spatial_features": {"type": ["string", "null"]},

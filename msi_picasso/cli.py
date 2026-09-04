@@ -377,6 +377,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     maldi_group.add_argument(
+        "--images-path",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Write ion images to a memory-mapped file at PATH instead of holding "
+            "the full (n_features, H, W) float32 array in RAM. Needed when the "
+            "feature list is large: 54326 features x 52019 pixels is 42 GB for the "
+            "main array alone, before the mobility-colocalization pass adds its own. "
+            "Transparent to all downstream code."
+        ),
+    )
+    maldi_group.add_argument(
+        "--image-batch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Features per batch when --images-path is set (default 100).",
+    )
+    maldi_group.add_argument(
         "--maldi-query-raw",
         action="store_true",
         default=None,
@@ -1389,7 +1408,7 @@ def main() -> None:
         # file paths
         "fasta", "extra_fasta", "entrapment_fasta", "mzml",
         "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_d",
-        "feature_mzs", "save_npz", "save_spatial", "spatial_features",
+        "feature_mzs", "images_path", "image_batch_size", "save_npz", "save_spatial", "spatial_features",
         "lcms_peptides", "lcms_proteins", "lcms_psms", "msf",
         "debug_gt", "psm_utils_reader",
     )
@@ -1516,6 +1535,8 @@ def main() -> None:
             feature_mzs=precomputed_mzs,
             extraction_ppm=_extraction["extraction_ppm"],
             matching_ppm=_extraction["matching_ppm"],
+            images_path=_ms1cfg.get("images_path"),
+            image_batch_size=_ms1cfg.get("image_batch_size") or 100,
             output_npz=_ms1cfg.get("save_npz"),
             output_spatial_tsv=_ms1cfg.get("save_spatial"),
             output_dir=output_dir,
