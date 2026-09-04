@@ -869,6 +869,29 @@ def extract_maldi_data(
         logger.info(
             f"  Memmap {n_features} × {height} × {width} float32 → {images_path}"
         )
+        # Two defects, measured rather than suspected, so this is a last resort:
+        #
+        # 1. It calls reader.get_ion_images() once per batch, and each call
+        #    iterates every spectrum. The in-RAM path instead makes ONE
+        #    spectra_iter pass for all six feature sets via
+        #    _extract_profile_fast_multi. Measured on her2 (54326 features,
+        #    52019 pixels, image_batch_size=100): 4m47s per batch of 100, i.e.
+        #    543 passes and ~43 hours, against ~10 minutes for the in-RAM path.
+        #    Raising image_batch_size cuts the number of passes proportionally.
+        # 2. It extracts ONLY the main feature set. The M+1, M+2, Na, K and CHCA
+        #    images are never produced, so every isotope- and adduct-
+        #    colocalization feature silently goes missing.
+        #
+        # Use this only when the array genuinely cannot fit in RAM, and expect a
+        # reduced feature set if you do.
+        logger.warning(
+            "  images_path is set: extraction falls back to a per-batch reader "
+            "loop (~%d passes over the data) and produces NO isotope/adduct "
+            "extra images, so those colocalization features will be missing. "
+            "Prefer the in-RAM path unless the %.1f GB array cannot fit.",
+            (n_features + image_batch_size - 1) // image_batch_size,
+            n_features * height * width * 4 / 1e9,
+        )
         spatial_chunks: list[pd.DataFrame] = []
         for batch_start in range(0, n_features, image_batch_size):
             batch_end = min(batch_start + image_batch_size, n_features)

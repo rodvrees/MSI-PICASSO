@@ -171,8 +171,16 @@ Performance-relevant details:
 - **imzy writes its own caches**: an `.icache` npz beside each imzML holding per-spectrum
   `.ibd` byte offsets and coordinates (so opening a 133 MB imzML is an npz load, not an XML
   parse), and a `.icache/frame_index_cache.npz` inside each Bruker `.d`.
-- **RAM vs memmap** — by default the full `(n_features, H, W)` float32 array lives in RAM.
-  Passing `images_path` switches to a `np.memmap` written in `image_batch_size` batches.
+- **RAM vs memmap** — by default the full `(n_features, H, W)` float32 array lives in RAM,
+  extracted in a single `spectra_iter` pass for all six feature sets. `--images-path`
+  switches to a `np.memmap` written in `image_batch_size` batches, and is a **last
+  resort, not a drop-in**: it calls `reader.get_ion_images()` once per batch (543 full
+  passes over her2's 52 K spectra at the default batch size — measured 4m47s per batch,
+  ~43 hours, against ~10 minutes in RAM) and it extracts **only the main feature set**, so
+  every isotope- and adduct-colocalization feature silently goes missing. It warns at
+  runtime. Raise `image_batch_size` sharply if you must use it. Feature-list mode makes the
+  array much larger than raw-query ever did (her2: 54 K features vs 5 K candidates, 42 GB),
+  so check available RAM rather than reaching for this.
 
 ### The `.d` is opened more than once
 
