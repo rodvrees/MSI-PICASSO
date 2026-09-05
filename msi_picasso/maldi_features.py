@@ -2125,6 +2125,43 @@ def _log_progress(prefix: str, n_done: int, n_total: int, t_start: float, every:
     )
 
 
+
+def _available_memory_bytes() -> int | None:
+    """Free physical memory, or ``None`` where the platform will not say."""
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _memory_capped_workers(
+    bytes_per_worker: int,
+    available: int | None = None,
+    max_workers: int = 64,
+    headroom: float = 0.5,
+) -> int:
+    """Thread count that fits ``bytes_per_worker`` x workers in free memory.
+
+    Threading a step whose per-call temporaries scale with the whole dataset
+    multiplies peak memory by the worker count. The mobility-colocalization M0
+    rebuild does exactly that -- two length-N boolean masks per call, N being the
+    3.16e9 relevant peaks on a whole section -- so 64 threads asked for 405 GB of
+    transient masks and the process died silently, three runs in a row, with the
+    CPU count alone deciding the pool size.
+
+    ``available`` defaults to the real free memory rather than to "no cap", so
+    forgetting to pass it cannot silently restore the behaviour this exists to
+    prevent.
+
+    Returns at least 1: better slow than not running.
+    """
+    if available is None:
+        available = _available_memory_bytes()
+    workers = min(os.cpu_count() or 1, max_workers)
+    if available and bytes_per_worker > 0:
+        workers = min(workers, int(headroom * available / bytes_per_worker))
+    return max(1, workers)
+
 def compute_mobility_colocalization_features(
     df: pd.DataFrame,
     tdf_path: str,
@@ -2538,7 +2575,11 @@ def compute_mobility_colocalization_features(
                 # search per feature would cut this further, at the cost of a
                 # full extra sorted copy of mzs_all/pix_ids/scan_ids/ints_all.
                 # Revisit if threading alone isn't enough headroom.
-                mz_mask = (mzs_all >= mz_lo) & (mzs_all <= mz_hi)
+                # In-place &= so only two length-N boolean temporaries are alive
+                # instead of three; see the worker-count cap below, which is
+                # sized against exactly this.
+                mz_mask = mzs_all >= mz_lo
+                mz_mask &= mzs_all <= mz_hi
                 if not mz_mask.any():
                     return []
                 sub_pix  = pix_ids[mz_mask]
@@ -2569,10 +2610,21 @@ def compute_mobility_colocalization_features(
 
             _needed_groups = [grp for _, grp in groups if any(i in _needs_img for i in grp.index)]
             _n_groups_needed = len(_needed_groups)
-            _n_workers = min(os.cpu_count() or 1, 64)
+            # Each worker's m/z window scan holds two length-N boolean temporaries
+            # (N = len(mzs_all)), so peak RAM here is workers x 2N, NOT 2N. On a
+            # whole section that product is what runs the machine out of memory:
+            # her2 has 3.16e9 relevant peaks, so 64 threads is 64 x 6.3 GB = 405 GB
+            # of transient masks on top of ~60 GB of base arrays and a 42 GB image
+            # array. It died silently at exactly this line three times before the
+            # count was capped. Size the pool against free memory instead.
+            _mask_bytes_per_worker = 2 * mzs_all.size
+            _avail = _available_memory_bytes()
+            _n_workers = _memory_capped_workers(_mask_bytes_per_worker, available=_avail)
             logger.info(
                 f"Mobility colocalization: rebuilding per-candidate M0 images for "
                 f"{_n_groups_needed} feature groups across {_n_workers} threads "
+                f"({_mask_bytes_per_worker / 1e9:.1f} GB of scan masks per thread, "
+                f"{(_avail / 1e9) if _avail else float('nan'):.0f} GB free) "
                 f"(this is the O(N) full-array-scan step — watch the progress line below "
                 f"for how it's tracking)…"
             )
