@@ -113,8 +113,11 @@ package. Every call site wraps it in `try/except ImportError` with a Python fall
    (`cli.py:1479`) so argparse defaults do not clobber config-file values.
 3. **MALDI input dispatch** (`cli.py:1613`), mutually exclusive:
    `maldi_npz | maldi_mzs | maldi_raw | maldi_d`.
-   With `maldi_d` + `maldi_query_raw=true` extraction is **deferred** into `rescore()`.
-   This is what every current config uses.
+   **`maldi_d` + `--feature-mzs <peak list>` is the current mode and the one new work
+   must use.** The peak list comes from the TIMSImaging fork (see "Reading MALDI data").
+   `maldi_query_raw=true` selects the superseded raw-query mode, which defers extraction
+   into `rescore()` and warns at startup; it is kept only to reproduce results predating
+   feature-list extraction.
 4. **`rescore()`** (`pipeline.py:1555`):
    - Step 1 candidate generation; 1b extra FASTA; 1c decoy generation (`pipeline.py:2093`)
    - Raw-query extraction (`pipeline.py:2277`) — `query_raw_maldi()` +
@@ -126,6 +129,36 @@ package. Every call site wraps it in `try/except ImportError` with a Python fall
      mobility-filtered colocalization, spatial-ranker features
    - Step 8 build `PSMList`; Step 9 rescoring, winner selection, TDC q-values, PEP
 5. **Output** — `_write_results()` (`cli.py:220`), debug figures via `save_debug_figures()`.
+
+### Extraction mode: feature list, not raw query
+
+Every candidate used to be queried at its own m/z, and the window integrator returned the
+weighted mean of whatever fell inside it — so an empty window returned the local noise and
+**no candidate could fail to be observed** (measured no-observation rate 0.000, F-012).
+Each candidate then owned its own `feature_idx`, so target and decoy never competed
+(0.00% of features carried both, F-010).
+
+Feature-list mode fixes both. A peak list is built once per dataset by the TIMSImaging
+fork's 2D (m/z, 1/K0) picker; candidates are matched to it within `matching_ppm`;
+unmatched candidates are dropped. Measured consequences:
+
+- target-decoy competition rises from 0.00% to 19–25% of occupied features, **earned from
+  the data** rather than imposed by a co-located decoy generator;
+- `protein_coverage` becomes a real feature — F-013 had recorded it constant at 1.000 and
+  dead weight, because in raw-query every candidate matched by construction;
+- the ~40 minute per-candidate alphatims pass disappears (observed CCS comes from the peak
+  list), replaced by a ~2 minute peak-finding pass.
+
+**Two things change meaning and must not be forgotten:**
+
+1. **A peptide matches several features** (2.1–4.8 on the three datasets, max 15), so a
+   candidate row is a *peptide-feature match*, not a peptide. FDR is therefore computed at
+   peptide level by `_peptide_level_qvalues` after winner selection — count IDs with
+   `is_peptide_winner & ~is_decoy & peptide_q_value <= alpha`. Counting rows overstates by
+   the multiplicity.
+2. **`matching_ppm` must be non-zero.** The old baselines set it to 0 (exact), which in
+   feature-list mode matches nothing at all. 10 ppm is the tightest value that keeps every
+   reachable ground-truth peptide on all three datasets.
 
 ### Two-pass scoring
 

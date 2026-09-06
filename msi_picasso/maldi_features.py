@@ -2127,7 +2127,23 @@ def _log_progress(prefix: str, n_done: int, n_total: int, t_start: float, every:
 
 
 def _available_memory_bytes() -> int | None:
-    """Free physical memory, or ``None`` where the platform will not say."""
+    """Memory obtainable without swapping, or ``None`` where the OS will not say.
+
+    Prefers ``MemAvailable``, which counts the page cache the kernel would
+    reclaim under pressure; ``SC_AVPHYS_PAGES`` counts only genuinely free pages
+    and badly understates what a large allocation can actually get. The gap is
+    not academic: reading it partway through a run that had already filled the
+    cache reported 49 GB against a real 450 GB, which throttled a thread pool to
+    3 workers and turned a ~30 minute step into 4 hours. Falls back to the
+    sysconf value where /proc is unavailable.
+    """
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
     try:
         return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except (ValueError, OSError, AttributeError):

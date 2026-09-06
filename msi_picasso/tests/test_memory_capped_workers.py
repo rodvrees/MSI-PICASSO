@@ -56,3 +56,25 @@ def test_available_memory_is_readable_or_none():
     avail = _available_memory_bytes()
 
     assert avail is None or avail > 0
+
+
+def test_available_memory_counts_reclaimable_cache():
+    """MemAvailable, not free-pages-only.
+
+    A run that has filled the page cache reports a small free-page count while
+    the kernel would happily reclaim hundreds of GB. Reading the pessimistic
+    number throttled the M0 rebuild to 3 workers and turned a ~30 minute step
+    into 4 hours, so the distinction is worth a test.
+    """
+    avail = _available_memory_bytes()
+    if avail is None or not os.path.exists("/proc/meminfo"):
+        pytest.skip("no /proc/meminfo on this platform")
+
+    free_only = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    # MemAvailable is free pages plus reclaimable cache, so never the smaller of
+    # the two on a machine that has done any I/O
+    assert avail >= free_only
+
+    with open("/proc/meminfo") as handle:
+        total = next(int(l.split()[1]) * 1024 for l in handle if l.startswith("MemTotal:"))
+    assert avail <= total

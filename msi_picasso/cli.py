@@ -1505,6 +1505,15 @@ def main() -> None:
             "from %s at candidate m/z values during candidate generation.",
             _maldi_raw_path,
         )
+        logger.warning(
+            "Raw-query mode is SUPERSEDED by feature-list extraction and is kept "
+            "only to reproduce results predating it. It cannot produce negative "
+            "evidence (every candidate is 'observed' by construction, F-012), it "
+            "yields no target-decoy competition (0.00%% of features carry both a "
+            "target and a decoy, F-010), and its candidates are one per feature so "
+            "peptide-level FDR is a no-op. Use --feature-mzs with a peak list from "
+            "the TIMSImaging fork for new work."
+        )
         maldi_mzs = np.array([], dtype=np.float64)
         ion_images = None
         ion_image_mzs = None
