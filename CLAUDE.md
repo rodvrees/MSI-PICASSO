@@ -12,6 +12,43 @@ Superseded material is archived in `/home/robbe/MALDI_MSI_score/docs/archive/`
 
 ---
 
+## Write so a new reader can follow it
+
+This applies to this file, to PROGRESS.md, and to how results are explained in
+conversation.
+
+The reader is a competent scientist who has not been living inside this project. They know
+mass spectrometry and proteomics. They do not know what *this project* means by "the noise
+band", "the spread", "a draw", "the head of the ranking", or "the q-value floor". Those are
+local shorthand, and every one of them was invented here.
+
+Rules:
+
+1. **Explain a term the first time it appears in a document**, in a clause, not a footnote.
+   "The q-value floor (the best q-value the run can reach at all, no matter the threshold)
+   was 0.0536."
+2. **PROGRESS.md §0.1 is the glossary.** Add a term there when you coin one. If a term is
+   not worth a glossary entry, it is not worth using.
+3. **Prefer the plain word.** "Varies from run to run" beats "exhibits inter-replicate
+   variance". "One result out of many possible ones" beats "a single draw". Keep the
+   technical term where it is genuinely standard (q-value, FDR, target-decoy competition,
+   PSM) and explain the ones that are not.
+4. **Short sentences.** One claim each. Long sentences in this project usually mean a
+   caveat has been folded into a finding; split them and state the caveat separately.
+5. **Give the number and what it means.** "3.06x" is not a result on its own. "3.06 times
+   larger than the biggest value random labels ever produced, so it is unlikely to be
+   chance" is.
+6. **No figurative language.** No "rides on", "collapses", "destroys", "the head is
+   poisoned". These read as measurements when they are not. F-002 said the collision filter
+   "destroys kidney"; the measured effect was roughly half the size that word implies.
+
+The reason is concrete rather than stylistic. This document set has repeatedly had findings
+misapplied because the wording was compact enough to be memorable and vague enough to be
+wrong: F-004 carried an `mz_shuffle` fix into `substitution` configs, and the scope tags in
+PROGRESS.md §0 exist because of it. Vague wording is how that happens.
+
+---
+
 ## Purpose
 
 `MSI-PICASSO` is a symmetric target-decoy rescoring package for MALDI-MSI MS1 data. It
