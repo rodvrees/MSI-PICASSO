@@ -160,6 +160,15 @@ unmatched candidates are dropped. Measured consequences:
    feature-list mode matches nothing at all. 10 ppm is the tightest value that keeps every
    reachable ground-truth peptide on all three datasets.
 
+### The debug table records what the ranker saw
+
+`13_debug_features.tsv` is the input to every offline analysis in PROGRESS.md, so it must
+match the matrix the ranker was fitted on. `rescore()` log1p-transforms five heavy-tail
+columns (`_HEAVY_TAIL_FEATURES`) before fitting; **that transform must stay above the debug
+write**, and a regression test (`test_debug_table_fidelity.py`) asserts the source order. It
+did not, once, and a refit from the table silently failed to reproduce the run it came from
+(PROGRESS.md F-032). This is the same class of ordering bug as F-018.
+
 ### Two-pass scoring
 
 Round 1 scores all candidates → per-feature winner selection (`_select_feature_winners`)
@@ -289,6 +298,16 @@ substitution}`. With any other method `use_spatial_ranker_features` is force-dis
 
 All backends share the same semi-supervised loop: seed → pseudo-label iteration → winner
 selection → TDC.
+
+**The loop does not converge, and a single fit's reported count is a draw rather than a
+measurement.** It is a chaotic map from the seed labels: the CV partition alone
+(`_make_fold_ids`, `random_state`) moves the head of the ranking enough to change the
+reported count several-fold on the low-count datasets. `model_repeats` (default 1, off)
+averages the standardised scores of that many independent replicate fits, each with its own
+partition, via the `_rescore_linear` wrapper around `_rescore_linear_once`. Averaging
+*inside* a single trajectory was tried and does not converge — see PROGRESS.md F-030/F-031.
+`model_repeats=1` is exactly the pre-existing single fit, so every earlier result reproduces.
+Reported importances come from the first replicate; they describe one fitted model.
 
 **Out-of-fold scoring.** `_cv_semisup_scores` (default `cv_folds=3`, stratified by
 `is_decoy`) scores every candidate with a model trained on the other folds. Feature
@@ -461,6 +480,8 @@ In `/home/robbe/MALDI_MSI_score/scripts/`:
 | `grid_search.py` / `analyze_grid_search.py` | parameter sweep (reuses `raw_query_cache`) and its sensitivity analysis |
 | `ablation_svm.py` / `ablation_lda.py` | feature ablation |
 | `audit_coloc_leak.py` | per-colocalization-column target/decoy AUC and abundance-leak check — run before promoting a coloc feature into the ranker |
+| `seed_permutation_test.py` | the F-020 label-permutation test on the seed search, over several independent permutation sets — reads the run's own ranker feature list and reproduces its reported seed |
+| `replicate_spread.py` | refits a past run's round 1 under N CV partitions and reports the spread of its ID counts — reads the run's own `.full_config.json`; run this before quoting or comparing any single-fit count |
 | `envelope_qc.py` | isotope-envelope QC |
 | `visualize_ms1rescore_features.py` | per-feature, per-candidate target/decoy visualisation |
 
