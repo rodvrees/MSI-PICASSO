@@ -988,6 +988,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--model-repeats",
+        type=int,
+        default=None,
+        metavar="INT",
+        help=(
+            "H-fdr-6: average the scores of this many independent replicate fits, "
+            "each with its own CV partition. The self-training loop does not converge, "
+            "so one fit's q-value floor is a draw rather than a property of the data -- "
+            "on kidney, twelve partitions gave 0 to 63 peptides at 5%% FDR with nothing "
+            "else changed. 1 (default) is a single fit and reproduces results predating "
+            "this."
+        ),
+    )
+    rescore_grp.add_argument(
         "--fragment-tol-da",
         type=float,
         default=None,
@@ -1402,6 +1416,7 @@ def main() -> None:
         "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
         "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
         "decoy_split", "decoy_split_final_only", "train_fdr_escalate", "pseudo_label_growth_cap",
+        "model_repeats",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
         "calibration_percentile", "maldi_query_raw", "raw_query_cache_dir",
@@ -1790,6 +1805,7 @@ def main() -> None:
         decoy_split_final_only=bool(_ms1cfg.get("decoy_split_final_only", False)),
         train_fdr_escalate=bool(_ms1cfg.get("train_fdr_escalate", False)),
         pseudo_label_growth_cap=_ms1cfg.get("pseudo_label_growth_cap"),
+        model_repeats=_ms1cfg.get("model_repeats", 1),
         drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),
         entrapment=bool(_ms1cfg.get("entrapment", False)),
         substitution_n_residues=_ms1cfg["substitution_n_residues"],

@@ -58,6 +58,7 @@
         "decoy_split_final_only": {"type": ["boolean", "null"]},
         "train_fdr_escalate":     {"type": ["boolean", "null"]},
         "pseudo_label_growth_cap": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "model_repeats": {"type": ["integer", "null"], "minimum": 1},
         "init_ppm_threshold":     {"type": ["number", "null"], "minimum": 0},
         "init_isotope_threshold": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
 

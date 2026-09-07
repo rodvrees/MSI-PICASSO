@@ -38,6 +38,7 @@
     "decoy_split_final_only": false,
     "train_fdr_escalate": false,
     "pseudo_label_growth_cap": null,
+    "model_repeats": 1,
     "protein_fdr": 0.01,
     "peptide_fdr": 0.01,
     "features_preset": "all",

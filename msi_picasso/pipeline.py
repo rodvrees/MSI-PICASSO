@@ -793,11 +793,18 @@ def _find_best_feature_labels_escalating(
     return result, fdr
 
 
-def _make_fold_ids(is_decoy: np.ndarray, cv_folds: int) -> np.ndarray | None:
-    """Fixed, is_decoy-stratified fold assignment for out-of-fold scoring.
+def _make_fold_ids(
+    is_decoy: np.ndarray, cv_folds: int, random_state: int = 0
+) -> np.ndarray | None:
+    """Stratified fold assignment for out-of-fold scoring.
 
     Returns an int array (row → fold) or ``None`` when there are too few targets
     or decoys for ``cv_folds``-fold CV (caller then scores in-sample).
+
+    ``random_state`` was fixed at 0 until F-030 measured how much rides on it:
+    twelve values gave kidney anywhere from 0 to 63 peptides at 5% FDR with
+    nothing else changed. It is now the replicate index under ``model_repeats``
+    (see ``_rescore_linear``); 0 reproduces every result predating that.
     """
     is_decoy = np.asarray(is_decoy, dtype=bool)
     n = len(is_decoy)
@@ -805,7 +812,7 @@ def _make_fold_ids(is_decoy: np.ndarray, cv_folds: int) -> np.ndarray | None:
         return None
     from sklearn.model_selection import StratifiedKFold
 
-    skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=0)
+    skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
     fold_ids = np.empty(n, dtype=np.int64)
     for k, (_, test) in enumerate(skf.split(np.zeros(n), is_decoy.astype(int))):
         fold_ids[test] = k
@@ -851,7 +858,7 @@ def _cv_semisup_scores(X_fit, labels, fold_ids, make_pipe):
     return oof, pipe_full
 
 
-def _rescore_linear(
+def _rescore_linear_once(
     features_df: pd.DataFrame,
     intrinsic_feature_names: list[str],
     init_ppm_threshold: float,
@@ -866,6 +873,7 @@ def _rescore_linear(
     min_seed_positives: int = 50,
     seed_features: list[str] | None = None,
     cv_folds: int = 3,
+    fold_seed: int = 0,
     make_clf=None,
     clf_name: str = "lda",
     fitted_out: dict | None = None,
@@ -1053,7 +1061,7 @@ def _rescore_linear(
     # manufacturing target/decoy separation by overfitting (each candidate is
     # scored by a model trained on other folds).  Folds are fixed and stratified
     # by is_decoy; falls back to in-sample scoring if there are too few pos/neg.
-    fold_ids = _make_fold_ids(is_decoy, cv_folds)
+    fold_ids = _make_fold_ids(is_decoy, cv_folds, fold_seed)
     if fold_ids is None:
         logger.warning(
             f"  {_tag}: too few targets/decoys for {cv_folds}-fold CV — scoring "
@@ -1203,6 +1211,46 @@ def _rescore_linear(
         fitted_out["X"] = X_fit
         fitted_out["feature_names"] = top_names if use_poly else present
     return scores, importances, struct_coefs, struct_names_out, feature_names_out
+
+
+def _rescore_linear(*args, model_repeats: int = 1, **kwargs):
+    """``_rescore_linear_once`` averaged over ``model_repeats`` replicate fits.
+
+    Why this exists (H-fdr-6, F-030). The semi-supervised loop does not converge:
+    it is a chaotic map from the seed labels, and every arbitrary internal choice
+    resamples its output. Re-running kidney's E016 round 1 under twelve CV
+    partitions — no data, hyperparameter or label change — gave q-value floors of
+    0.024 to 0.071 and 0 to 63 peptides at 5% FDR, with the published run among
+    the worst three. Its reported "0 IDs at 5%" was a draw, not a property of the
+    tissue.
+
+    Each replicate is an *independent* trajectory (its own CV partition), so the
+    mean over replicates converges where perturbing a single trajectory does not:
+    measured on kidney, two disjoint sets of 30 replicates agree at 50 and 55
+    peptides at 5% FDR, against the 0-to-63 single-trajectory spread.
+
+    Averaging is over standardised scores, since replicates share a ranking but
+    not a scale. Both classes go through the identical code path in every
+    replicate, so the TDC null is untouched — checked by permuting the final
+    report's labels (0 passing in 60 of 60 trials, all three datasets).
+
+    Reported importances come from the first replicate: they describe one fitted
+    model and averaging structure coefficients across replicates would describe
+    none of them. ``model_repeats=1`` is exactly ``_rescore_linear_once``.
+    """
+    if model_repeats <= 1:
+        return _rescore_linear_once(*args, **kwargs)
+
+    scores_acc = []
+    first: tuple | None = None
+    for r in range(model_repeats):
+        out = _rescore_linear_once(*args, fold_seed=r, **kwargs)
+        s = np.asarray(out[0], dtype=np.float64)
+        scores_acc.append((s - s.mean()) / (s.std() or 1.0))
+        if first is None:
+            first = out
+    logger.info(f"  Averaged {model_repeats} replicate fits (differing CV partition)")
+    return (np.mean(scores_acc, axis=0),) + tuple(first[1:])
 
 
 def _rescore_lda(features_df, intrinsic_feature_names, init_ppm_threshold, **kwargs):
@@ -1411,7 +1459,9 @@ def _rescore_qda(
             "in-sample (overfitting risk)"
         )
     else:
-        logger.info(f"  QDA: {cv_folds}-fold cross-validated (out-of-fold) scoring")
+        logger.info(
+            f"  QDA: {cv_folds}-fold cross-validated (out-of-fold) scoring"
+        )
 
     scores = np.zeros(len(df))
     prev_pos_size = -1
@@ -1977,6 +2027,7 @@ def rescore(
     decoy_split_final_only: bool = False,
     train_fdr_escalate: bool = False,
     pseudo_label_growth_cap: float | None = None,
+    model_repeats: int = 1,
     drop_zero_signal: bool = False,
     entrapment: bool = False,
     substitution_n_residues: int = 1,
@@ -2241,6 +2292,13 @@ def rescore(
         iteration's label update) once the pseudo-positive count exceeds this
         multiple of the initial seed size, regardless of convergence. ``None``
         (default) disables it.
+    model_repeats
+        H-fdr-6, opt-in. Number of independent replicate fits (each with its own
+        CV partition) whose standardised scores are averaged. The semi-supervised
+        loop does not converge, so a single fit's q-value floor is a draw rather
+        than a property of the data -- kidney's spanned 0 to 63 peptides at 5% FDR
+        across twelve partitions (F-030). ``1`` (default) reproduces every result
+        predating this.
     r1_seed_percentile
         Percentile of target R1 scores used as the seed threshold for R2
         (LDA/QDA). The top ``(1 - r1_seed_percentile)`` fraction of target
@@ -3131,6 +3189,29 @@ def rescore(
     if _exclude_set:
         logger.info(f"  Excluding {len(_exclude_set)} features: {sorted(_exclude_set)}")
 
+    # Log-transform heavy-tail features in place.  These features span 4+
+    # orders of magnitude on real data; after StandardScaler the few extreme
+    # values dominate and suppress discrimination from well-behaved features.
+    #
+    # This MUST stay above the 13_debug_features.tsv write below.  It used to sit
+    # after it, so the debug table held the untransformed columns while the ranker
+    # saw the transformed ones -- and that table is what every offline analysis in
+    # PROGRESS.md reads.  A refit from it diverged from the run it was supposed to
+    # reproduce (kidney q-value floor 0.0222 against the run's 0.0536) until the
+    # transform was applied by hand in the analysis script.
+    _HEAVY_TAIL_FEATURES = (
+        "chca_cluster_distance_ppm",
+        "theo_isotope_chi2",
+        "ppm_best_ratio",
+        "theo_m1_ratio_diff",
+        "theo_m2_ratio_diff",
+    )
+    for _f in _HEAVY_TAIL_FEATURES:
+        if _f in features_df.columns:
+            features_df[_f] = np.log1p(
+                np.clip(features_df[_f].values.astype(float), 0.0, None)
+            )
+
     if verbose:
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
         _debug_cols = [c for c in features_df.columns if c not in _exclude_set]
@@ -3232,22 +3313,6 @@ def rescore(
     lcms_present = [f for f in LCMS_PRIOR_FEATURES if f in features_df.columns]
     spatial_present = [f for f in SPATIAL_PRIOR_FEATURES if f in features_df.columns]
 
-    # Log-transform heavy-tail features in place.  These features span 4+
-    # orders of magnitude on real data; after StandardScaler the few extreme
-    # values dominate and suppress discrimination from well-behaved features.
-    _HEAVY_TAIL_FEATURES = (
-        "chca_cluster_distance_ppm",
-        "theo_isotope_chi2",
-        "ppm_best_ratio",
-        "theo_m1_ratio_diff",
-        "theo_m2_ratio_diff",
-    )
-    for _f in _HEAVY_TAIL_FEATURES:
-        if _f in features_df.columns:
-            features_df[_f] = np.log1p(
-                np.clip(features_df[_f].values.astype(float), 0.0, None)
-            )
-
     # Drop constant / near-constant features from the ranker input.  A column
     # with one unique value contributes zero variance and only consumes a slot
     # in the SVM grid search; in pathological CV folds it can also produce
@@ -3339,6 +3404,7 @@ def rescore(
             decoy_split_mask=_train_split_mask_r1,
             train_fdr_escalate=train_fdr_escalate,
             pseudo_label_growth_cap=pseudo_label_growth_cap,
+            model_repeats=model_repeats,
             **_svm_kwargs,
         )
         # Output importances
@@ -3433,6 +3499,7 @@ def rescore(
                 decoy_split_mask=_train_split_mask_w,
                 train_fdr_escalate=train_fdr_escalate,
                 pseudo_label_growth_cap=pseudo_label_growth_cap,
+                model_repeats=model_repeats,
                 **_svm_kwargs,
             )
             # Output importances

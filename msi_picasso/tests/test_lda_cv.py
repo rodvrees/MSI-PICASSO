@@ -13,6 +13,9 @@ from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from unittest import mock
+
+from msi_picasso import pipeline
 from msi_picasso.pipeline import _cv_semisup_scores, _make_fold_ids
 
 
@@ -103,3 +106,66 @@ class TestCvScoring:
         folds = _make_fold_ids(is_decoy, cv_folds=3)
         oof, _ = _cv_semisup_scores(X, labels, folds, _make_pipe)
         assert np.isfinite(oof).all()  # every row (incl label-0) gets a score
+
+
+class TestModelRepeats:
+    """Averaging independent replicate fits (H-fdr-6/F-030).
+
+    The failure this addresses: the semi-supervised loop does not converge, so
+    its q-value floor moves with the arbitrary CV partition. Averaging *inside*
+    one trajectory was tried first and refuted on real data (kidney returned to
+    0 IDs at 5% FDR at 40 partitions); averaging independent trajectories is what
+    converges, and that is what `model_repeats` does.
+    """
+
+    def test_fold_seed_changes_the_partition(self):
+        rng = np.random.default_rng(0)
+        is_decoy = rng.integers(0, 2, 300).astype(bool)
+        a = _make_fold_ids(is_decoy, cv_folds=3)
+        assert np.array_equal(a, _make_fold_ids(is_decoy, cv_folds=3, random_state=0))
+        assert not np.array_equal(a, _make_fold_ids(is_decoy, cv_folds=3, random_state=1))
+        for one in (a, _make_fold_ids(is_decoy, cv_folds=3, random_state=1)):
+            assert set(np.unique(one)) == {0, 1, 2}
+
+    def test_default_is_a_single_unchanged_fit(self):
+        """model_repeats=1 must be the old code path exactly, or every result in
+        PROGRESS.md stops reproducing."""
+        calls = []
+
+        def fake_once(*args, **kwargs):
+            calls.append(kwargs.get("fold_seed", "absent"))
+            return (np.arange(5.0), None, None, None, [])
+
+        with mock.patch.object(pipeline, "_rescore_linear_once", fake_once):
+            out = pipeline._rescore_linear("df", ["f"], 5.0)
+        assert calls == ["absent"]
+        assert np.array_equal(out[0], np.arange(5.0))
+
+    def test_repeats_average_standardised_replicate_scores(self):
+        """Replicates share a ranking but not a scale, so the mean is over
+        z-scored scores; a replicate on a wild scale must not dominate."""
+        made = [np.array([3.0, 2.0, 1.0]), np.array([1000.0, 0.0, -1000.0])]
+
+        def fake_once(*args, fold_seed=0, **kwargs):
+            return (made[fold_seed], f"imp{fold_seed}", None, None, [])
+
+        with mock.patch.object(pipeline, "_rescore_linear_once", fake_once):
+            out = pipeline._rescore_linear("df", ["f"], 5.0, model_repeats=2)
+        z = [(v - v.mean()) / v.std() for v in made]
+        assert np.allclose(out[0], np.mean(z, axis=0))
+        assert out[1] == "imp0", "importances describe one fitted model, not a mean"
+
+    def test_averaged_scores_stay_out_of_fold(self):
+        """Exchangeable classes must still not separate under a different
+        partition, or the TDC FDR goes anti-conservative."""
+        rng = np.random.default_rng(1)
+        n, p = 240, 40
+        X = rng.standard_normal((n, p))
+        is_decoy = np.zeros(n, dtype=bool)
+        is_decoy[n // 2:] = True
+        labels = np.where(is_decoy, -1, 1).astype(np.int8)
+
+        for seed in (0, 3):
+            folds = _make_fold_ids(is_decoy, cv_folds=3, random_state=seed)
+            oof, _ = _cv_semisup_scores(X, labels, folds, _make_pipe)
+            assert 0.35 < roc_auc_score(is_decoy.astype(int), oof) < 0.65

@@ -148,3 +148,16 @@ def test_images_path_defaults_to_ram():
     config = parse_configurations([{}])["MSI-PICASSO"]
     assert config["images_path"] is None
     assert config["image_batch_size"] == 100
+
+
+def test_model_repeats_round_trip(tmp_path):
+    """H-fdr-6/F-030: the number of CV partitions averaged is a config knob."""
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("[MSI-PICASSO]\nmodel-repeats = 10\n")
+    config = parse_configurations([str(toml)])["MSI-PICASSO"]
+    assert config["model_repeats"] == 10
+
+
+def test_model_repeats_defaults_to_one():
+    """Absent the key, one fixed partition — every result predating this reproduces."""
+    assert parse_configurations([{}])["MSI-PICASSO"]["model_repeats"] == 1
