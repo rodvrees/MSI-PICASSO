@@ -1823,30 +1823,33 @@ def main() -> None:
     _write_results(result_df, output_dir)
     if gt_peptides and "is_tdc_winner" in result_df.columns:
         gt_set = set(gt_peptides)
-        winners = result_df[result_df["is_tdc_winner"] & ~result_df["is_decoy"].astype(bool)]
-        n_gt_winners = winners.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
+        is_target = ~result_df["is_decoy"].astype(bool)
+        winners = result_df[result_df["is_tdc_winner"] & is_target]
         logger.info(
-            "%d/%d GT peptides are round-2 (feature-level) winners.",
-            n_gt_winners, len(gt_set),
+            "%d/%d GT peptides are feature-level winners.",
+            winners.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum(),
+            len(gt_set),
         )
-        winners_fdr = winners[winners['reweighted_q_value'] <= 0.01]
-        n_gt_winners_fdr = winners_fdr.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
-        logger.info(
-            "%d/%d GT peptides are round-2 winners at 1%% FDR.",
-            n_gt_winners_fdr, len(gt_set),
-        )
-        winners_fdr_5 = winners[winners['reweighted_q_value'] <= 0.05]
-        n_gt_winners_fdr_5 = winners_fdr_5.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
-        logger.info(
-            "%d/%d GT peptides are round-2 winners at 5%% FDR.",
-            n_gt_winners_fdr_5, len(gt_set),
-        )
-        winners_fdr_10 = winners[winners['reweighted_q_value'] <= 0.10]
-        n_gt_winners_fdr_10 = winners_fdr_10.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
-        logger.info(
-            "%d/%d GT peptides are round-2 winners at 10%% FDR.",
-            n_gt_winners_fdr_10, len(gt_set),
-        )   
+
+        # Report GT recovery on the SAME population the reported ID count uses.
+        # F-029 moved ID counting to peptide level but left this block at feature
+        # level, so every log from E015 on printed the two on different footings.
+        # amyloidosis E018 read 7/10 GT at 1% FDR against E016's 8/10 -- looking
+        # like GT had been lost while the count rose, which PROGRESS.md sec.1 calls a
+        # red flag for an over-optimistic FDR. At peptide level the same two runs
+        # give 6/10 and 7/10: GT rose with the count. See PROGRESS.md F-034.
+        if "is_peptide_winner" in result_df.columns:
+            pep_col, q_col, level = "is_peptide_winner", "peptide_q_value", "peptide-level"
+        else:
+            pep_col, q_col, level = "is_tdc_winner", "reweighted_q_value", "feature-level"
+        reported = result_df[result_df[pep_col] & is_target]
+        for alpha in (0.01, 0.05, 0.10):
+            passing = reported[reported[q_col] <= alpha].drop_duplicates(subset=["peptide"])
+            logger.info(
+                "%d/%d GT peptides at %g%% FDR (%s, same population as the reported "
+                "ID count).",
+                passing["peptide"].isin(gt_set).sum(), len(gt_set), alpha * 100, level,
+            )
     logger.info("Done.")
 
 
