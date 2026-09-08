@@ -512,10 +512,10 @@ In `/home/robbe/MALDI_MSI_score/scripts/`:
 | script | purpose |
 |---|---|
 | `scoreboard.py` | scrape all `results/*/*/run.log` into one comparison table; `--markdown` for a PROGRESS.md row, `--diff A B` for a settings diff between two runs |
-| `validate_results.py` | biological validation: marker recovery, GT recovery, LC-MS concordance |
-| `diagnose_gt.py` | per-GT-peptide failure diagnosis against a results dir |
-| `grid_search.py` / `analyze_grid_search.py` | parameter sweep (reuses `raw_query_cache`) and its sensitivity analysis |
-| `ablation_svm.py` / `ablation_lda.py` | feature ablation |
+| `validate_results.py` | biological validation: marker recovery, GT recovery, LC-MS concordance. Counts on the reported population (peptide-level since F-029) |
+| `diagnose_gt.py` | **STALE — does not run on any current result.** LDA-only: reads `17_debug_lda_*` and `lda_score_r*`, which no `rbf_svm` run writes. Its coefficient-attribution analysis is linear-model-specific, so reviving it needs a design decision first, not a rename. |
+| `grid_search.py` / `analyze_grid_search.py` | parameter sweep (reuses `raw_query_cache`) and its sensitivity analysis. Its objective counts on the reported population — keep it that way or the sweep optimises something the scoreboard does not show |
+| `ablation_svm.py` / `ablation_lda.py` | feature ablation. `ablation_lda.py` still counts at feature level (H-code-1, not fixed — it is LDA-era and unused) |
 | `audit_coloc_leak.py` | per-colocalization-column target/decoy AUC and abundance-leak check — run before promoting a coloc feature into the ranker |
 | `seed_permutation_test.py` | the F-020 label-permutation test on the seed search, over several independent permutation sets — reads the run's own ranker feature list and reproduces its reported seed |
 | `replicate_spread.py` | refits a past run's round 1 under N CV partitions and reports the spread of its ID counts — reads the run's own `.full_config.json`; run this before quoting or comparing any single-fit count |

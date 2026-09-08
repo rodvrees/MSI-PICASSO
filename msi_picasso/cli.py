@@ -223,23 +223,52 @@ def _write_results(
 ) -> None:
     """Write rescoring results to TSV files in ``output_dir``.
 
-    Writes all candidates (targets and decoys) with q-value annotation.
-    No hard filtering is applied — downstream consumers can filter by
-    ``reweighted_q_value``, ``is_tdc_winner``, and ``is_decoy`` as needed.
+    ``ms1rescore_matches.tsv`` gets every candidate, targets and decoys, with its
+    q-value annotation and no filtering: downstream consumers filter on
+    ``is_peptide_winner``/``peptide_q_value`` (or the feature-level equivalents for
+    results predating F-029) and ``is_decoy`` themselves.
+
+    ``ms1rescore_peptides.tsv`` is the confident-identification list, so it is
+    filtered: targets only, one row per peptide, at 1% FDR. It previously did none
+    of those things despite its name -- it kept every peptide-feature pair, applied
+    the feature-level q-value, and **did not exclude decoys**, so amyloidosis E018
+    shipped 1294 rows covering 308 peptides of which 11 were decoys, where the
+    reported count was 247 target peptides. See PROGRESS.md F-035.
     """
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, "ms1rescore_matches.tsv")
     result.to_csv(out_path, sep="\t", index=False)
     n_winners = result.get("is_tdc_winner", result["is_decoy"].apply(lambda x: not x)).sum()
     logger.info(f"  Wrote {len(result)} candidates ({n_winners} TDC winners) → {out_path}")
-    # Filter per-feature winners filtered by q-value
-    if "is_tdc_winner" in result.columns and "reweighted_q_value" in result.columns:
-        winners = result[result["is_tdc_winner"] & (result["reweighted_q_value"] <= 0.01)]
-        peptides_out = os.path.join(output_dir, "ms1rescore_peptides.tsv")
-        cols = [c for c in ["feature_idx", "feature_mz", "feature_ccs", "peptide", "protein", "reweighted_q_value"] if c in winners.columns]
-        peptides = winners[cols].drop_duplicates().sort_values("reweighted_q_value")
-        peptides.to_csv(peptides_out, sep="\t", index=False)
-        logger.info(f"  Wrote {len(peptides)} peptide-level winners → {peptides_out}")
+
+    # Prefer the peptide-level population, matching the reported ID count (F-029).
+    # Fall back to feature level for raw-query results, which have no peptide-level
+    # columns; the log line says which was used.
+    if "is_peptide_winner" in result.columns and "peptide_q_value" in result.columns:
+        win_col, q_col, level = "is_peptide_winner", "peptide_q_value", "peptide-level"
+    elif "is_tdc_winner" in result.columns and "reweighted_q_value" in result.columns:
+        win_col, q_col, level = "is_tdc_winner", "reweighted_q_value", "feature-level"
+    else:
+        return
+
+    confident = result[
+        result[win_col].astype(bool)
+        & ~result["is_decoy"].astype(bool)
+        & (result[q_col] <= 0.01)
+    ]
+    cols = [c for c in ["feature_idx", "feature_mz", "feature_ccs", "peptide", "protein",
+                        q_col] if c in confident.columns]
+    peptides = (
+        confident[cols]
+        .sort_values(q_col)
+        .drop_duplicates(subset=["peptide"], keep="first")
+    )
+    peptides_out = os.path.join(output_dir, "ms1rescore_peptides.tsv")
+    peptides.to_csv(peptides_out, sep="\t", index=False)
+    logger.info(
+        "  Wrote %d confident target peptides at 1%% FDR (%s) → %s",
+        len(peptides), level, peptides_out,
+    )
 
 # ---------------------------------------------------------------------------
 # Argument parser
