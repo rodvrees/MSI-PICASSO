@@ -89,9 +89,24 @@ the only part of this file that is genuinely load-bearing.
    make the null anti-conservative (F-019, and `generate_mz_shuffle_candidates`' docstring).
    In feature-list mode the anchor is the matched detected peak's m/z, which is likewise the
    candidate's own match.
-3. **Composition features stay out of `_BEST_FEAT_SKIP` and out of the seed.** Several decoy
+3. **Composition features must stay OUT of the seed and out of the ranker.** Several decoy
    methods alter elemental composition, so composition features separate target from decoy
-   as an artifact of decoy construction. Seeding on them makes the FDR anti-conservative.
+   as an artifact of decoy construction, with no spectral evidence involved. Seeding on them
+   makes the FDR anti-conservative.
+
+   Two separate mechanisms do the excluding and it is worth knowing which is which, because
+   the wording here used to be wrong in a way PROGRESS.md then repeated. `_BEST_FEAT_SKIP`
+   (`pipeline.py:488`, 11 entries) excludes columns from the **seed search only**.
+   Eligibility for the **ranker** is set by membership of `MALDI_INTRINSIC_FEATURES`. `n_S`
+   is in neither, which is what actually keeps it out — not `_BEST_FEAT_SKIP`, which does not
+   contain it.
+
+   **Anything derived from composition counts as a composition feature**, and the
+   isotope-envelope family is derived from composition. F-036 measured `theo_isotope_kl`
+   reading sulfur content at AUC 0.61-0.70 among targets alone, while `substitution` decoys
+   carry twice the sulfur of targets — so it partially reads the label. Those features are
+   currently in the ranker; see PROGRESS.md F-036 and H-decoy-13 before adding more of the
+   same shape.
 4. **`is_decoy` must be cast to `bool` dtype** before returning a candidates frame.
    `pd.concat` with an empty frame yields `object`-dtype booleans, which break
    `~df["is_decoy"]` indexing downstream.
@@ -305,7 +320,7 @@ configuration it was established under.
 
 | method | what it does | preserves | notes |
 |---|---|---|---|
-| `substitution` | substitutes `substitution_n_residues` interior non-K/R residues, one decoy per unique target | length, cleavage sites | **changes elemental composition** — see invariant 3. Mass shift ~1–50 Da, so CCS features stay usable and it is compatible with `--match-ccs`. |
+| `substitution` | substitutes `substitution_n_residues` interior non-K/R residues, one decoy per unique target | length, cleavage sites | **changes elemental composition** — see invariant 3, and F-036 for a measured consequence. Mass shift measured p10 24 Da, median 55 Da, p90 107 Da, max 407 Da (F-036) — the "~1–50 Da" this table used to claim understated it. CCS features stay usable and it is compatible with `--match-ccs`. |
 | `mz_shift` | shifts the query m/z by a random delta in `[delta_min, delta_max]` Da | sequence exactly | in raw-query, snapping is disabled so each decoy sits at its exact shifted m/z on a distinct feature |
 | `mz_shuffle` | derangement of the peptide→feature assignment (mass-sorted rotation) | sequence exactly | decoys are **co-located** with targets on identical ion images, so feature-quality features are exactly symmetric. **Do not combine with `--match-ccs`** — it would remove ~all decoys by design. Raw CCS scalars and mobility-gated colocalizations are auto-excluded (`_MZ_SHUFFLE_CCS_LEAK_FEATURES`); only `*_resid` variants are kept. |
 | `entrapment` | tryptic peptides from a foreign-organism FASTA (`entrapment_fasta`), isobaric-with-target ones filtered out | — | `protein="ENTRAPMENT_{acc}"` |
