@@ -161,3 +161,16 @@ def test_model_repeats_round_trip(tmp_path):
 def test_model_repeats_defaults_to_one():
     """Absent the key, one fixed partition — every result predating this reproduces."""
     assert parse_configurations([{}])["MSI-PICASSO"]["model_repeats"] == 1
+
+
+def test_substitution_mass_shift_max_da_round_trip(tmp_path):
+    """H-fdr-10/F-036: the cap on the substitution mass shift is a config knob."""
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("[MSI-PICASSO]\nsubstitution_mass_shift_max_da = 120.0\n")
+    config = parse_configurations([str(toml)])["MSI-PICASSO"]
+    assert config["substitution_mass_shift_max_da"] == 120.0
+
+
+def test_substitution_mass_shift_max_da_defaults_to_unset():
+    """Absent the key there is no cap, so earlier results reproduce."""
+    assert parse_configurations([{}])["MSI-PICASSO"]["substitution_mass_shift_max_da"] is None

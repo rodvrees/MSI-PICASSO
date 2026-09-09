@@ -527,3 +527,66 @@ def test_retry_does_not_change_decoys_when_filter_is_inert():
         return list(out.loc[out.is_decoy].sort_values("feature_mz")["peptide"])
 
     assert _decoys(1) == _decoys(200)
+
+
+class TestMassShiftMaxDa:
+    """H-fdr-10: an upper bound on the substitution mass shift.
+
+    F-036 measured the isotope-envelope features separating targets from decoys at
+    AUC 0.58-0.66 among decoys whose substitution moved the mass more than ~120 Da,
+    against 0.50-0.53 below that. Those features read elemental composition, and a
+    large shift is exactly a large composition change, so the separation comes from
+    how the decoy was built rather than from any spectral evidence.
+
+    The cap rejects and resamples rather than dropping, so no decoy is lost.
+    """
+
+    @staticmethod
+    def _shifts(max_da, n_residues=2, seed=11):
+        """Net |mass shift| of each decoy against its source target."""
+        target_df = _make_target_df(_PEPTIDES_100)
+        result = generate_substitution_candidates(
+            target_df, _empty_features(), matching_ppm=20.0, n_residues=n_residues,
+            random_seed=seed, mass_shift_max_da=max_da, collision_filter=False,
+            snap_to_features=False,
+        )
+        src = target_df.set_index("peptide")["mh_mz"].to_dict()
+        dec = result[result["is_decoy"].astype(bool)]
+        out = []
+        for row in dec.itertuples(index=False):
+            cand = [abs(row.mh_mz - m) for p, m in src.items()
+                    if len(p) == len(row.peptide)
+                    and 0 < sum(a != b for a, b in zip(p, row.peptide)) <= n_residues]
+            if cand:
+                out.append(min(cand))
+        return out, int(len(dec))
+
+    def test_uncapped_can_exceed_the_bound(self):
+        """Without a cap the shifts run well past it, or the next test is vacuous."""
+        shifts, _ = self._shifts(max_da=None)
+        assert shifts, "no decoys paired back to a source target"
+        assert max(shifts) > 40, f"uncapped max was only {max(shifts):.1f} Da"
+
+    @pytest.mark.parametrize("cap", [20.0, 40.0])
+    def test_cap_is_respected(self, cap):
+        shifts, _ = self._shifts(max_da=cap)
+        assert shifts, f"no decoys generated at cap {cap}"
+        assert max(shifts) <= cap + 1e-6, \
+            f"cap {cap} Da exceeded: max shift {max(shifts):.3f} Da"
+
+    def test_cap_resamples_rather_than_dropping(self):
+        """A rejected substitution is retried, so the decoy count must not fall."""
+        _, n_capped = self._shifts(max_da=40.0)
+        _, n_plain = self._shifts(max_da=None)
+        assert n_capped >= n_plain * 0.98, \
+            f"capping lost decoys: {n_capped} against {n_plain}"
+
+    def test_none_reproduces_previous_behaviour(self):
+        """The default must leave every earlier result bit-identical."""
+        target_df = _make_target_df(_PEPTIDES_100)
+        kw = dict(matching_ppm=20.0, n_residues=2, random_seed=11,
+                  collision_filter=False, snap_to_features=False)
+        a = generate_substitution_candidates(target_df, _empty_features(), **kw)
+        b = generate_substitution_candidates(target_df, _empty_features(),
+                                             mass_shift_max_da=None, **kw)
+        pd.testing.assert_frame_equal(a, b)

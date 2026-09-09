@@ -655,6 +655,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     cand.add_argument(
+        "--substitution-mass-shift-max-da",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "substitution only: maximum absolute NET mass shift in Da; a substitution "
+            "exceeding it is rejected and resampled, so no decoy is lost. Default: unset "
+            "(no cap). H-fdr-10: a large shift leaves the decoy's elemental composition far "
+            "from its source target's, and the isotope-envelope features read composition, "
+            "so those decoys separate from targets for a construction reason rather than a "
+            "spectral one. Measured AUC 0.58-0.66 above ~120 Da against 0.50-0.53 below "
+            "(PROGRESS.md F-036). Two substitutions cannot exceed ~258 Da, so a cap above "
+            "that is a no-op."
+        ),
+    )
+    cand.add_argument(
         "--decoy-target-ratio",
         type=float,
         default=None,
@@ -1432,7 +1448,8 @@ def main() -> None:
         "decoy_method", "mz_shift_delta_min", "mz_shift_delta_max",
         "mz_shift_snap_tolerance_ppm", "max_shuffle_rounds", "decoy_target_ratio",
         "substitution_n_residues", "substitution_seed", "substitution_no_collision_filter",
-        "substitution_mass_shift_min_da", "substitution_collision_ppm",
+        "substitution_mass_shift_min_da", "substitution_mass_shift_max_da",
+        "substitution_collision_ppm",
         "protein_fdr", "peptide_fdr", "lcms_id_format",
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
         "features_preset", "features_exclude", "seed_features",
@@ -1841,6 +1858,7 @@ def main() -> None:
         substitution_seed=_ms1cfg["substitution_seed"],
         substitution_collision_filter=not bool(_ms1cfg.get("substitution_no_collision_filter", False)),
         substitution_mass_shift_min_da=_ms1cfg.get("substitution_mass_shift_min_da"),
+        substitution_mass_shift_max_da=_ms1cfg.get("substitution_mass_shift_max_da"),
         substitution_collision_ppm=_ms1cfg.get("substitution_collision_ppm"),
     )
 

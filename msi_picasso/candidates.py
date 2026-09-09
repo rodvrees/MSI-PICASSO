@@ -697,6 +697,7 @@ def generate_substitution_candidates(
     n_residues: int = 1,
     random_seed: int = 42,
     mass_shift_min_da: float | None = None,
+    mass_shift_max_da: float | None = None,
     collision_filter: bool = True,
     collision_ppm: float | None = None,
     snap_to_features: bool = False,
@@ -829,6 +830,14 @@ def generate_substitution_candidates(
                         )
                         if abs(mass_delta) < min_shift:
                             continue
+                        # Upper bound: H-fdr-10. A large shift leaves the decoy with a
+                        # composition far from its source target's, and the isotope-envelope
+                        # features read composition, so those decoys separate from targets for
+                        # a construction reason rather than a spectral one (PROGRESS.md F-036:
+                        # AUC 0.58-0.66 above ~120 Da, against 0.50-0.53 below). Rejecting
+                        # here resamples the substitution rather than dropping the decoy.
+                        if mass_shift_max_da is not None and abs(mass_delta) > mass_shift_max_da:
+                            continue
 
                         if collision_filter:
                             if _collides_target(approx_mhz):
@@ -929,6 +938,15 @@ def generate_substitution_candidates(
                     logger.debug(
                         "substitution: '%s' net shift %.4f Da < min %.4f Da — retrying",
                         peptide, abs(net_delta), min_shift,
+                    )
+                    continue
+                # See the matching guard above: H-fdr-10 / F-036. This is the binding one,
+                # since it is the NET shift across all substituted residues that determines
+                # how far the decoy's composition has moved from its source target's.
+                if mass_shift_max_da is not None and abs(net_delta) > mass_shift_max_da:
+                    logger.debug(
+                        "substitution: '%s' net shift %.4f Da > max %.4f Da — retrying",
+                        peptide, abs(net_delta), mass_shift_max_da,
                     )
                     continue
 

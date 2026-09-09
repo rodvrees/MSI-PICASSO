@@ -2035,6 +2035,7 @@ def rescore(
     substitution_collision_filter: bool = True,
     substitution_collision_ppm: float | None = None,
     substitution_mass_shift_min_da: float | None = None,
+    substitution_mass_shift_max_da: float | None = None,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -2642,6 +2643,7 @@ def rescore(
             n_residues=substitution_n_residues,
             random_seed=substitution_seed,
             mass_shift_min_da=substitution_mass_shift_min_da,
+            mass_shift_max_da=substitution_mass_shift_max_da,
             collision_filter=substitution_collision_filter,
             collision_ppm=substitution_collision_ppm,
             snap_to_features=not maldi_query_raw,
