@@ -74,6 +74,13 @@ MALDI_INTRINSIC_FEATURES = [
     "theo_isotope_cosine", "theo_isotope_chi2", "theo_isotope_kl",
     "theo_has_sulfur", "averagine_deviation", "averagine_deviation_sulfur",
     "theo_m1_ratio_diff", "theo_m2_ratio_diff",
+    # H-decoy-13: the same envelope comparison referenced to averagine at the matched
+    # peak's mass rather than to the candidate's own formula, so it cannot read the
+    # composition asymmetry `substitution` creates (PROGRESS.md F-036/F-039). Value is
+    # per-peak, identical for every candidate on it, so it ranks peaks rather than
+    # separating candidates competing for one.
+    "averagine_envelope_kl",
+    "averagine_envelope_m1_ratio_diff", "averagine_envelope_m2_ratio_diff",
     "monoisotopic_confidence",       # A8
     # --- ionization priors ---
     "n_arginine", "n_basic_residues", "n_aromatic",
@@ -333,6 +340,11 @@ FEATURE_NAN_FILL: dict[str, float | str] = {
     # asymmetry in the original feature, not introduced here.
     "theo_m1_ratio_diff_massnorm": "col_max",
     "theo_m2_ratio_diff_massnorm": "col_max",
+    # H-decoy-13, same treatment and same pre-existing asymmetry: the ratio diffs go to
+    # worst-case when no envelope exists, averagine_envelope_kl stays 0.0 like the
+    # unnormalized theo_isotope_kl it parallels.
+    "averagine_envelope_m1_ratio_diff": "col_max",
+    "averagine_envelope_m2_ratio_diff": "col_max",
 }
 
 # ---------------------------------------------------------------------------

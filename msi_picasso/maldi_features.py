@@ -1148,6 +1148,65 @@ def compute_theoretical_isotope_features(
     df["theo_isotope_cosine"] = theo_cosine
     df["theo_isotope_chi2"] = theo_chi2
     df["theo_isotope_kl"] = theo_kl
+
+    # --- H-decoy-13: the same envelope comparison, referenced to averagine -------------
+    # The three columns above predict the isotope pattern from the CANDIDATE's own
+    # elemental formula. That makes them read composition, and `substitution` decoys
+    # differ from targets in composition by construction, so they partly read the
+    # target/decoy label with no spectral evidence involved (PROGRESS.md F-036: AUC
+    # 0.58-0.66 among the decoys whose substitution moved the mass furthest; and among
+    # targets alone the feature separates sulfur-bearing from sulfur-free peptides at
+    # AUC 0.61-0.70).
+    #
+    # Sulfur is not the whole story -- the leak survives restricting both classes to zero
+    # sulfur on kidney (0.593) and her2 (0.609) -- so blinding the feature to sulfur alone
+    # would not fix it. The candidate's composition has to leave the calculation entirely.
+    #
+    # These columns predict from averagine at the MATCHED PEAK's implied mass instead, so
+    # the value depends only on the peak and is identical for every candidate matched to
+    # it. That is symmetric between the classes by construction, which is the point, and
+    # it changes what the feature measures: "is the signal at this peak isotopically
+    # consistent with a peptide of this mass at all", rather than "does this particular
+    # candidate explain it". It therefore cannot separate candidates competing for the
+    # same peak, only rank one peak against another. Averagine also assumes zero sulfur,
+    # so genuinely sulfur-bearing targets are penalised -- a real cost, borne by both
+    # classes in proportion to their sulfur.
+    avg_env_kl = np.zeros(n)
+    avg_env_m1_diff = np.full(n, np.nan)
+    avg_env_m2_diff = np.full(n, np.nan)
+
+    if maldi_envelopes:
+        feature_mzs = df["feature_mz"].values.astype(float)
+        # Averagine composition from the peak, not from the candidate. Charge 1, standard
+        # for MALDI singly-protonated ions, matching `implied_mass` elsewhere in this file.
+        feat_mass = feature_mzs - PROTON
+        fa_comps = list(zip(
+            np.round(feat_mass * AVERAGINE_C).astype(int).tolist(),
+            np.round(feat_mass * AVERAGINE_H).astype(int).tolist(),
+            np.round(feat_mass * AVERAGINE_N).astype(int).tolist(),
+            np.round(feat_mass * AVERAGINE_O).astype(int).tolist(),
+            [0] * n,
+        ))
+        fa_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in set(fa_comps)}
+        for i in range(n):
+            maldi_env = maldi_envelopes.get(feature_mzs[i])
+            if maldi_env is None or len(maldi_env) < 3:
+                continue
+            obs = np.array(maldi_env[:3], dtype=np.float64)
+            a = np.asarray(fa_cache[fa_comps[i]], dtype=np.float64)
+            obs_s = obs.sum()
+            if obs_s > 0:
+                obs_norm = obs / obs_s
+                a_safe = np.clip(a, 1e-10, None)
+                obs_safe = np.clip(obs_norm, 1e-10, None)
+                avg_env_kl[i] = np.sum(obs_safe * np.log(obs_safe / a_safe))
+            if obs[0] > 0 and a[0] > 0:
+                avg_env_m1_diff[i] = abs(obs[1] / obs[0] - a[1] / a[0])
+                avg_env_m2_diff[i] = abs(obs[2] / obs[0] - a[2] / a[0])
+
+    df["averagine_envelope_kl"] = avg_env_kl
+    df["averagine_envelope_m1_ratio_diff"] = avg_env_m1_diff
+    df["averagine_envelope_m2_ratio_diff"] = avg_env_m2_diff
     df["theo_m1_ratio_diff"] = theo_m1_diff
     df["theo_m2_ratio_diff"] = theo_m2_diff
     df["monoisotopic_confidence"] = mono_conf
