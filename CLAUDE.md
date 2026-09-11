@@ -344,7 +344,7 @@ substitution}`. With any other method `use_spatial_ranker_features` is force-dis
 |---|---|---|
 | `lda` | `LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")` | package default; importances are `coef_[0]` |
 | `svm` | `sklearn.svm.LinearSVC` | shares `_rescore_linear` with `lda`; adds no dependency |
-| `rbf_svm` | `sklearn.svm.SVC(kernel="rbf")` | nonlinear; no `coef_`, so importances are reported as \|structure coefficient\|. `rbf_svm_gamma` accepts `"scale"`/`"auto"` or a float. Training is O(N²). |
+| `rbf_svm` | `sklearn.svm.SVC(kernel="rbf")` | nonlinear; no `coef_`, so importances are reported as permutation importance (below). `rbf_svm_gamma` accepts `"scale"`/`"auto"` or a float. Training is O(N²). |
 | `qda` | `QuadraticDiscriminantAnalysis(reg_param=0.1)` | reuses R1 posteriors for PEP under `--single-round` |
 | `gbt` | gradient-boosted trees (`_rescore_gbt`, `pipeline.py:991`) | `gbt_n_estimators`, `gbt_max_depth`, `gbt_learning_rate`; never benchmarked on the three datasets |
 
@@ -365,6 +365,32 @@ Reported importances come from the first replicate; they describe one fitted mod
 `is_decoy`) scores every candidate with a model trained on the other folds. Feature
 importances come from a model fit on everything, but the FDR scores are strictly
 out-of-fold.
+
+**Three different per-feature numbers are reported, and they are not the same quantity.**
+`17_debug_<model>_importances_r1.tsv` holds two of them.
+
+| column | what it is | which backends |
+|---|---|---|
+| `importance` | `coef_[0]`, or `feature_importances_` for trees | `lda`, `svm`, `gbt` |
+| `importance` | permutation importance: `1 - spearman(score with that column shuffled, the unshuffled score)`, 5 shuffles, rows subsampled to 5000. 0 means the model does not use the feature (`_permutation_importance`, `pipeline.py`) | `rbf_svm`, and anything else without `coef_` |
+| `structure_coef` | Pearson r between the scaled feature and the score | all |
+
+A structure coefficient is a *correlation*, not an attribution: a feature can correlate
+with the score without contributing to it and contribute without correlating. The two
+disagree in practice (PROGRESS.md F-041), so read both: `importance` says how much the
+model uses a feature, `structure_coef` says in which direction. Permutation importance has
+no sign — kidney's top feature carries three quarters of the ranking with a structure
+coefficient of −0.53, meaning a high value pushes a candidate *down*.
+
+Permutation importance is averaged over the first `_PERM_IMPORTANCE_REPLICATES` (5)
+replicate fits rather than all `model_repeats`, because one replicate's ranking is not
+reproducible on kidney (F-041) and a full 20 would add 23 minutes to an amyloidosis run.
+Coefficients and structure coefficients still come from replicate 0 only.
+
+**SHAP works for every backend** (`debug_pfm_explanations`, `--verbose`): `LinearExplainer`
+where there is a `coef_`, `KernelExplainer` on `decision_function` otherwise. The kernel
+path is affordable only because it runs on the reported candidates — at most `max_targets`
+of them, 1.3 s each on the E021 models — and not on the ~12 K candidate rows.
 
 **Round-1 seed** — `_find_best_feature_labels` (`pipeline.py:456`) sweeps each feature and
 both ranking directions, counting targets at q ≤ `train_fdr`. Sub-ULP random noise breaks
@@ -536,6 +562,7 @@ In `/home/robbe/MALDI_MSI_score/scripts/`:
 | `replicate_spread.py` | refits a past run's round 1 under N CV partitions and reports the spread of its ID counts — reads the run's own `.full_config.json`; run this before quoting or comparing any single-fit count |
 | `refit_harness.py` | shared helpers for refitting a finished run's scoring step offline with one thing changed: `load`, `fit`, `rollup`, `stats`, `final_report_permutation`. Reproduces a run's reported counts exactly when nothing is varied — if it does not, stop and find out why. Always pass `model_repeats` |
 | `compare_backends.py` | which scoring backend, at what cost in IDs (PROGRESS.md F-040). `RUN=E021 python scripts/compare_backends.py` |
+| `importance_attribution.py` | permutation importance against the structure coefficients, and whether either is stable across replicate fits (PROGRESS.md F-041). `RUN=E021 REPS=6 python scripts/importance_attribution.py` |
 | `envelope_qc.py` | isotope-envelope QC |
 | `visualize_ms1rescore_features.py` | per-feature, per-candidate target/decoy visualisation |
 

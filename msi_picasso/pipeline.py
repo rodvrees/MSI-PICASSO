@@ -858,6 +858,56 @@ def _cv_semisup_scores(X_fit, labels, fold_ids, make_pipe):
     return oof, pipe_full
 
 
+# How many replicate fits contribute to the reported permutation importance when
+# model_repeats > 1. See _rescore_linear for why this is not all of them.
+_PERM_IMPORTANCE_REPLICATES = 5
+
+
+def _permutation_importance(
+    pipe, X_fit, n_repeats: int = 5, random_state: int = 0, max_samples: int = 5000
+):
+    """How much of the score's ranking one feature carries (H-model-2, F-041).
+
+    A structure coefficient says how strongly a feature *correlates* with the
+    score. A feature can correlate without contributing (it moves with one that
+    does) and contribute without correlating (its effect is conditional on
+    another feature), so it is not an attribution. Shuffling a column and
+    re-scoring measures the contribution directly, and it needs nothing from the
+    estimator but ``decision_function`` — which is what the kernel backends need,
+    since they have no ``coef_``.
+
+    Returned value per feature: ``1 - spearman(score with that column shuffled,
+    the unshuffled score)``, averaged over ``n_repeats`` shuffles. 0 means the
+    ranking is unchanged, so the model does not use the feature; 1 means the
+    ranking is destroyed.
+
+    Scored against the model's own output rather than against the labels on
+    purpose. The obvious alternative, the drop in target-versus-pseudo-positive
+    ROC AUC, is saturated here: the fitted SVC separates its own training rows at
+    AUC 0.9995-1.0000 on all three datasets, and with 22 pseudo-positives against
+    6245 decoys (kidney) the remaining features still reach 1.0 after any single
+    column is shuffled, so that measure returns exactly 0 for almost every
+    feature. The ranking is also the quantity that decides the identification
+    count, which the training-set AUC is not.
+
+    Reporting only: these values never enter a score or an FDR estimate. Rows are
+    subsampled to ``max_samples`` to bound the cost, which is
+    ``n_features * n_repeats`` scoring passes.
+    """
+    from scipy.stats import spearmanr
+    from sklearn.inspection import permutation_importance
+
+    def _agreement(est, Xq, yq):
+        return float(spearmanr(est.decision_function(Xq), yq).statistic)
+
+    r = permutation_importance(
+        pipe, X_fit, pipe.decision_function(X_fit), scoring=_agreement,
+        n_repeats=n_repeats, random_state=random_state,
+        max_samples=min(max_samples, len(X_fit)),
+    )
+    return r.importances_mean
+
+
 def _rescore_linear_once(
     features_df: pd.DataFrame,
     intrinsic_feature_names: list[str],
@@ -880,6 +930,7 @@ def _rescore_linear_once(
     decoy_split_mask: np.ndarray | None = None,
     train_fdr_escalate: bool = False,
     pseudo_label_growth_cap: float | None = None,
+    perm_importance: bool = True,
 ) -> np.ndarray:
     """
     Semi-supervised rescoring on MALDI-intrinsic features with a linear,
@@ -932,6 +983,12 @@ def _rescore_linear_once(
     0.5) until a non-empty discovery set is found or the cap is reached, instead
     of falling back to the weaker ppm-based heuristic or stopping early. A no-op
     whenever the configured threshold already succeeds.
+
+    ``perm_importance`` (H-model-2): report permutation importance rather than
+    ``|structure coefficient|`` when the estimator exposes neither ``coef_`` nor
+    ``feature_importances_``. See ``_permutation_importance``. Costs one refit-free
+    pass of ``5 x n_features`` scoring calls (3 to 68 s on the three datasets), so
+    ``_rescore_linear`` asks only the first few replicates for it.
 
     ``pseudo_label_growth_cap`` (H-fdr-5, opt-in): if an iteration's pseudo-
     positive count exceeds this multiple of the initial seed size, the loop
@@ -1199,9 +1256,17 @@ def _rescore_linear_once(
             pass
         # Kernel models (e.g. the rbf_svm backend) expose neither coef_ nor
         # feature_importances_ — the decision function lives in kernel space, not
-        # per-feature. Fall back to |structure coefficient| so the importance TSV
-        # stays populated and sortable. Only valid when not using poly expansion
-        # (struct_coefs align with `present`, the un-expanded feature list).
+        # per-feature. Report permutation importance instead, which is a
+        # contribution rather than a correlation (H-model-2, F-041); its columns
+        # are X_fit's, i.e. `struct_names_out`. Falls back to |structure
+        # coefficient| if that fails, so the importance TSV is always populated.
+        if importances is None and perm_importance:
+            try:
+                importances = _permutation_importance(pipe, X_fit)
+                if importances is not None:
+                    feature_names_out = struct_names_out
+            except Exception as exc:
+                logger.warning(f"  {_tag}: permutation importance failed ({exc})")
         if importances is None and struct_coefs is not None and not use_poly:
             importances = np.abs(struct_coefs)
     # Expose the fitted pipeline + raw feature matrix for downstream SHAP debug
@@ -1234,23 +1299,59 @@ def _rescore_linear(*args, model_repeats: int = 1, **kwargs):
     replicate, so the TDC null is untouched — checked by permuting the final
     report's labels (0 passing in 60 of 60 trials, all three datasets).
 
-    Reported importances come from the first replicate: they describe one fitted
-    model and averaging structure coefficients across replicates would describe
-    none of them. ``model_repeats=1`` is exactly ``_rescore_linear_once``.
+    Reported coefficients and structure coefficients come from the first
+    replicate: they describe one fitted model and averaging them across
+    replicates would describe none of them. **Permutation importances are the
+    exception and are averaged** over the first ``_PERM_IMPORTANCE_REPLICATES``
+    replicates, because a single replicate's ranking is not reproducible on every
+    dataset — measured on E021, replicate-to-replicate Spearman is 0.95 on
+    amyloidosis and 0.97 on her2 but 0.44 on kidney, with a worst pair of 0.16
+    (F-041). That is the same instability the scores have, so it gets the same
+    treatment. Five is a compromise: it covers most of the noise, and the cost is
+    a fifth of a full 20-replicate measurement, which would add 23 minutes to a
+    117 minute amyloidosis run to sharpen a ranking that was already stable
+    there.
+
+    ``model_repeats=1`` is exactly ``_rescore_linear_once``.
     """
     if model_repeats <= 1:
         return _rescore_linear_once(*args, **kwargs)
 
+    # Intercepted so each replicate's fitted pipeline can be inspected here; the
+    # caller's dict still ends up holding the last replicate's, as before.
+    kwargs = dict(kwargs)
+    caller_fitted_out = kwargs.pop("fitted_out", None)
+    fitted: dict = {}
+
     scores_acc = []
+    perm_acc = []
     first: tuple | None = None
     for r in range(model_repeats):
-        out = _rescore_linear_once(*args, fold_seed=r, **kwargs)
+        out = _rescore_linear_once(
+            *args, fold_seed=r, fitted_out=fitted,
+            perm_importance=(r < _PERM_IMPORTANCE_REPLICATES), **kwargs,
+        )
         s = np.asarray(out[0], dtype=np.float64)
         scores_acc.append((s - s.mean()) / (s.std() or 1.0))
+        # out[1] is a permutation importance only for an estimator that exposes
+        # neither coef_ nor feature_importances_; anything else is that
+        # estimator's own quantity and is reported from replicate 0 unaveraged.
+        est = fitted.get("pipe", [None])[-1]
+        if (
+            r < _PERM_IMPORTANCE_REPLICATES
+            and out[1] is not None
+            and est is not None
+            and not hasattr(est, "coef_")
+            and not hasattr(est, "feature_importances_")
+        ):
+            perm_acc.append(np.asarray(out[1], dtype=np.float64))
         if first is None:
             first = out
+    if caller_fitted_out is not None:
+        caller_fitted_out.update(fitted)
     logger.info(f"  Averaged {model_repeats} replicate fits (differing CV partition)")
-    return (np.mean(scores_acc, axis=0),) + tuple(first[1:])
+    importances = np.mean(perm_acc, axis=0) if len(perm_acc) > 1 else first[1]
+    return (np.mean(scores_acc, axis=0), importances) + tuple(first[2:])
 
 
 def _rescore_lda(features_df, intrinsic_feature_names, init_ppm_threshold, **kwargs):
