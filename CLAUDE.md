@@ -534,6 +534,8 @@ In `/home/robbe/MALDI_MSI_score/scripts/`:
 | `audit_coloc_leak.py` | per-colocalization-column target/decoy AUC and abundance-leak check — run before promoting a coloc feature into the ranker |
 | `seed_permutation_test.py` | the F-020 label-permutation test on the seed search, over several independent permutation sets — reads the run's own ranker feature list and reproduces its reported seed |
 | `replicate_spread.py` | refits a past run's round 1 under N CV partitions and reports the spread of its ID counts — reads the run's own `.full_config.json`; run this before quoting or comparing any single-fit count |
+| `refit_harness.py` | shared helpers for refitting a finished run's scoring step offline with one thing changed: `load`, `fit`, `rollup`, `stats`, `final_report_permutation`. Reproduces a run's reported counts exactly when nothing is varied — if it does not, stop and find out why. Always pass `model_repeats` |
+| `compare_backends.py` | which scoring backend, at what cost in IDs (PROGRESS.md F-040). `RUN=E021 python scripts/compare_backends.py` |
 | `envelope_qc.py` | isotope-envelope QC |
 | `visualize_ms1rescore_features.py` | per-feature, per-candidate target/decoy visualisation |
 
