@@ -250,6 +250,7 @@ def compute_spatial_features(
 def compute_tissue_mask(
     ion_images: np.ndarray,
     tic_quantile: float = 0.0,
+    tic_image: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Build an on-tissue pixel mask from a total-ion-current (TIC) proxy.
@@ -262,7 +263,14 @@ def compute_tissue_mask(
     co-distribution within the tissue.  Restricting the correlation to
     on-tissue pixels removes that common component.
 
-    The TIC proxy is the per-pixel sum over all supplied ion images.  Pixels
+    The TIC proxy is the per-pixel sum over all supplied ion images. ``tic_image``
+    overrides that with a sum computed elsewhere, which is what lets the caller
+    keep ion images for only the peaks a candidate matched: the mask must still be
+    built from **every** extracted peak, matched or not, or the tissue outline it
+    traces changes and every masked correlation moves with it. Measured when this
+    was got wrong: dropping the 78% of kidney peaks that no candidate matches
+    shifted the whole protein_colocalization_* family on ~100% of rows, by a median
+    of 0.07% to 20% depending on the feature.  Pixels
     with TIC == 0 are unmeasured padding and are always excluded.  When
     ``tic_quantile > 0`` the threshold is raised to that quantile of the
     measured-pixel TIC, additionally trimming low-signal tissue edges.
@@ -278,8 +286,16 @@ def compute_tissue_mask(
     -------
     (H*W,) boolean mask over flattened pixels (True = on-tissue / keep).
     """
-    n_feat = ion_images.shape[0]
-    tic = ion_images.reshape(n_feat, -1).sum(axis=0)
+    if tic_image is not None:
+        tic = np.asarray(tic_image, dtype=np.float64).reshape(-1)
+        if ion_images is not None and tic.size != int(np.prod(ion_images.shape[1:])):
+            raise ValueError(
+                f"tic_image has {tic.size} pixels but ion images have "
+                f"{int(np.prod(ion_images.shape[1:]))}"
+            )
+    else:
+        n_feat = ion_images.shape[0]
+        tic = ion_images.reshape(n_feat, -1).sum(axis=0)
     measured = tic > 0
     if tic_quantile and tic_quantile > 0.0 and measured.any():
         thr = float(np.quantile(tic[measured], tic_quantile))
@@ -293,6 +309,8 @@ def _pearson_r_matrix(
     pixel_mask: np.ndarray | None = None,
     tic_normalize: bool = False,
     common_mode_removal: bool = False,
+    full_tic: np.ndarray | None = None,
+    full_n_features: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Compute the full (n_valid × n_valid) Pearson correlation matrix.
@@ -341,11 +359,36 @@ def _pearson_r_matrix(
         # ion_images; the in-place transforms below must not mutate the caller's
         # array).
         flat_all = flat_all.astype(np.float32, copy=True)
+        # Both transforms are per-pixel aggregates ACROSS features, so they read every
+        # image, not just the ones being correlated. When ``ion_images`` has been
+        # reduced to the peaks candidates matched (``keep_mask``), computing them here
+        # would silently use the reduced set and shift every r. ``full_tic`` carries
+        # the per-pixel sum over all extracted peaks so the result matches a full run.
+        # Same reasoning as compute_tissue_mask; PROGRESS.md F-048.
+        full_col_tic = None
+        if full_tic is not None:
+            full_col_tic = np.asarray(full_tic, dtype=np.float32).reshape(-1)
+            if pixel_mask is not None:
+                full_col_tic = full_col_tic[np.asarray(pixel_mask, dtype=bool)]
+            if full_col_tic.size != flat_all.shape[1]:
+                raise ValueError(
+                    f"full_tic has {full_col_tic.size} pixels but the correlation uses "
+                    f"{flat_all.shape[1]}"
+                )
+            full_col_tic = full_col_tic[None, :]
+        n_full = int(full_n_features) if full_n_features else flat_all.shape[0]
         if tic_normalize:
-            col_tic = flat_all.sum(axis=0, keepdims=True)
+            col_tic = full_col_tic if full_col_tic is not None else flat_all.sum(axis=0, keepdims=True)
             np.divide(flat_all, col_tic, out=flat_all, where=col_tic > 0)
         if common_mode_removal:
-            flat_all -= flat_all.mean(axis=0, keepdims=True)
+            if full_col_tic is None:
+                flat_all -= flat_all.mean(axis=0, keepdims=True)
+            elif tic_normalize:
+                # Post-normalisation each pixel sums to 1 over the full set, so the
+                # common mode is the constant 1/n and per-image centring removes it.
+                flat_all -= np.float32(1.0 / n_full)
+            else:
+                flat_all -= full_col_tic / np.float32(n_full)
 
     stds = flat_all.std(axis=1)
     valid_mask = stds > 1e-10

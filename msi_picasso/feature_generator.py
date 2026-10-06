@@ -105,6 +105,94 @@ MALDI_INTRINSIC_FEATURES = [
     "adduct_colocalization_chca_mob",
 ]
 
+# Protein-level features whose value is largely a readout of how many tryptic peptides
+# the protein has, rather than of whether the protein is present (PROGRESS.md F-045).
+# In feature-list mode a candidate is kept only if it matches a detected peak, but a
+# 10 ppm window against 35-54k peaks matches targets and decoys at the same rate
+# (67.7% against 67.9% on amyloidosis, 50.7% against 50.7% on kidney), so "peptides of
+# this protein that matched" is mostly "peptides this protein has". Measured Spearman
+# against protein_tryptic_count: log_protein_n_features and
+# protein_colocalization_n_partners +0.90 to +0.95, protein_coverage -0.46 to -0.51,
+# is_single_peptide_protein -0.63 to -0.66, protein_best_ratio +0.34 to +0.41.
+# The protein_colocalization_* family proper is deliberately NOT here: removing size
+# from those sharpens them, while removing it from these strips their ground-truth
+# signal on kidney and her2 (F-045).
+SIZE_DRIVEN_PROTEIN_FEATURES = [
+    "log_protein_n_features",
+    "protein_n_features",
+    "protein_colocalization_n_partners",
+    "protein_coverage",
+    "is_single_peptide_protein",
+    "protein_best_ratio",
+]
+
+PROTEIN_SIZE_COLUMN = "protein_tryptic_count"
+PROTEIN_SIZE_RESID_SUFFIX = "_sizeresid"
+
+
+def residualize_against_protein_size(
+    features_df,
+    columns=None,
+    size_column=PROTEIN_SIZE_COLUMN,
+    n_bins=12,
+    suffix=PROTEIN_SIZE_RESID_SUFFIX,
+):
+    """Add a size-free companion column for each size-driven protein feature.
+
+    Each value is replaced by its rank *within a bin of the protein's tryptic
+    count*, scaled to [0, 1]. That removes any monotone dependence on protein size
+    without assuming a functional form, and leaves whatever else the feature
+    carries.
+
+    Bins are built from targets and decoys pooled and the function never sees
+    ``is_decoy`` (invariant 1): the transform is identical for both classes and so
+    cannot itself separate them. Measured after the fact on E024, residualized
+    columns keep a target/decoy AUC within 0.02 of the raw ones.
+
+    New columns are ADDED rather than substituted, following F-039's precedent with
+    the averagine envelope, so both versions stay measurable side by side and
+    ``scripts/audit_protein_size.py`` can check each. Returns the list of names added.
+    """
+    from scipy.stats import rankdata
+
+    if size_column not in features_df.columns:
+        logger.warning(
+            "protein-size residualization skipped: no %s column", size_column
+        )
+        return []
+
+    size = features_df[size_column].to_numpy(dtype=float)
+    try:
+        bins = pd.qcut(pd.Series(size), n_bins, labels=False, duplicates="drop").to_numpy()
+    except ValueError:                      # too few distinct sizes to bin
+        bins = np.zeros(len(size), dtype=float)
+
+    added = []
+    for col in (columns if columns is not None else SIZE_DRIVEN_PROTEIN_FEATURES):
+        if col not in features_df.columns:
+            continue
+        values = features_df[col].to_numpy(dtype=float)
+        out = np.full(values.shape, np.nan)
+        for b in np.unique(bins[~pd.isna(bins)]):
+            m = (bins == b) & np.isfinite(values)
+            if m.sum() < 5:
+                continue
+            out[m] = (rankdata(values[m]) - 0.5) / m.sum()
+        # A bin too small to rank leaves NaN; fall back to the global rank there so
+        # the column is never mostly-NaN on a dataset with few distinct protein sizes.
+        gap = ~np.isfinite(out) & np.isfinite(values)
+        if gap.any():
+            out[gap] = (rankdata(values[gap]) - 0.5) / gap.sum()
+        features_df[col + suffix] = out
+        added.append(col + suffix)
+
+    logger.info(
+        "protein-size residualization: added %d column(s) (%s)",
+        len(added), ", ".join(added) if added else "none",
+    )
+    return added
+
+
 # Protein-level features: aggregate signal across all candidates sharing a protein,
 # including decoys. This breaks the TDC null model (decoys inherit inflated counts
 # from target co-occurring proteins), so these features are excluded from the ranker
@@ -453,6 +541,8 @@ def compute_all_features(
     im2deep_calibration: str = "linear",
     im2deep_kwargs: dict | None = None,
     coloc_tic_quantile: float = 0.0,
+    tic_image: np.ndarray | None = None,
+    tic_n_features: int | None = None,
     coloc_measured_pixel_mask: "np.ndarray | None" = None,
     coloc_tic_normalize: bool = False,
     coloc_common_mode: bool = False,
@@ -582,7 +672,9 @@ def compute_all_features(
         # outline. Restricting the correlation to on-tissue pixels removes it so
         # colocalization reflects co-distribution within the tissue (see
         # compute_tissue_mask). TIC == 0 padding is always dropped.
-        pixel_mask = compute_tissue_mask(ion_images, tic_quantile=coloc_tic_quantile)
+        pixel_mask = compute_tissue_mask(
+            ion_images, tic_quantile=coloc_tic_quantile, tic_image=tic_image
+        )
         if coloc_measured_pixel_mask is not None:
             pixel_mask = pixel_mask & coloc_measured_pixel_mask
         _mask_suffix = ", measured-coord mask applied" if coloc_measured_pixel_mask is not None else ""
@@ -604,6 +696,7 @@ def compute_all_features(
             protein_corr_cache = _pearson_r_matrix(
                 ion_images, ion_image_mzs, pixel_mask=pixel_mask,
                 tic_normalize=coloc_tic_normalize, common_mode_removal=coloc_common_mode,
+                full_tic=tic_image, full_n_features=tic_n_features,
             )
         else:
             protein_corr_cache = corr_cache

@@ -8,6 +8,7 @@ from msi_picasso.candidates import (
     _AA_RESIDUE_MASSES,
     _assign_mass_columns,
     generate_substitution_candidates,
+    target_rows,
 )
 from msi_picasso.utils import PROTON
 
@@ -590,3 +591,165 @@ class TestMassShiftMaxDa:
         b = generate_substitution_candidates(target_df, _empty_features(),
                                              mass_shift_max_da=None, **kw)
         pd.testing.assert_frame_equal(a, b)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Composition symmetry: H-decoy-15 / PROGRESS.md F-042
+# ---------------------------------------------------------------------------
+
+class TestCompositionSymmetry:
+    """`substitution` decoys carry about twice the sulfur of their targets, because
+    the replacement residue is drawn uniformly over 18 letters while Cys and Met are
+    only 1.4-1.8% of real residues. Features that read composition then partly read
+    the target/decoy label (F-036, F-042). These check the two options that fix it,
+    and that neither changes a run that does not ask for it."""
+
+    @staticmethod
+    def _sulfur_free_peptides(n=400):
+        """Targets with no Cys or Met at all, so any sulfur in a decoy was put
+        there by the generator and nothing else."""
+        rng = np.random.default_rng(3)
+        aa = list("ADEFGHILNPQSTVWY")  # 16 letters: no C/M, no K/R
+        peps, seen = [], set()
+        while len(peps) < n:
+            pep = "".join(rng.choice(aa, size=int(rng.integers(8, 16))).tolist()) + "K"
+            if pep not in seen:
+                seen.add(pep)
+                peps.append(pep)
+        return peps
+
+    @staticmethod
+    def _run_opts(peptides, **kw):
+        target_df = _make_target_df(peptides)
+        out = generate_substitution_candidates(
+            target_df, _empty_features(), matching_ppm=20.0, n_residues=2,
+            random_seed=42, collision_filter=True, snap_to_features=False, **kw,
+        )
+        # Targets do not match an empty feature list, so the frame holds decoys only.
+        return out[out["is_decoy"].astype(bool)].reset_index(drop=True)
+
+    @staticmethod
+    def _decoy_of(peptide, **kw):
+        """The one decoy built from a single target, so the pairing is unambiguous
+        and needs no reconstruction (the failure mode of the F-036 Correction)."""
+        dec = TestCompositionSymmetry._run_opts([peptide], **kw)
+        assert len(dec) == 1, f"expected one decoy for {peptide}, got {len(dec)}"
+        return dec.at[0, "peptide"]
+
+    def test_defaults_are_identical_to_the_unoptioned_call(self):
+        """Neither option may change a run that does not ask for it, or every
+        result predating them stops reproducing."""
+        peps = self._sulfur_free_peptides(120)
+        pd.testing.assert_frame_equal(
+            self._run_opts(peps),
+            self._run_opts(peps, residue_weighting="uniform", preserve_sulfur=False),
+        )
+
+    def test_uniform_draw_gives_decoys_sulfur_their_targets_never_had(self):
+        """The failure F-042 documents. If this stops holding, the two tests below
+        are testing nothing."""
+        mean_s = self._run_opts(self._sulfur_free_peptides())["n_S"].mean()
+        assert mean_s > 0.15, f"expected the uniform draw to add sulfur, got {mean_s:.3f}"
+
+    def test_target_frequency_weighting_removes_most_of_it(self):
+        """H-decoy-15. The targets here contain no C or M at all, so their measured
+        frequency is zero and the weighted draw should essentially never pick one."""
+        peps = self._sulfur_free_peptides()
+        uniform = self._run_opts(peps)["n_S"].mean()
+        weighted = self._run_opts(peps, residue_weighting="target_frequency")["n_S"].mean()
+        assert weighted < uniform / 2, f"weighting barely helped: {uniform:.3f} -> {weighted:.3f}"
+
+    def test_preserve_sulfur_never_substitutes_sulfur_in(self):
+        assert self._run_opts(self._sulfur_free_peptides(), preserve_sulfur=True)["n_S"].sum() == 0
+
+    @pytest.mark.parametrize("peptide", ["PEPTCIDEK", "PEPTMIDEK", "PECPTMIDEK", "ACMDEFGHIK"])
+    def test_preserve_sulfur_never_substitutes_sulfur_out(self, peptide):
+        """Exact per peptide, not merely equal on average: the sulfur residues must
+        still be in the same positions."""
+        decoy = self._decoy_of(peptide, preserve_sulfur=True)
+        assert len(decoy) == len(peptide)
+        for pos, (t_aa, d_aa) in enumerate(zip(peptide, decoy)):
+            if t_aa in "CM":
+                assert d_aa == t_aa, f"{peptide} -> {decoy}: position {pos} changed"
+        assert decoy != peptide, "no substitution was applied at all"
+
+    def test_uniform_draw_does_substitute_sulfur_out(self):
+        """The negative control for the test above: without the option, a sulfur
+        position is substitutable like any other. Four peptides are too few to see
+        it, since only 2 of ~10 positions are touched, so this uses a set."""
+        rng = np.random.default_rng(11)
+        aa = list("ACDEFGHILMNPQSTVWY")
+        peps = []
+        while len(peps) < 60:
+            pep = "".join(rng.choice(aa, size=10).tolist()) + "K"
+            if ("C" in pep or "M" in pep) and pep not in peps:
+                peps.append(pep)
+
+        def n_sulfur_lost(**kw):
+            return sum(
+                self._decoy_of(p, **kw).count("C") + self._decoy_of(p, **kw).count("M")
+                < p.count("C") + p.count("M")
+                for p in peps
+            )
+
+        assert n_sulfur_lost() > 0, "uniform draw never substituted a sulfur residue out"
+        assert n_sulfur_lost(preserve_sulfur=True) == 0
+
+    def test_both_options_compose(self):
+        dec = self._run_opts(self._sulfur_free_peptides(200),
+                             residue_weighting="target_frequency", preserve_sulfur=True)
+        assert dec["n_S"].sum() == 0
+
+    def test_decoy_yield_is_not_sacrificed(self):
+        """The falsifier registered with H-decoy-15: narrowing the pool must not
+        cost decoys, or the identification comparison is uninterpretable. Check
+        this before reading any count."""
+        peps = self._sulfur_free_peptides(300)
+        n_base = len(self._run_opts(peps))
+        for kw in ({"residue_weighting": "target_frequency"},
+                   {"preserve_sulfur": True},
+                   {"residue_weighting": "target_frequency", "preserve_sulfur": True}):
+            n = len(self._run_opts(peps, **kw))
+            assert n >= 0.95 * n_base, f"{kw} lost decoys: {n_base} -> {n}"
+
+    def test_preserve_sulfur_keeps_yield_on_sulfur_rich_peptides(self):
+        """The case where the option bites hardest: removing C/M positions from the
+        eligible set could leave too few to substitute."""
+        peps = ["MCMCMADEK", "CMPEPTIDEK", "MMMCCADEFGK", "ACDEFGHMK"]
+        assert len(self._run_opts(peps, preserve_sulfur=True)) == len(self._run_opts(peps))
+
+    def test_invalid_weighting_is_rejected(self):
+        with pytest.raises(ValueError, match="residue_weighting"):
+            self._run_opts(["PEPTIDEK"], residue_weighting="natural")
+
+
+class TestTargetRows:
+    """target_rows() is shared by the pipeline and scripts/prefilter_peaklist.py.
+
+    Any filtering added here shifts every decoy, because placement consumes one RNG
+    draw per row. A prefilter that de-duplicated and range-filtered produced a
+    different decoy set and a keep list missing 61 matched peaks (PROGRESS.md F-049).
+    """
+
+    @staticmethod
+    def _db():
+        return pd.DataFrame({
+            "peptide": ["PEPTIDEK", "PEPTIDEK", "AAAAAK", "DECOYPEP"],
+            "mh_mz": [900.0, 900.0, 100.0, 950.0],
+            "is_decoy": [False, False, False, True],
+        })
+
+    def test_drops_decoys_only(self):
+        out = target_rows(self._db())
+        assert list(out["peptide"]) == ["PEPTIDEK", "PEPTIDEK", "AAAAAK"]
+
+    def test_keeps_duplicate_peptides(self):
+        assert (target_rows(self._db())["peptide"] == "PEPTIDEK").sum() == 2
+
+    def test_does_not_filter_by_mz(self):
+        assert 100.0 in set(target_rows(self._db())["mh_mz"])
+
+    def test_index_is_reset(self):
+        assert list(target_rows(self._db()).index) == [0, 1, 2]

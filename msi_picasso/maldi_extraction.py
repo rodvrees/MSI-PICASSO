@@ -642,6 +642,8 @@ def compute_spatial_features(
     import os
     from concurrent.futures import ThreadPoolExecutor
 
+    from msi_picasso.maldi_features import _available_memory_bytes
+
     n_features = len(feature_mzs)
     if n_workers is None:
         n_workers = os.cpu_count() or 1
@@ -655,19 +657,44 @@ def compute_spatial_features(
         )
         return df
 
-    # Split feature axis into equal chunks — one per thread.
-    splits = np.array_split(np.arange(n_features), n_workers)
+    # Split the feature axis into chunks. Two constraints, both learned by being killed
+    # at this line (PROGRESS.md F-050):
+    #
+    # 1. Slice, do not index. The chunks are contiguous, so a slice is a view; fancy
+    #    indexing builds a second copy of the whole array before any work starts, which
+    #    is 71 GB on kidney at min_regions=1.
+    # 2. Bound the chunk SIZE, not just the worker count. `_compute_chunk` allocates two
+    #    full-size copies of its chunk (the `np.sort` for p90, and the Moran's I
+    #    deviation), so transient memory is about 3 x chunk x workers. With one chunk per
+    #    thread that is 3 x the whole array however many threads there are -- 370 GB on
+    #    her2 at min_regions=1 -- and capping workers cannot help, because shrinking the
+    #    chunk count grows the chunk. Bounding the chunk makes the product bounded.
+    #
+    # Every statistic in `_compute_chunk` is a per-feature reduction, so the chunk
+    # boundaries do not change a single value: finer chunks give bit-identical output,
+    # which `test_spatial_chunking.py` pins.
+    bytes_per_feature = 3 * int(np.prod(ion_images.shape[1:])) * ion_images.dtype.itemsize
+    budget = _available_memory_bytes()
+    max_chunk = n_features
+    if budget:
+        max_chunk = max(1, int(budget // 4 // max(n_workers * bytes_per_feature, 1)))
+    n_chunks = max(n_workers, -(-n_features // max(max_chunk, 1)))
+    bounds = np.linspace(0, n_features, n_chunks + 1).astype(int)
+    mzs = np.asarray(feature_mzs)
     chunks = [
-        (ion_images[idx], np.asarray(feature_mzs)[idx], n_pixels_total)
-        for idx in splits
-        if len(idx) > 0
+        (ion_images[a:b], mzs[a:b], n_pixels_total)
+        for a, b in zip(bounds[:-1], bounds[1:])
+        if b > a
     ]
+    assert chunks[0][0].base is not None, "chunking copied the ion images instead of viewing"
     logger.info(
         f"  Computing spatial features for {n_features} features "
-        f"across {len(chunks)} threads..."
+        f"in {len(chunks)} chunks across {min(n_workers, len(chunks))} threads..."
     )
 
-    with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+    # max_workers=n_workers, NOT len(chunks): there are now more chunks than threads by
+    # design, and one thread per chunk would put the 3 x chunk x workers product back.
+    with ThreadPoolExecutor(max_workers=min(n_workers, len(chunks))) as pool:
         futures = [
             pool.submit(_compute_chunk, imgs, mzs, n_pix)
             for imgs, mzs, n_pix in chunks
@@ -708,6 +735,7 @@ def extract_maldi_data(
     extraction_ppm: float = 25.0,
     matching_ppm: float = 20.0,
     feature_mzs: np.ndarray | None = None,
+    keep_mask: np.ndarray | None = None,
     drop_zero_signal: bool = True,
     images_path: str | None = None,
     image_batch_size: int = 100,
@@ -715,6 +743,7 @@ def extract_maldi_data(
     output_spatial_tsv: str | None = None,
     output_dir: str | None = None,
     verbose: bool = False,
+    save_ion_images: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """
     Extract MALDI features, ion images, and spatial statistics from a raw
@@ -828,7 +857,14 @@ def extract_maldi_data(
     if images_path is None:
         logger.debug("  No images_path given, extracting full ion image array in RAM.")
         # Attempt a single spectra_iter() pass for all 6 feature sets (profile mode).
-        _all_feat_mzs = [feature_mzs] + [feature_mzs + d for d in _extra_deltas]
+        # The main set covers EVERY peak, because the on-tissue mask is a per-pixel
+        # sum over all of them and changes if any are missing (PROGRESS.md, the
+        # colocalization family moved on ~100% of rows when 78% of peaks were
+        # dropped). The isotope and adduct sets are read per candidate, so they are
+        # extracted only where a candidate matched -- that is five of the six
+        # arrays, and the bulk of the memory.
+        _extra_src = feature_mzs if keep_mask is None else feature_mzs[keep_mask]
+        _all_feat_mzs = [feature_mzs] + [_extra_src + d for d in _extra_deltas]
         _multi = _extract_profile_fast_multi(reader, _all_feat_mzs, ppm=extraction_ppm)
         if _multi is not None:
             logger.debug(
@@ -841,7 +877,12 @@ def extract_maldi_data(
 
         if verbose:
             logger.info(f"  Ion images shape: {ion_images.shape}, dtype: {ion_images.dtype}")
-            if output_dir:
+            # Nothing in the pipeline reads 2_ion_images.npy back; it exists for the
+            # notebooks. It is also the largest thing a run writes -- 123 GB for her2 at
+            # min_regions=1, and 926 GB of a 942 GB results tree -- so it is opt-in
+            # rather than a side effect of `verbose`. It filled the disk and killed
+            # her2_E030 and all three E031 runs before this was changed.
+            if output_dir and save_ion_images:
                 images_npy = os.path.join(output_dir, "2_ion_images.npy")
                 np.save(images_npy, ion_images)
                 logger.info(f"  Saved ion images → {images_npy}")
@@ -921,10 +962,19 @@ def extract_maldi_data(
             f"  Dropping {n_removed} features with zero MALDI signal "
             f"({detected_mask.sum()} features retained)."
         )
+        # With keep_mask the extras were extracted only at the kept peaks, so their
+        # rows are indexed by flatnonzero(keep_mask), not by the full feature axis.
+        # Subsetting them with the full-length detected_mask would misalign every
+        # isotope and adduct image against its own peak.
+        if keep_mask is not None and _extra_raw is not None:
+            _kept_survives = np.asarray(detected_mask, bool)[np.flatnonzero(keep_mask)]
+            _extra_raw = {k: v[_kept_survives] for k, v in _extra_raw.items()}
+        elif _extra_raw is not None:
+            _extra_raw = {k: v[detected_mask] for k, v in _extra_raw.items()}
+        if keep_mask is not None:
+            keep_mask = np.asarray(keep_mask, bool)[detected_mask]
         feature_mzs = feature_mzs[detected_mask]
         ion_images = ion_images[detected_mask]
-        if _extra_raw is not None:
-            _extra_raw = {k: v[detected_mask] for k, v in _extra_raw.items()}
         spatial_df = spatial_df[detected_mask].reset_index(drop=True)
 
     # Extract M+1, M+2, and adduct ion images for spatial colocalization features (E1/E2).
@@ -975,6 +1025,33 @@ def extract_maldi_data(
         spatial_df.to_csv(tsv_path, sep="\t", index=False)
         logger.info(f"  Saved spatial features → {tsv_path}")
 
+    # Take the on-tissue TIC across EVERY peak before discarding the unmatched ones.
+    # A sum does not need its terms kept, so the mask stays exactly what a full run
+    # would compute while the images shrink to the peaks a candidate matched.
+    tic_image = None
+    tic_n_features = None
+    if keep_mask is not None:
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        if len(keep_mask) != len(feature_mzs):
+            raise ValueError(
+                f"keep_mask has {len(keep_mask)} entries for {len(feature_mzs)} features"
+            )
+        if ion_images is not None:
+            tic_image = ion_images.reshape(ion_images.shape[0], -1).sum(axis=0)
+            # How many images that sum covers. Cross-feature per-pixel transforms
+            # (_pearson_r_matrix's common-mode removal and TIC normalisation) need
+            # the count to turn the sum back into the whole-list mean.
+            tic_n_features = int(ion_images.shape[0])
+            ion_images = np.ascontiguousarray(ion_images[keep_mask])
+        feature_mzs = feature_mzs[keep_mask]
+        if spatial_df is not None and len(spatial_df) == len(keep_mask):
+            spatial_df = spatial_df[keep_mask].reset_index(drop=True)
+        logger.info(
+            "  Kept ion images for %d of %d peaks (%.1f%%); the on-tissue mask is "
+            "still computed over all of them.",
+            int(keep_mask.sum()), len(keep_mask), 100.0 * keep_mask.mean(),
+        )
+
     # --- Compute MALDI isotope envelopes (M0/M+1/M+2 mean spatial intensity) ---
     logger.info("Computing MALDI isotope envelopes...")
     if extra_ion_images is not None:
@@ -996,4 +1073,5 @@ def extract_maldi_data(
     }
     logger.info(f"  {len(maldi_envelopes)}/{len(feature_mzs)} features with M0 signal for envelope scoring")
 
-    return feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes, (x_coords, y_coords)
+    return (feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes,
+            (x_coords, y_coords), tic_image, tic_n_features)

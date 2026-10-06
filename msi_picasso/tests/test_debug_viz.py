@@ -1,8 +1,15 @@
 """Tests for debug_viz helpers (FDR-coloured ion-image frames)."""
 
 import numpy as np
+import pandas as pd
 
-from msi_picasso.debug_viz import _fdr_frame_color
+from msi_picasso.debug_viz import (
+    _FIGURES_WRITTEN,
+    _co_feature_panels,
+    _fdr_frame_color,
+    _one_row_per_peptide,
+    _reset_figure_dir,
+)
 
 
 class TestFdrFrameColor:
@@ -95,3 +102,134 @@ class TestPfmExplanations:
         summary = pd.read_csv(out / "summary.tsv", sep="\t")
         assert (~summary["is_decoy"]).sum() == 3
         assert (summary.loc[~summary["is_decoy"], "q_value"] < 0.01).all()
+
+
+class TestOneRowPerPeptide:
+    """One ion-image figure per peptide, not one per peptide-feature pair (F-029)."""
+
+    @staticmethod
+    def _rows():
+        return pd.DataFrame({
+            "peptide": ["PEPTIDEK", "PEPTIDEK", "PEPTIDEK", "OTHERR", "OTHERR"],
+            "is_decoy": [False, False, False, False, False],
+            "feature_mz": [1000.1, 1000.2, 1000.3, 1200.1, 1200.2],
+            "reweighted_q_value": [0.30, 0.01, 0.50, 0.40, 0.02],
+        })
+
+    def test_keeps_the_best_q_value_match(self):
+        out = _one_row_per_peptide(self._rows())
+        assert len(out) == 2
+        best = dict(zip(out["peptide"], out["feature_mz"]))
+        assert best["PEPTIDEK"] == 1000.2
+        assert best["OTHERR"] == 1200.2
+
+    def test_two_peptides_of_one_protein_give_one_row(self):
+        """Every figure shows the whole protein, so the protein is the unit."""
+        rows = self._rows()
+        rows["protein"] = ["P1", "P1", "P1", "P1", "P1"]
+        out = _one_row_per_peptide(rows)
+        assert len(out) == 1
+        assert out.loc[0, "feature_mz"] == 1000.2
+        rows["protein"] = ["P1", "P1", "P1", "P2", "P2"]
+        assert len(_one_row_per_peptide(rows)) == 2
+
+    def test_targets_and_decoys_stay_separate(self):
+        rows = self._rows()
+        rows.loc[2, "is_decoy"] = True
+        out = _one_row_per_peptide(rows)
+        assert len(out) == 3
+        assert out[out["is_decoy"]]["feature_mz"].tolist() == [1000.3]
+
+    def test_nan_q_values_lose_to_real_ones(self):
+        rows = self._rows()
+        rows.loc[1, "reweighted_q_value"] = np.nan
+        out = _one_row_per_peptide(rows)
+        assert out.set_index("peptide").loc["PEPTIDEK", "feature_mz"] == 1000.1
+
+    def test_falls_back_to_q_value_then_to_first_row(self):
+        rows = self._rows().drop(columns=["reweighted_q_value"])
+        rows["q_value"] = [0.3, 0.4, 0.05, 0.4, 0.02]
+        assert _one_row_per_peptide(rows).set_index("peptide").loc[
+            "PEPTIDEK", "feature_mz"] == 1000.3
+        bare = self._rows().drop(columns=["reweighted_q_value"])
+        out = _one_row_per_peptide(bare)
+        assert len(out) == 2
+        assert out.set_index("peptide").loc["PEPTIDEK", "feature_mz"] == 1000.1
+
+    def test_empty_and_peptideless_input_pass_through(self):
+        assert len(_one_row_per_peptide(pd.DataFrame())) == 0
+        no_pep = pd.DataFrame({"feature_mz": [1.0, 2.0]})
+        assert len(_one_row_per_peptide(no_pep)) == 2
+
+
+class TestResetFigureDir:
+    def test_removes_stale_pngs_and_keeps_other_files(self, tmp_path):
+        d = tmp_path / "ion_images"
+        d.mkdir()
+        (d / "T_001_P11087.png").write_bytes(b"old")
+        (d / "T_007_P11087.png").write_bytes(b"older, different rank")
+        (d / "notes.txt").write_text("keep me")
+        _reset_figure_dir(str(d))
+        assert sorted(p.name for p in d.iterdir()) == ["notes.txt"]
+
+    def test_creates_the_directory_when_absent(self, tmp_path):
+        d = tmp_path / "made"
+        _reset_figure_dir(str(d))
+        assert d.is_dir()
+
+    def test_clears_the_written_registry(self, tmp_path):
+        d = str(tmp_path / "ion_images")
+        _FIGURES_WRITTEN[d] = {("T", "P11087")}
+        _reset_figure_dir(d)
+        assert d not in _FIGURES_WRITTEN
+
+
+class TestCoFeaturePanels:
+    """One co-feature panel per peptide, represented by the best peak it wins."""
+
+    @staticmethod
+    def _prot():
+        # AAAK matches three near-duplicate peaks, BBBK two, CCCK one.
+        return pd.DataFrame({
+            "protein": ["P1"] * 6 + ["P2"],
+            "peptide": ["AAAK", "AAAK", "AAAK", "BBBK", "BBBK", "CCCK", "OTHER"],
+            "feature_mz": [957.53, 957.54, 957.55, 1232.61, 1232.62, 847.44, 500.0],
+        })
+
+    def test_one_panel_per_peptide(self):
+        """Six peaks, three peptides, precursor excluded -> two panels."""
+        out = _co_feature_panels(self._prot(), "P1", 957.53, "AAAK", None, None)
+        peps = [p for _, p in out]
+        assert sorted(peps) == ["BBBK", "CCCK"]
+        assert len(peps) == len(set(peps))
+
+    def test_orders_by_q_value_when_there_is_one(self):
+        qvals = {1232.61: 0.01, 847.44: 0.50}
+        out = _co_feature_panels(self._prot(), "P1", 957.53, "AAAK", qvals, None)
+        assert [p for _, p in out] == ["BBBK", "CCCK"]
+
+    def test_precursor_peptide_is_excluded(self):
+        """AAAK's other two peaks must not reappear as co-features."""
+        out = _co_feature_panels(self._prot(), "P1", 957.53, "AAAK", None, None)
+        assert all(p != "AAAK" for _, p in out)
+
+    def test_prefers_a_peak_the_peptide_wins_over_a_better_q_it_loses(self):
+        qvals = {1232.61: 0.01, 1232.62: 0.90}      # the 0.01 peak is better...
+        winners = {1232.61: "SOMEONE_ELSE", 1232.62: "BBBK"}  # ...but BBBK loses it
+        out = dict((p, m) for m, p in _co_feature_panels(
+            self._prot(), "P1", 957.53, "AAAK", qvals, winners))
+        assert out["BBBK"] == 1232.62
+
+    def test_falls_back_to_best_q_when_the_peptide_wins_nothing(self):
+        qvals = {1232.61: 0.90, 1232.62: 0.01}
+        winners = {1232.61: "X", 1232.62: "Y"}
+        out = dict((p, m) for m, p in _co_feature_panels(
+            self._prot(), "P1", 957.53, "AAAK", qvals, winners))
+        assert out["BBBK"] == 1232.62
+
+    def test_other_proteins_are_not_included(self):
+        out = _co_feature_panels(self._prot(), "P1", 957.53, "AAAK", None, None)
+        assert all(p != "OTHER" for _, p in out)
+
+    def test_unknown_protein_gives_nothing(self):
+        assert _co_feature_panels(self._prot(), "NOPE", 1.0, "AAAK", None, None) == []

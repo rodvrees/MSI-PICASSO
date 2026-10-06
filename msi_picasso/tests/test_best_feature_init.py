@@ -230,6 +230,110 @@ class TestFindBestFeatureLabels:
 
 
 # ---------------------------------------------------------------------------
+# H-fdr-11 / F-051: protein-level rollup before TDC counting
+# ---------------------------------------------------------------------------
+
+
+def _make_protein_block_df(n_proteins: int = 5, rows_per_protein: int = 8, n_decoys: int = 20):
+    """F-051's mechanism in miniature: ``n_proteins`` proteins each carry
+    ``rows_per_protein`` rows of one cleanly-separating feature (values spaced
+    far apart, so ranking by it never interleaves two proteins' rows), ranked
+    above ``n_decoys`` singleton (one-row-per-protein) decoys with distinctly
+    lower values.
+
+    Deterministic (no RNG). With every block row outranking every decoy, the
+    block reaches its best possible q at its very last (lowest-ranked) row --
+    q = (1 + 0 decoys) / (n_proteins * rows_per_protein) -- so row-level TDC
+    counts every block row as passing. Rolled up to one row per protein, the
+    best q a block can reach is (1 + 0) / n_proteins -- worse by exactly
+    ``rows_per_protein``, because that is the whole confound: a protein's row
+    count is buying q-value the same way real independent targets would.
+
+    Row-level TDC sees ``n_proteins * rows_per_protein`` passing targets.
+    Protein-level TDC sees ``n_proteins``: each protein is one vote.
+    """
+    block_protein, block_values = [], []
+    for k in range(n_proteins):
+        top = 1000.0 - 10.0 * k
+        block_protein.extend([f"BIG{k}"] * rows_per_protein)
+        block_values.extend([top - r for r in range(rows_per_protein)])
+    block_protein = np.array(block_protein)
+    block_values = np.array(block_values)
+    block_is_decoy = np.zeros(len(block_values), dtype=bool)
+
+    # Distinctly below every block value, and each its own protein, so the
+    # rollup leaves this side of the population untouched.
+    decoy_protein = np.array([f"DECOY_D{i}" for i in range(n_decoys)])
+    decoy_values = np.arange(n_decoys, dtype=float)
+
+    protein = np.concatenate([block_protein, decoy_protein])
+    feature = np.concatenate([block_values, decoy_values])
+    is_decoy = np.concatenate([block_is_decoy, np.ones(n_decoys, dtype=bool)])
+    X = feature.reshape(-1, 1)
+    return X, is_decoy, protein, n_proteins, n_proteins * rows_per_protein
+
+
+class TestProteinRollup:
+    def test_row_level_counts_every_row_in_the_block(self):
+        """Baseline (no protein arg): unchanged row-level behaviour.
+
+        All ``n_proteins * rows_per_protein`` block rows outrank every decoy
+        (the singleton region is designed to never pass on its own), so TDC
+        over rows counts all 40 of them, exactly as F-051 measured happening
+        for real on kidney E031 (a 255-target seed traced back to 4 proteins).
+        """
+        X, is_decoy, _protein, _n_proteins, n_block_rows = _make_protein_block_df()
+        result = _find_best_feature_labels(
+            X, is_decoy, ["block_feature"], init_fdr=0.2, min_seed_positives=1,
+        )
+        assert result is not None
+        _, _, n_passing = result
+        assert n_passing == n_block_rows == 40
+
+    def test_protein_rollup_counts_one_vote_per_protein(self):
+        """With protein given, each of the 5 proteins is one unit of evidence.
+
+        Rolled up to one (best-scoring) row per protein, the 5 block proteins
+        rank 1st-5th with no decoy ahead of the 5th (q = (1+0)/5 = 0.2, exactly
+        at ``init_fdr``), so all 5 pass and none of the 35 redundant rows do.
+        """
+        X, is_decoy, protein, n_proteins, _n_block_rows = _make_protein_block_df()
+        result = _find_best_feature_labels(
+            X, is_decoy, ["block_feature"], init_fdr=0.2, min_seed_positives=1,
+            protein=protein,
+        )
+        assert result is not None
+        labels, _, n_passing = result
+        assert n_passing == n_proteins == 5
+        assert int((labels == 1).sum()) == n_proteins
+
+        # Exactly one representative row per passing protein is positive; its
+        # other rows are unlabeled (0), not silently dropped or all positive --
+        # broadcasting to the whole block would hand the classifier back the
+        # exact multiplicity this rollup exists to remove.
+        for k in range(n_proteins):
+            block_labels = labels[protein == f"BIG{k}"]
+            assert (block_labels == 1).sum() == 1
+            assert (block_labels == 0).sum() == len(block_labels) - 1
+
+    def test_protein_rollup_threads_through_include_mask(self):
+        """protein must be sliced/expanded consistently with include_mask (H-fdr-2)."""
+        X, is_decoy, protein, n_proteins, _n_block_rows = _make_protein_block_df()
+        include_mask = np.ones(len(is_decoy), dtype=bool)
+        include_mask[-1] = False  # drop one decoy row
+
+        result = _find_best_feature_labels(
+            X, is_decoy, ["block_feature"], init_fdr=0.2, min_seed_positives=1,
+            protein=protein, include_mask=include_mask,
+        )
+        assert result is not None
+        labels, _, n_passing = result
+        assert n_passing == n_proteins
+        assert len(labels) == len(is_decoy)
+        assert labels[-1] == 0  # excluded row always label 0
+
+
+# ---------------------------------------------------------------------------
 # Fallback to ppm-based seeding when best-feature init returns None
 # ---------------------------------------------------------------------------
 

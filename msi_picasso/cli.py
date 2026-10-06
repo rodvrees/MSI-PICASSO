@@ -671,6 +671,62 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     cand.add_argument(
+        "--substitution-residue-weighting",
+        choices=("uniform", "target_frequency"),
+        default=None,
+        help=(
+            "substitution only: how the replacement residue is drawn. 'uniform' "
+            "(default) draws evenly over the 18-letter alphabet, so every residue "
+            "appears 5.6%% of the time whatever its real abundance. "
+            "'target_frequency' draws from the empirical residue frequency of the "
+            "target peptides instead (H-decoy-15). Cys and Met are 2 of 18 letters "
+            "but only 1.4-1.8%% of real residues, so the uniform draw over-produces "
+            "sulfur by 6-8x and leaves decoys with twice the sulfur of targets; "
+            "features that read composition then partially read the target/decoy "
+            "label (PROGRESS.md F-036, F-042). Acts on every composition axis."
+        ),
+    )
+    cand.add_argument(
+        "--substitution-preserve-sulfur",
+        action="store_true",
+        default=None,
+        help=(
+            "substitution only: never substitute Cys or Met in or out, so every "
+            "decoy carries exactly its source target's sulfur count. Narrower than "
+            "--substitution-residue-weighting but exact on the axis that dominates "
+            "isotope-envelope shape. The two compose."
+        ),
+    )
+    cand.add_argument(
+        "--feature-mzs-keep",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Peak list naming the peaks to KEEP ion images for, produced by "
+            "scripts/prefilter_peaklist.py. Ion images are extracted at every m/z in "
+            "--feature-mzs, the on-tissue TIC mask is computed over all of them, and "
+            "only the peaks listed here are retained. Only 18-34%% of peaks are ever "
+            "matched by a candidate, so this cuts ion-image memory 3-5x with no change "
+            "to any feature. Do NOT pass the reduced list as --feature-mzs instead: the "
+            "mask is a sum over every peak and drops with them (PROGRESS.md F-048)."
+        ),
+    )
+    cand.add_argument(
+        "--protein-size-residualize",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Replace the size-driven protein-level features with size-free companions "
+            "(log_protein_n_features, protein_colocalization_n_partners, protein_coverage, "
+            "is_single_peptide_protein, protein_best_ratio -> *_sizeresid), ranking each "
+            "within bins of the protein's tryptic count. Default ON. In feature-list mode "
+            "targets and decoys match detected peaks at the same rate, so these features "
+            "mostly read how many peptides a protein HAS rather than whether it is present "
+            "(PROGRESS.md F-045). Use --no-protein-size-residualize to reproduce a run "
+            "from before E025."
+        ),
+    )
+    cand.add_argument(
         "--decoy-target-ratio",
         type=float,
         default=None,
@@ -1105,7 +1161,34 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FLOAT",
         help=(
             "CCS filter threshold = multiplier × p95 |delta_CCS%%| on single-candidate "
-            "calibration matches. Analogous to --rt-window-multiplier. Default 2.0."
+            "calibration matches. Analogous to --rt-window-multiplier. Default 2.0. "
+            "Ignored when --ccs-window-pct is set."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--save-ion-images",
+        action="store_true",
+        default=None,
+        help=(
+            "Write the full ion-image array to 2_ion_images.npy. Off by default: nothing "
+            "in the pipeline reads it back, it is there for the notebooks, and it is the "
+            "largest thing a run writes (123 GB for her2 at min_regions=1). Leaving it on "
+            "filled the disk and killed four runs."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--ccs-window-pct",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Fixed CCS filter threshold in percent, overriding --ccs-window-multiplier. "
+            "The multiplier scales a p95 measured on whichever calibration peptides the "
+            "run has, and a denser peak list raises it (amyloidosis 3.18%% at "
+            "min_regions=2, 4.06%% at 1), so two runs cannot share a threshold unless it "
+            "is fixed. Keep it above the ground truth's own CCS error: the reachable "
+            "confirmed peptides need 1.84%% on amyloidosis, 1.45%% on her2, 0.90%% on "
+            "kidney (PROGRESS.md F-050)."
         ),
     )
     rescore_grp.add_argument(
@@ -1429,10 +1512,10 @@ def main() -> None:
         "verbose", "storey_pi0", "lda_r2_median_filter",
         "only_main_features", "use_protein_level_feats", "match_ccs",
         "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc", "mob_protein_coloc",
-        "drop_zero_signal", "entrapment", "coloc_measured_mask",
+        "drop_zero_signal", "entrapment", "coloc_measured_mask", "save_ion_images",
         "region_coloc", "within_region_coloc", "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
         "substitution_no_collision_filter", "decoy_split", "decoy_split_final_only",
-        "train_fdr_escalate",
+        "train_fdr_escalate", "substitution_preserve_sulfur",
     })
 
     # Only pass top-level configurable params (not file paths or extraction params)
@@ -1450,6 +1533,8 @@ def main() -> None:
         "substitution_n_residues", "substitution_seed", "substitution_no_collision_filter",
         "substitution_mass_shift_min_da", "substitution_mass_shift_max_da",
         "substitution_collision_ppm",
+        "substitution_residue_weighting", "substitution_preserve_sulfur",
+        "protein_size_residualize", "feature_mzs_keep",
         "protein_fdr", "peptide_fdr", "lcms_id_format",
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
         "features_preset", "features_exclude", "seed_features",
@@ -1457,7 +1542,7 @@ def main() -> None:
         "max_iter", "init_fdr", "min_seed_positives",
         "matching_ppm", "fragment_tol_da", "winner_percentile",
         "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
-        "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_protein_coloc", "mob_window_multiplier",
+        "match_ccs", "ccs_window_multiplier", "ccs_window_pct", "mob_coloc", "mob_protein_coloc", "mob_window_multiplier",
         "mob_quality_mz_window_ppm", "mob_quality_k0_tol",
         "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
         "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
@@ -1515,7 +1600,10 @@ def main() -> None:
         stream=sys.stderr,
     )
     # Third-party loggers that emit excessive DEBUG noise regardless of user intent.
-    for _noisy in ("numba", "numba.core", "imzy", "koyo",
+    # `shap` is the worst of them: KernelExplainer logs its sampling weights per
+    # explained candidate, which was 2394 lines — 45% of a kidney run's log — all of it
+    # `subset_size = 1` and `weight_vector = array([...])` with nothing run-specific in it.
+    for _noisy in ("numba", "numba.core", "imzy", "koyo", "shap",
                    "matplotlib", "matplotlib.font_manager", "matplotlib.pyplot",
                    "matplotlib.backends", "PIL"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
@@ -1575,6 +1663,8 @@ def main() -> None:
             "peptide-level FDR is a no-op. Use --feature-mzs with a peak list from "
             "the TIMSImaging fork for new work."
         )
+        _tic_image = None
+        _tic_n_features = None
         maldi_mzs = np.array([], dtype=np.float64)
         ion_images = None
         ion_image_mzs = None
@@ -1599,10 +1689,50 @@ def main() -> None:
                 sys.exit(1)
             logger.info(f"  {len(precomputed_mzs)} features loaded (skipping detection)")
 
+        _keep_mask = None
+        _keep_path = _ms1cfg.get("feature_mzs_keep")
+        if _keep_path and precomputed_mzs is not None:
+            try:
+                _keep_mzs, _, _ = _read_feature_mzs(_keep_path)
+            except Exception as exc:
+                logger.error(f"Could not read --feature-mzs-keep {_keep_path!r}: {exc}")
+                sys.exit(1)
+            # Match by nearest within a hair's breadth rather than by equality: a
+            # keep list written through a CSV can lose the last bit of a float
+            # (measured: 17 of 7842 kidney m/z off by ~5e-13). The tolerance is
+            # 1e-9 relative, about a thousandth of a ppm, far below any real peak
+            # spacing, so it identifies the same peak and nothing else.
+            _order = np.argsort(precomputed_mzs)
+            _srt = precomputed_mzs[_order]
+            _pos = np.clip(np.searchsorted(_srt, _keep_mzs), 1, len(_srt) - 1)
+            _left = np.abs(_keep_mzs - _srt[_pos - 1])
+            _right = np.abs(_keep_mzs - _srt[np.minimum(_pos, len(_srt) - 1)])
+            _near = np.where(_left <= _right, _pos - 1, np.minimum(_pos, len(_srt) - 1))
+            _dist = np.minimum(_left, _right)
+            _hit = _dist <= 1e-9 * np.abs(_keep_mzs)
+            _keep_mask = np.zeros(len(precomputed_mzs), dtype=bool)
+            _keep_mask[_order[_near[_hit]]] = True
+            _missing = int((~_hit).sum())
+            if _missing:
+                logger.error(
+                    "  %d of %d m/z in --feature-mzs-keep are absent from --feature-mzs. "
+                    "The two lists must come from the same peak-finding run.",
+                    _missing, len(_keep_mzs),
+                )
+                sys.exit(1)
+            logger.info(
+                "  Keeping ion images for %d of %d peaks (%.1f%%) from %s; the "
+                "on-tissue mask is still computed over all of them.",
+                int(_keep_mask.sum()), len(precomputed_mzs),
+                100.0 * _keep_mask.mean(), _keep_path,
+            )
+
         logger.info(f"Extracting MALDI features from raw data: {_maldi_raw_path}")
-        maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes, _raw_pixel_coords = extract_maldi_data(
+        (maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes,
+         _raw_pixel_coords, _tic_image, _tic_n_features) = extract_maldi_data(
             _maldi_raw_path,
             feature_mzs=precomputed_mzs,
+            keep_mask=_keep_mask,
             extraction_ppm=_extraction["extraction_ppm"],
             matching_ppm=_extraction["matching_ppm"],
             images_path=_ms1cfg.get("images_path"),
@@ -1611,6 +1741,7 @@ def main() -> None:
             output_spatial_tsv=_ms1cfg.get("save_spatial"),
             output_dir=output_dir,
             verbose=verbose,
+            save_ion_images=bool(_ms1cfg.get("save_ion_images", False)),
         )
         ion_image_mzs = maldi_mzs if ion_images is not None else None
         logger.info(
@@ -1785,6 +1916,8 @@ def main() -> None:
         storey_pi0=_ms1cfg["storey_pi0"],
         only_main_features=_ms1cfg["only_main_features"],
         lcms_proteins_path=_ms1cfg.get("lcms_proteins"),
+        tic_image=_tic_image,
+        tic_n_features=_tic_n_features,
         lcms_peptides_path=lcms_peptides_path,
         lcms_psms_path=_ms1cfg.get("lcms_psms"),
         lcms_id_format=lcms_id_format,
@@ -1833,6 +1966,7 @@ def main() -> None:
         spatial_prior_weight=_ms1cfg["spatial_prior_weight"],
         match_ccs=bool(_ms1cfg.get("match_ccs", False)),
         ccs_window_multiplier=_ms1cfg["ccs_window_multiplier"],
+        ccs_window_pct=_ms1cfg.get("ccs_window_pct"),
         tdf_path=_maldi_raw_path,
         mob_coloc=bool(_ms1cfg.get("mob_coloc", False)),
         mob_protein_coloc=bool(_ms1cfg.get("mob_protein_coloc", False)),
@@ -1859,6 +1993,9 @@ def main() -> None:
         substitution_collision_filter=not bool(_ms1cfg.get("substitution_no_collision_filter", False)),
         substitution_mass_shift_min_da=_ms1cfg.get("substitution_mass_shift_min_da"),
         substitution_mass_shift_max_da=_ms1cfg.get("substitution_mass_shift_max_da"),
+        substitution_residue_weighting=_ms1cfg.get("substitution_residue_weighting"),
+        substitution_preserve_sulfur=_ms1cfg.get("substitution_preserve_sulfur"),
+        protein_size_residualize=_ms1cfg.get("protein_size_residualize", True),
         substitution_collision_ppm=_ms1cfg.get("substitution_collision_ppm"),
     )
 

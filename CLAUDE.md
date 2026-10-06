@@ -104,9 +104,26 @@ the only part of this file that is genuinely load-bearing.
    **Anything derived from composition counts as a composition feature**, and the
    isotope-envelope family is derived from composition. F-036 measured `theo_isotope_kl`
    reading sulfur content at AUC 0.61-0.70 among targets alone, while `substitution` decoys
-   carry twice the sulfur of targets — so it partially reads the label. Those features are
-   currently in the ranker; see PROGRESS.md F-036 and H-decoy-13 before adding more of the
-   same shape.
+   carry twice the sulfur of targets — so it partially reads the label. F-039 replaced that
+   family with averagine-referenced versions that do not.
+
+   **This is not a property of the isotope family, and there is a check for it.** F-042 found
+   four more ranker features doing the same thing at about a tenth of the size
+   (`log_maldi_intensity_p90`, `protein_colocalization_weighted_max`, `spatial_gearys_c`,
+   `adduct_colocalization_chca_mob`), and traced the cause to the decoy generator rather than
+   to the features: `generate_substitution_candidates` draws the replacement residue uniformly
+   over 18 amino acids, so 11.1% of substitutions add a sulfur residue against a natural
+   frequency of 1.4-1.8%. **Fixed at the generator as of E024** by
+   `substitution_residue_weighting = "target_frequency"` plus
+   `substitution_preserve_sulfur = true`, which the checked-in configs set; both default off so
+   earlier results reproduce. Removing the asymmetry gains identifications on kidney and her2
+   but costs her2 both of its reachable confirmed ground-truth peptides, which are sulfur-free
+   and were being flattered by the old ranking — read PROGRESS.md F-043 before changing either
+   option. **Run `scripts/audit_composition_leak.py` when adding a feature to
+   the ranker or changing the decoy generator.** It tests the whole chain — does the feature
+   read composition, and does that come out as target/decoy separation — because reading
+   composition alone is not enough to leak: the protein-level features read sulfur strongly
+   and stay symmetric, since a decoy protein is the same size as its target protein.
 4. **`is_decoy` must be cast to `bool` dtype** before returning a candidates frame.
    `pd.concat` with an empty frame yields `object`-dtype booleans, which break
    `~df["is_decoy"]` indexing downstream.
@@ -201,6 +218,15 @@ unmatched candidates are dropped. Measured consequences:
 - the ~40 minute per-candidate alphatims pass disappears (observed CCS comes from the peak
   list), replaced by a ~2 minute peak-finding pass.
 
+**Matching is not evidence, and must not be treated as such.** Targets and decoys survive
+feature matching at the same rate (67.7% against 67.9% on amyloidosis, 50.7% against 50.7% on
+kidney) and their mass errors are indistinguishable at every tolerance from 1 to 10 ppm. That is
+the decoys working correctly: a false identification is a wrong peptide whose mass matches a real
+peak, which is what `substitution` models. **No tolerance change repairs it and none should be
+attempted** — the ground truth needs up to 8.86 ppm on amyloidosis, so tightening loses real IDs.
+All discrimination comes from the ion images. Expect any feature built on mass agreement or on
+match counts to be symmetric, and measure it before building on it. See PROGRESS.md F-047.
+
 **Two things change meaning and must not be forgotten:**
 
 1. **A peptide matches several features** (2.1–4.8 on the three datasets, max 15), so a
@@ -230,6 +256,24 @@ q-values over winners.
 `--single-round` skips Round 2 only. **Winner selection still runs**, so the
 target-vs-decoy competition that defines the TDC population is unchanged and the FDR
 semantics are identical; only the final discriminant refit is dropped.
+
+**Protein-level features are size-residualized by default** (`protein_size_residualize`, on
+since E025). Each size-driven one gains a `*_sizeresid` companion — its rank within a bin of the
+protein's tryptic count — and the raw column is excluded. The seed allowlist is remapped to the
+companion names, because every config seeds mostly on these features and a seed that hunts for a
+missing column fails silently (F-044). A companion is **not** added when the config excludes its
+raw form, or config exclusions would be bypassed. Turn it off with `--no-protein-size-residualize`;
+every pre-E025 config pins it false so it reproduces. See PROGRESS.md F-045 and E025 — this buys
+the 5% and 10% columns and costs the 1% column and confirmed recovery on two datasets.
+
+**Ties in `_tdc_qvalues` go to the decoys, and must keep doing so.** The candidates frame is
+every target followed by every decoy, so sorting on score alone inherits that order. When
+scoring degenerates — a failed seed makes `_rescore_linear_once` return all zeros — a
+row-order tiebreak puts every target above every decoy and the run reports nearly all of them
+at q = 1/n_targets instead of failing. `np.lexsort((~is_decoy, -scores))` makes that case
+conservative, and a warning fires when every score is identical. Real fitted scores have no
+ties (zero on all three E024 datasets), so this changes no result that was not already
+meaningless. See PROGRESS.md F-044.
 
 ---
 
@@ -320,7 +364,7 @@ configuration it was established under.
 
 | method | what it does | preserves | notes |
 |---|---|---|---|
-| `substitution` | substitutes `substitution_n_residues` interior non-K/R residues, one decoy per unique target | length, cleavage sites | **changes elemental composition** — see invariant 3, and F-036 for a measured consequence. Mass shift measured p10 24 Da, median 55 Da, p90 107 Da, max ~244 Da (F-036 as corrected) — the "~1–50 Da" this table used to claim understated it. CCS features stay usable and it is compatible with `--match-ccs`. |
+| `substitution` | substitutes `substitution_n_residues` interior non-K/R residues, one decoy per unique target | length, cleavage sites | **changes elemental composition unless told not to** — see invariant 3. `--substitution-residue-weighting target_frequency` draws the replacement from the target residue frequency instead of uniformly, and `--substitution-preserve-sulfur` never substitutes Cys or Met in or out; together they take the decoy/target sulfur ratio from ~2x to ~1x at no cost in decoys (F-042, F-043). **Both default off so pre-E024 results reproduce; the checked-in configs set both.** Mass shift measured p10 24 Da, median 55 Da, p90 107 Da, max ~244 Da (F-036 as corrected) — the "~1–50 Da" this table used to claim understated it. CCS features stay usable and it is compatible with `--match-ccs`. |
 | `mz_shift` | shifts the query m/z by a random delta in `[delta_min, delta_max]` Da | sequence exactly | in raw-query, snapping is disabled so each decoy sits at its exact shifted m/z on a distinct feature |
 | `mz_shuffle` | derangement of the peptide→feature assignment (mass-sorted rotation) | sequence exactly | decoys are **co-located** with targets on identical ion images, so feature-quality features are exactly symmetric. **Do not combine with `--match-ccs`** — it would remove ~all decoys by design. Raw CCS scalars and mobility-gated colocalizations are auto-excluded (`_MZ_SHUFFLE_CCS_LEAK_FEATURES`); only `*_resid` variants are kept. |
 | `entrapment` | tryptic peptides from a foreign-organism FASTA (`entrapment_fasta`), isobaric-with-target ones filtered out | — | `protein="ENTRAPMENT_{acc}"` |
@@ -381,6 +425,14 @@ disagree in practice (PROGRESS.md F-041), so read both: `importance` says how mu
 model uses a feature, `structure_coef` says in which direction. Permutation importance has
 no sign — kidney's top feature carries three quarters of the ranking with a structure
 coefficient of −0.53, meaning a high value pushes a candidate *down*.
+
+**Neither number says a feature separates targets from decoys, and on current runs the top ones
+do not.** E025's highest-importance feature has a target/decoy AUC of 0.476 while the best
+separators carry importance 0.012 (PROGRESS.md F-046). Permutation importance is also sensitive
+to a feature's entropy: any transform that spreads a coarse feature — ranking, binning, quantile
+mapping — raises its reported importance without adding information, which is how
+`protein_coverage_sizeresid` reached 0.292 from a variable with a 30% point mass at 1.0. **Read
+the importance table next to the target/decoy AUC, never on its own.**
 
 Permutation importance is averaged over the first `_PERM_IMPORTANCE_REPLICATES` (5)
 replicate fits rather than all `model_repeats`, because one replicate's ranking is not
@@ -558,11 +610,19 @@ In `/home/robbe/MALDI_MSI_score/scripts/`:
 | `grid_search.py` / `analyze_grid_search.py` | parameter sweep (reuses `raw_query_cache`) and its sensitivity analysis. Its objective counts on the reported population — keep it that way or the sweep optimises something the scoreboard does not show |
 | `ablation_svm.py` / `ablation_lda.py` | feature ablation. `ablation_lda.py` still counts at feature level (H-code-1, not fixed — it is LDA-era and unused) |
 | `audit_coloc_leak.py` | per-colocalization-column target/decoy AUC and abundance-leak check — run before promoting a coloc feature into the ranker |
-| `seed_permutation_test.py` | the F-020 label-permutation test on the seed search, over several independent permutation sets — reads the run's own ranker feature list and reproduces its reported seed |
+| `audit_match_information.py` | per-peptide best `|ppm|` against the matched peaks, targets vs decoys vs ground truth, by tolerance. Answers whether mass agreement can discriminate (it cannot, PROGRESS.md F-047) and what tolerance the ground truth needs. `RUN=E025 python scripts/audit_match_information.py` |
+| `audit_ccs_matching.py` | sizes what a CCS window would do to candidate multiplicity and to the target peptides, at any peak list. Reads the run's own predicted CCS and asserts the run's `im2deep_abs_delta_ccs_pct` comes back out of the join before reasoning from it. `--peaklist` sizes a list that has no run yet, rebuilding candidates through `target_rows` (F-049); decoy sequences depend on the peak list, so that mode is targets only. `python scripts/audit_ccs_matching.py kidney results/kidney/E025 [--peaklist peaklists/kidney_region4_minreg1.csv]` (PROGRESS.md F-050) |
+| `make_peaklist.py` / `prefilter_peaklist.py` | regenerate a TIMSImaging-fork peak list at a chosen `min_regions`, and derive the keep list of peaks a candidate can match. **Validate a new list by filtering it to `n_regions >= 2` and diffing against the checked-in one**, and a new keep list with `--against-run` once a run exists — the older `--verify` passed while a list was missing 61 of a run's peaks (F-049, F-050) |
+| `audit_protein_size.py` | asks whether the protein-level features measure protein presence or protein size, by re-ranking each within bins of the protein's tryptic count and re-reading its target/decoy and ground-truth AUCs (PROGRESS.md, RD's objection of 2026-09-11). `RUN=E024 python scripts/audit_protein_size.py` |
+| `audit_composition_leak.py` | screens every ranker feature for composition dependence and reports how much of each one's target/decoy separation the composition asymmetry accounts for (PROGRESS.md F-042). **Run it whenever a feature is added to the ranker or the decoy generator changes.** `RUN=E021 python scripts/audit_composition_leak.py`; `--self-check` exercises the decoy pairing |
+| `seed_permutation_test.py` | the F-020 label-permutation test on the seed search, over several independent permutation sets — reads the run's own ranker feature list and reproduces its reported seed. `--protein-block` (F-051) permutes at the real/decoy protein-pair level instead of per row. `--rollup {none,protein,feature_mz}` (F-052/F-053) chooses the unit `_find_best_feature_labels` counts passes at before comparing to that null. `--features <list>` overrides the run's own `seed_features` allowlist, to test a candidate pool that has no run yet |
+| `screen_seed_features.py` | per-feature triage for seed-allowlist candidates (H-fdr-11 option 3, F-054): target/decoy AUC and composition-leak share (both reused from `audit_composition_leak.py`) plus a block ratio (F-051's per-protein diagnostic, generalized to every feature) for every ranker feature a run used. Reads a candidate pool for `seed_permutation_test.py --features`, it does not itself decide whether that pool clears the noise band. `python scripts/screen_seed_features.py amyloidosis kidney her2 --run E025` |
 | `replicate_spread.py` | refits a past run's round 1 under N CV partitions and reports the spread of its ID counts — reads the run's own `.full_config.json`; run this before quoting or comparing any single-fit count |
 | `refit_harness.py` | shared helpers for refitting a finished run's scoring step offline with one thing changed: `load`, `fit`, `rollup`, `stats`, `final_report_permutation`. Reproduces a run's reported counts exactly when nothing is varied — if it does not, stop and find out why. Always pass `model_repeats` |
 | `compare_backends.py` | which scoring backend, at what cost in IDs (PROGRESS.md F-040). `RUN=E021 python scripts/compare_backends.py` |
 | `importance_attribution.py` | permutation importance against the structure coefficients, and whether either is stable across replicate fits (PROGRESS.md F-041). `RUN=E021 REPS=6 python scripts/importance_attribution.py` |
+| `lcms_seed_test.py` | H-seed-1: three-way seed comparison (the run's own default seed search vs an LC-MS/MS-confidence seed vs a same-size random control) via `_rescore_linear`'s `seed_mask` — no `pipeline.py` change needed. `--seed-mode {unique,confidence-only}` (F-059/F-060: literal peak-match uniqueness silently selects for depressed `protein_colocalization_top5`; confidence-only + a `--tie-break` disambiguates per peptide instead), `--pep-percentile`/`--pep-max`, `--init-fdr`/`--train-fdr`/`--cv-mode` sweeps, `--model-repeats`. `python scripts/lcms_seed_test.py amyloidosis kidney her2` |
+| `trace_seed_iterations.py` | reimplements `_rescore_linear_once`'s self-training loop from imported pipeline.py helpers (including `_find_best_feature_labels_escalating` for `--seed-mode default`, the pipeline's own seed search) to report every iteration's pseudo-positive count, q-floor and GT recovery, and (F-060) the per-CV-fold-seed death rate a converged-endpoint-only view like `lcms_seed_test.py` cannot see. `--summary-only` for a fold-seed sweep; `--average N` (H-seed-2, F-061/F-062/F-063) reproduces `_rescore_linear`'s `model_repeats=N` averaging exactly, then recomputes it with degenerate replicates (`IDs@5%==0`) dropped, reporting both; `--model {rbf_svm,linear_svm}` compares backend stability on the same seed. `python scripts/trace_seed_iterations.py amyloidosis --seed-mode confidence-only --average 20` |
 | `envelope_qc.py` | isotope-envelope QC |
 | `visualize_ms1rescore_features.py` | per-feature, per-candidate target/decoy visualisation |
 
