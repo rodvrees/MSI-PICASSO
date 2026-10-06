@@ -95,7 +95,22 @@ def test_maldi_extraction_section_preserved(tmp_path):
     toml.write_text('[MSI-PICASSO.maldi_extraction]\nmatching_ppm = 15.0\n')
     config = parse_configurations([str(toml)])["MSI-PICASSO"]
     assert config["maldi_extraction"]["matching_ppm"] == pytest.approx(15.0)
-    assert config["maldi_extraction"]["ppm_bin"] == pytest.approx(5.0)
+    # the untouched sibling key still comes from the packaged defaults
+    assert config["maldi_extraction"]["extraction_ppm"] == pytest.approx(25.0)
+
+
+def test_removed_feature_detection_keys_are_rejected(tmp_path):
+    """Feature finding moved to the TIMSImaging fork, so its knobs are gone.
+
+    The schema rejects unknown keys, so a config still carrying one fails loudly
+    instead of silently ignoring a setting the user believes is in effect. This
+    is the check that catches a stale config from before the move.
+    """
+    for dead_key in ("ppm_bin = 5.0", "deisotope = true", "peak_prominence = 0.01"):
+        toml = tmp_path / f"cfg_{dead_key.split()[0]}.toml"
+        toml.write_text(f"[MSI-PICASSO.maldi_extraction]\n{dead_key}\n")
+        with pytest.raises(Exception):
+            parse_configurations([str(toml)])
 
 
 def test_im2deep_section_preserved(tmp_path):
@@ -111,3 +126,51 @@ def test_dict_source_overrides(tmp_path):
     config = parse_configurations([override])["MSI-PICASSO"]
     assert config["n_interaction_features"] == 3
     assert config["model"] == "lda"
+
+
+def test_images_path_and_batch_size_round_trip(tmp_path):
+    """Memmapped ion images are reachable from a config.
+
+    `extract_maldi_data` has taken `images_path` all along and CLAUDE.md
+    documented it, but it was never wired through the CLI or the config, so it
+    was unreachable — and feature-list extraction is where it became necessary
+    (54326 features x 52019 pixels is 42 GB for the main array alone).
+    """
+    toml = tmp_path / "cfg.toml"
+    toml.write_text('[MSI-PICASSO]\nimages-path = "/tmp/ion.dat"\nimage-batch-size = 50\n')
+    config = parse_configurations([str(toml)])["MSI-PICASSO"]
+    assert config["images_path"] == "/tmp/ion.dat"
+    assert config["image_batch_size"] == 50
+
+
+def test_images_path_defaults_to_ram():
+    """Absent the key, images stay in RAM — the prior behaviour."""
+    config = parse_configurations([{}])["MSI-PICASSO"]
+    assert config["images_path"] is None
+    assert config["image_batch_size"] == 100
+
+
+def test_model_repeats_round_trip(tmp_path):
+    """H-fdr-6/F-030: the number of CV partitions averaged is a config knob."""
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("[MSI-PICASSO]\nmodel-repeats = 10\n")
+    config = parse_configurations([str(toml)])["MSI-PICASSO"]
+    assert config["model_repeats"] == 10
+
+
+def test_model_repeats_defaults_to_one():
+    """Absent the key, one fixed partition — every result predating this reproduces."""
+    assert parse_configurations([{}])["MSI-PICASSO"]["model_repeats"] == 1
+
+
+def test_substitution_mass_shift_max_da_round_trip(tmp_path):
+    """H-fdr-10/F-036: the cap on the substitution mass shift is a config knob."""
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("[MSI-PICASSO]\nsubstitution_mass_shift_max_da = 120.0\n")
+    config = parse_configurations([str(toml)])["MSI-PICASSO"]
+    assert config["substitution_mass_shift_max_da"] == 120.0
+
+
+def test_substitution_mass_shift_max_da_defaults_to_unset():
+    """Absent the key there is no cap, so earlier results reproduce."""
+    assert parse_configurations([{}])["MSI-PICASSO"]["substitution_mass_shift_max_da"] is None

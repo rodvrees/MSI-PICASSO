@@ -15,6 +15,7 @@ from psm_utils.peptidoform import Peptidoform
 
 from msi_picasso.maldi_features import (
     _pearson_r_matrix,
+    _median_thresholded_cosine_matrix,
     compute_tissue_mask,
     compute_region_colocalization_features,
     compute_within_region_colocalization_features,
@@ -23,6 +24,7 @@ from msi_picasso.maldi_features import (
     compute_candidate_ambiguity_features,
     compute_chca_cluster_features,
     compute_colocalization_features,
+    compute_cosine_colocalization_features,
     compute_im2deep_features,
     compute_lcms_ccs_features,
     compute_isotopologue_colocalization,
@@ -72,6 +74,13 @@ MALDI_INTRINSIC_FEATURES = [
     "theo_isotope_cosine", "theo_isotope_chi2", "theo_isotope_kl",
     "theo_has_sulfur", "averagine_deviation", "averagine_deviation_sulfur",
     "theo_m1_ratio_diff", "theo_m2_ratio_diff",
+    # H-decoy-13: the same envelope comparison referenced to averagine at the matched
+    # peak's mass rather than to the candidate's own formula, so it cannot read the
+    # composition asymmetry `substitution` creates (PROGRESS.md F-036/F-039). Value is
+    # per-peak, identical for every candidate on it, so it ranks peaks rather than
+    # separating candidates competing for one.
+    "averagine_envelope_kl",
+    "averagine_envelope_m1_ratio_diff", "averagine_envelope_m2_ratio_diff",
     "monoisotopic_confidence",       # A8
     # --- ionization priors ---
     "n_arginine", "n_basic_residues", "n_aromatic",
@@ -95,6 +104,94 @@ MALDI_INTRINSIC_FEATURES = [
     "adduct_colocalization_na_mob", "adduct_colocalization_k_mob",
     "adduct_colocalization_chca_mob",
 ]
+
+# Protein-level features whose value is largely a readout of how many tryptic peptides
+# the protein has, rather than of whether the protein is present (PROGRESS.md F-045).
+# In feature-list mode a candidate is kept only if it matches a detected peak, but a
+# 10 ppm window against 35-54k peaks matches targets and decoys at the same rate
+# (67.7% against 67.9% on amyloidosis, 50.7% against 50.7% on kidney), so "peptides of
+# this protein that matched" is mostly "peptides this protein has". Measured Spearman
+# against protein_tryptic_count: log_protein_n_features and
+# protein_colocalization_n_partners +0.90 to +0.95, protein_coverage -0.46 to -0.51,
+# is_single_peptide_protein -0.63 to -0.66, protein_best_ratio +0.34 to +0.41.
+# The protein_colocalization_* family proper is deliberately NOT here: removing size
+# from those sharpens them, while removing it from these strips their ground-truth
+# signal on kidney and her2 (F-045).
+SIZE_DRIVEN_PROTEIN_FEATURES = [
+    "log_protein_n_features",
+    "protein_n_features",
+    "protein_colocalization_n_partners",
+    "protein_coverage",
+    "is_single_peptide_protein",
+    "protein_best_ratio",
+]
+
+PROTEIN_SIZE_COLUMN = "protein_tryptic_count"
+PROTEIN_SIZE_RESID_SUFFIX = "_sizeresid"
+
+
+def residualize_against_protein_size(
+    features_df,
+    columns=None,
+    size_column=PROTEIN_SIZE_COLUMN,
+    n_bins=12,
+    suffix=PROTEIN_SIZE_RESID_SUFFIX,
+):
+    """Add a size-free companion column for each size-driven protein feature.
+
+    Each value is replaced by its rank *within a bin of the protein's tryptic
+    count*, scaled to [0, 1]. That removes any monotone dependence on protein size
+    without assuming a functional form, and leaves whatever else the feature
+    carries.
+
+    Bins are built from targets and decoys pooled and the function never sees
+    ``is_decoy`` (invariant 1): the transform is identical for both classes and so
+    cannot itself separate them. Measured after the fact on E024, residualized
+    columns keep a target/decoy AUC within 0.02 of the raw ones.
+
+    New columns are ADDED rather than substituted, following F-039's precedent with
+    the averagine envelope, so both versions stay measurable side by side and
+    ``scripts/audit_protein_size.py`` can check each. Returns the list of names added.
+    """
+    from scipy.stats import rankdata
+
+    if size_column not in features_df.columns:
+        logger.warning(
+            "protein-size residualization skipped: no %s column", size_column
+        )
+        return []
+
+    size = features_df[size_column].to_numpy(dtype=float)
+    try:
+        bins = pd.qcut(pd.Series(size), n_bins, labels=False, duplicates="drop").to_numpy()
+    except ValueError:                      # too few distinct sizes to bin
+        bins = np.zeros(len(size), dtype=float)
+
+    added = []
+    for col in (columns if columns is not None else SIZE_DRIVEN_PROTEIN_FEATURES):
+        if col not in features_df.columns:
+            continue
+        values = features_df[col].to_numpy(dtype=float)
+        out = np.full(values.shape, np.nan)
+        for b in np.unique(bins[~pd.isna(bins)]):
+            m = (bins == b) & np.isfinite(values)
+            if m.sum() < 5:
+                continue
+            out[m] = (rankdata(values[m]) - 0.5) / m.sum()
+        # A bin too small to rank leaves NaN; fall back to the global rank there so
+        # the column is never mostly-NaN on a dataset with few distinct protein sizes.
+        gap = ~np.isfinite(out) & np.isfinite(values)
+        if gap.any():
+            out[gap] = (rankdata(values[gap]) - 0.5) / gap.sum()
+        features_df[col + suffix] = out
+        added.append(col + suffix)
+
+    logger.info(
+        "protein-size residualization: added %d column(s) (%s)",
+        len(added), ", ".join(added) if added else "none",
+    )
+    return added
+
 
 # Protein-level features: aggregate signal across all candidates sharing a protein,
 # including decoys. This breaks the TDC null model (decoys inherit inflated counts
@@ -132,6 +229,21 @@ PROTEIN_LEVEL_FEATURES = [
 # Appended to the ranker pool at runtime in pipeline.py when the flag is set.
 REGION_COLOCALIZATION_FEATURES = [
     "protein_region_colocalization",
+]
+
+# Median-thresholded cosine colocalization (opt-in via --cosine-coloc, requires
+# ion_images). Ovchinnikova et al. (2020, ColocML): median-thresholded cosine
+# similarity of raw ion images, validated at Spearman 0.794 against 42 expert
+# raters (matching a trained deep model), as a replacement for the
+# Pearson-plus-TIC-mask colocalization above (PROGRESS.md H-feat-3 / H-decoy-9).
+# Takes only the observed ion images -- no candidate mass or composition -- so it
+# is safe by construction under every decoy method, mz_shuffle included: there is
+# no F-020-style leak vector to audit for. Protein-level, so valid only because
+# decoys occupy a separate protein namespace (see PROTEIN_LEVEL_FEATURES above).
+COSINE_COLOCALIZATION_FEATURES = [
+    "protein_colocalization_cosine",
+    "protein_colocalization_cosine_max",
+    "protein_colocalization_cosine_median",
 ]
 
 # Within-region and dominant-region Pearson-r colocalization (opt-in via
@@ -234,6 +346,22 @@ MOB_QUALITY_FEATURES = [
     "mob_peak_snr",
 ]
 
+# Mass-normalized isotope-envelope features (PROGRESS.md H-decoy-7a): theo_isotope_kl and
+# siblings build the theoretical envelope from the candidate's OWN mass, which leaks under
+# mz_shuffle because the derangement deliberately places a decoy far away in mass from its
+# assigned feature (F-020, Spearman 0.70-0.80 with the construction mass gap). These
+# variants rescale the candidate's elemental composition to the mass IMPLIED BY THE ASSIGNED
+# FEATURE before building the theoretical envelope, removing the raw mass confound while
+# retaining whatever composition-type signal remains. Experimental: may prove
+# symmetric-but-uninformative like MOB_QUALITY_FEATURES rather than genuinely discriminative
+# — kept OUT of MALDI_INTRINSIC_FEATURES and gated to mz_shuffle only in pipeline.py, mirroring
+# how MOB_QUALITY_FEATURES is gated to _MOB_QUALITY_DEFAULT_DECOYS.
+MZ_SHUFFLE_MASSNORM_ISOTOPE_FEATURES = [
+    "theo_isotope_kl_massnorm",
+    "theo_m1_ratio_diff_massnorm",
+    "theo_m2_ratio_diff_massnorm",
+]
+
 # Alias kept separate so LDA-specific feature selection can diverge later.
 LDA_FEATURES = MALDI_INTRINSIC_FEATURES
 
@@ -293,6 +421,18 @@ FEATURE_NAN_FILL: dict[str, float | str] = {
     "mob_peak_snr": "col_min",        # no peak → lowest observed signal contrast
     "mob_k0_spread": "col_max",       # no peak → widest (worst) mobility spread
     "mob_mz_spread_ppm": "col_max",   # no peak → widest (worst) m/z spread
+    # Mass-normalized isotope envelope (H-decoy-7a): no observed envelope at the assigned
+    # feature → worst-case, matching theo_m1_ratio_diff/theo_m2_ratio_diff's existing
+    # col_max treatment. theo_isotope_kl_massnorm defaults to 0.0 (perfect match) when no
+    # envelope exists, same as the unnormalized theo_isotope_kl -- that is a pre-existing
+    # asymmetry in the original feature, not introduced here.
+    "theo_m1_ratio_diff_massnorm": "col_max",
+    "theo_m2_ratio_diff_massnorm": "col_max",
+    # H-decoy-13, same treatment and same pre-existing asymmetry: the ratio diffs go to
+    # worst-case when no envelope exists, averagine_envelope_kl stays 0.0 like the
+    # unnormalized theo_isotope_kl it parallels.
+    "averagine_envelope_m1_ratio_diff": "col_max",
+    "averagine_envelope_m2_ratio_diff": "col_max",
 }
 
 # ---------------------------------------------------------------------------
@@ -401,6 +541,8 @@ def compute_all_features(
     im2deep_calibration: str = "linear",
     im2deep_kwargs: dict | None = None,
     coloc_tic_quantile: float = 0.0,
+    tic_image: np.ndarray | None = None,
+    tic_n_features: int | None = None,
     coloc_measured_pixel_mask: "np.ndarray | None" = None,
     coloc_tic_normalize: bool = False,
     coloc_common_mode: bool = False,
@@ -409,6 +551,7 @@ def compute_all_features(
     region_coloc_debug: dict | None = None,
     within_region_coloc: bool = False,
     within_region_coloc_debug: dict | None = None,
+    cosine_coloc: bool = False,
 ) -> pd.DataFrame:
     """
     Compute all features on the candidate DataFrame.
@@ -529,7 +672,9 @@ def compute_all_features(
         # outline. Restricting the correlation to on-tissue pixels removes it so
         # colocalization reflects co-distribution within the tissue (see
         # compute_tissue_mask). TIC == 0 padding is always dropped.
-        pixel_mask = compute_tissue_mask(ion_images, tic_quantile=coloc_tic_quantile)
+        pixel_mask = compute_tissue_mask(
+            ion_images, tic_quantile=coloc_tic_quantile, tic_image=tic_image
+        )
         if coloc_measured_pixel_mask is not None:
             pixel_mask = pixel_mask & coloc_measured_pixel_mask
         _mask_suffix = ", measured-coord mask applied" if coloc_measured_pixel_mask is not None else ""
@@ -551,10 +696,14 @@ def compute_all_features(
             protein_corr_cache = _pearson_r_matrix(
                 ion_images, ion_image_mzs, pixel_mask=pixel_mask,
                 tic_normalize=coloc_tic_normalize, common_mode_removal=coloc_common_mode,
+                full_tic=tic_image, full_n_features=tic_n_features,
             )
         else:
             protein_corr_cache = corr_cache
         df = compute_colocalization_features(df, ion_images, ion_image_mzs, _corr_cache=protein_corr_cache)
+        if cosine_coloc:
+            cosine_corr_cache = _median_thresholded_cosine_matrix(ion_images, ion_image_mzs, pixel_mask=pixel_mask)
+            df = compute_cosine_colocalization_features(df, ion_images, ion_image_mzs, _corr_cache=cosine_corr_cache)
         df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images, pixel_mask=pixel_mask)  # E1
         df = compute_adduct_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images, pixel_mask=pixel_mask)        # E2
         df = compute_spatial_autocorrelation_full(df, ion_images, ion_image_mzs)                         # E5/E6

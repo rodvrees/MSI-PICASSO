@@ -269,6 +269,133 @@ def _mz_diverse_order(df: pd.DataFrame, mz_col: str = "feature_mz") -> pd.DataFr
     full_order = valid_idx[order_v].tolist() + invalid_idx.tolist()
     return df.iloc[full_order].reset_index(drop=True)
 
+#: q-value columns to choose a representative match by, best first. The reweighted value
+#: is preferred wherever it exists, matching how the caller picks a protein's
+#: representative peptide.
+_QVAL_PREFERENCE = ("reweighted_q_value", "q_value", "peptide_q_value")
+
+
+def _one_row_per_peptide(subset: pd.DataFrame) -> pd.DataFrame:
+    """Collapse peptide-feature rows to one row per protein, keeping the best q-value.
+
+    Two levels of duplication, and this removes both.
+
+    *Per peptide-feature pair.* A peptide matches 2.1 to 4.8 detected peaks at
+    ``min_regions=2`` and up to 12.8 at ``min_regions=1`` (PROGRESS.md F-029, F-050), so
+    one figure per row draws the same peptide many times over, differing only in which
+    feature is the precursor panel.
+
+    *Per peptide of one protein.* Every figure already shows the whole protein — precursor
+    plus all same-protein co-features plus the protein mean — so two peptides of one
+    protein give the same panel set in a different order. The protein is therefore the
+    unit, and the peptide is the fallback only when no protein column exists.
+
+    Targets and decoys are kept apart. Decoy proteins carry a ``DECOY_`` prefix so they
+    already separate, but keying on the name alone would silently merge the two classes
+    if that ever stopped being true.
+    """
+    if subset is None or not len(subset):
+        return subset
+    unit = "protein" if "protein" in subset.columns else "peptide"
+    if unit not in subset.columns:
+        return subset
+    key = [unit] + (["is_decoy"] if "is_decoy" in subset.columns else [])
+    qcol = next((c for c in _QVAL_PREFERENCE if c in subset.columns), None)
+    if qcol is None:
+        # No q-value to rank by: keep the first row rather than dropping the figures
+        # entirely, so a run without a scored result still produces diagnostics.
+        return subset.drop_duplicates(subset=key, keep="first").reset_index(drop=True)
+    return (
+        subset
+        .sort_values(qcol, ascending=True, na_position="last", kind="stable")
+        .drop_duplicates(subset=key, keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def _co_feature_panels(
+    features_df: pd.DataFrame,
+    protein,
+    precursor_mz: float,
+    precursor_peptide: str,
+    feature_qvals: dict | None,
+    feature_peptides: dict | None,
+) -> list:
+    """The co-feature panels for one protein: ``[(feature_mz, peptide), ...]``.
+
+    **One panel per peptide, not per peptide-feature pair.** A peptide matches several
+    detected peaks — 2.1 to 4.8 at ``min_regions=2`` and up to 12.8 at 1 (F-029, F-050) —
+    and at ``min_regions=1`` those are near-duplicate peaks of the same ion, so the panels
+    are visually identical and crowd out the protein's other peptides. Measured on kidney
+    E030's P47963: 43 peaks for **9 peptides**, with TIGISVDPR taking 6 panels between
+    957.5339 and 957.5452.
+
+    Each peptide is represented by **the best peak it actually wins**. Ranking on the
+    feature's own q-value alone picks the peak carrying the best identification, which is
+    often one a stronger peptide owns, so nearly every panel came out annotated
+    "(not winner: ...)" — the least representative peak of the set.
+
+    The precursor's peptide is excluded: it already has its own panel.
+    """
+    prot_rows = features_df.loc[features_df["protein"] == protein]
+    if not len(prot_rows) or "peptide" not in prot_rows.columns:
+        return []
+    pep_at_mz: dict = {}
+    for mz, pep in zip(prot_rows["feature_mz"], prot_rows["peptide"]):
+        if pd.notna(mz):
+            pep_at_mz.setdefault(float(mz), str(pep))
+
+    def sort_key(m):
+        q = feature_qvals.get(m, float("nan")) if feature_qvals else float("nan")
+        winner = feature_peptides.get(m, "") if feature_peptides else ""
+        mine = pep_at_mz.get(m, "")
+        not_winner = 1 if (winner and mine and winner != mine) else 0
+        finite = np.isfinite(q) if q is not None else False
+        return (not_winner, 0 if finite else 1, q if finite else float("inf"), m)
+
+    candidates = sorted(
+        (m for m in pep_at_mz if abs(m - precursor_mz) > 1e-6), key=sort_key
+    )
+    seen = {precursor_peptide} if precursor_peptide and precursor_peptide != "unknown" else set()
+    out = []
+    for m in candidates:
+        pep = pep_at_mz.get(m, "")
+        if pep:
+            if pep in seen:
+                continue
+            seen.add(pep)
+        out.append((m, pep))
+    return out
+
+
+def _reset_figure_dir(out_dir: str) -> None:
+    """Empty a figure directory so a rerun replaces its figures instead of joining them.
+
+    Figures are named with a rank, and the rank of a protein changes between runs, so
+    re-running into an existing output directory leaves both copies: kidney's E025
+    directory held 103 files for 59 figures, the surplus being the superseded first run
+    of E025 sitting beside the corrected one under different ranks. Nothing distinguishes
+    them in a listing, which is exactly the "same protein, different rank" confusion.
+    """
+    if os.path.isdir(out_dir):
+        for name in os.listdir(out_dir):
+            if name.endswith(".png"):
+                try:
+                    os.remove(os.path.join(out_dir, name))
+                except OSError:
+                    pass
+    os.makedirs(out_dir, exist_ok=True)
+    _FIGURES_WRITTEN.pop(out_dir, None)
+
+
+#: Figures already written into each output directory this run, as ``{out_dir: {tag}}``.
+#: ``plot_ion_image_colocalization`` is called twice into ``ion_images/`` — once for the
+#: protein-level set and once for the ground-truth peptides — and each call can only
+#: deduplicate against itself, so a ground-truth peptide's protein came out twice. Cleared
+#: by ``_reset_figure_dir`` at the start of a run.
+_FIGURES_WRITTEN: dict[str, set] = {}
+
+
 def plot_ion_image_colocalization(
     subset: pd.DataFrame,
     features_df: pd.DataFrame,
@@ -279,12 +406,22 @@ def plot_ion_image_colocalization(
     feature_peptides: dict | None = None,
 ) -> None:
     """
-    One figure **per protein** (the caller collapses ``subset`` to one
-    representative row — the lowest-q peptide — per protein): the representative
-    feature's ion image + ALL same-protein co-feature images (ranked by
-    reweighted q-value ascending) + protein mean. Per-peptide figures of the same
-    protein would show the identical feature set in a different order, so only the
-    protein-level figure is emitted.
+    **At most one figure per peptide**, never one per peptide-feature pair. A peptide
+    matches several detected peaks (F-029), and a figure per match redraws the same
+    peptide with a different panel promoted to precursor. ``_one_row_per_peptide``
+    collapses ``subset`` here, keeping the match with the best q-value, so every caller
+    gets this and none has to remember to.
+
+    The main caller collapses further, to one representative row — the lowest-q peptide —
+    **per protein**, because every figure already shows the whole protein and per-peptide
+    figures of one protein differ only in panel order. The ground-truth caller does not:
+    there the point is the named peptides, so each gets its own figure.
+
+    Each figure is the representative feature's ion image + one co-feature panel **per
+    same-protein peptide** (its best-q match, ranked by reweighted q-value ascending) +
+    the mean over those panels. The panels are per peptide for the same reason the figures
+    are: a peptide's several matched peaks are near-duplicates of one ion at
+    ``min_regions=1`` and their images are visually identical.
 
     Co-feature panels show the same-protein candidate peptide as the label.  When
     a different-protein peptide is the TDC winner at that feature, it is annotated
@@ -297,8 +434,11 @@ def plot_ion_image_colocalization(
     dark green at q ≤ 1%, light green at q ≤ 5%, white (no frame) otherwise.
     """
     os.makedirs(out_dir, exist_ok=True)
+    subset = _one_row_per_peptide(subset)
+    already = _FIGURES_WRITTEN.setdefault(out_dir, set())
 
     n_saved = 0
+    n_skipped = 0
     for _, row in subset.iterrows():
         try:
             feature_mz = row.get("feature_mz")
@@ -311,6 +451,18 @@ def plot_ion_image_colocalization(
 
             prefix = str(row.get("_group", "L"))
             td = str(row.get("_td", "T"))
+
+            # One figure per protein across the whole run, not just within this call.
+            # This function is called twice into the same directory — the protein-level
+            # set, then the ground-truth peptides — and a ground-truth peptide's protein
+            # is usually in both. The first call wins, and it already chose that
+            # protein's best-q peptide, so nothing better is being discarded.
+            _prot_tag = _safe_fname(str(protein)) if protein else _safe_fname(peptide)
+            if (td, _prot_tag) in already:
+                n_skipped += 1
+                continue
+            already.add((td, _prot_tag))
+
             prec_idx = _find_image_idx(feature_mz, ion_image_mzs)
             if prec_idx is None:
                 continue
@@ -321,33 +473,20 @@ def plot_ion_image_colocalization(
             co_mzs: list[float] = []
             co_pep_labels: list[str] = []
             if protein and "protein" in features_df.columns and "feature_mz" in features_df.columns:
-                prot_mzs = (
-                    features_df.loc[features_df["protein"] == protein, "feature_mz"]
-                    .dropna()
-                    .unique()
-                )
-                co_mz_candidates = [float(m) for m in prot_mzs if abs(float(m) - feature_mz) > 1e-6]
-                co_mz_candidates.sort(
-                    key=lambda m: (
-                        0 if (feature_qvals and np.isfinite(feature_qvals.get(m, float("nan")))) else 1,
-                        feature_qvals.get(m, float("inf")) if feature_qvals else m,
-                    )
-                )
-                for mz in co_mz_candidates:
+                for mz, co_pep in _co_feature_panels(
+                    features_df, protein, feature_mz, peptide,
+                    feature_qvals, feature_peptides,
+                ):
                     co_img_idx = _find_image_idx(mz, ion_image_mzs)
-                    if co_img_idx is not None:
-                        same_prot_peps = features_df.loc[
-                            (features_df["feature_mz"] == mz) & (features_df["protein"] == protein),
-                            "peptide",
-                        ]
-                        co_pep = str(same_prot_peps.iloc[0]) if len(same_prot_peps) > 0 else ""
-                        winner_pep = feature_peptides.get(mz, "") if feature_peptides else ""
-                        label = co_pep
-                        if co_pep and winner_pep and co_pep != winner_pep:
-                            label += f"\n(not winner: {winner_pep})"
-                        co_imgs.append(ion_images[co_img_idx])
-                        co_mzs.append(mz)
-                        co_pep_labels.append(label)
+                    if co_img_idx is None:
+                        continue
+                    winner_pep = feature_peptides.get(mz, "") if feature_peptides else ""
+                    label = co_pep
+                    if co_pep and winner_pep and co_pep != winner_pep:
+                        label += f"\n(not winner: {winner_pep})"
+                    co_imgs.append(ion_images[co_img_idx])
+                    co_mzs.append(mz)
+                    co_pep_labels.append(label)
 
             all_imgs = [prec_img] + co_imgs
             prot_mean = np.mean(all_imgs, axis=0)
@@ -396,7 +535,6 @@ def plot_ion_image_colocalization(
 
             fig.suptitle(_candidate_title(row), fontsize=8, y=1.01)
             plt.tight_layout()
-            _prot_tag = _safe_fname(str(protein)) if protein else _safe_fname(peptide)
             fname = f"{td}_{rank:03d}_{_prot_tag}.png"
             _save_and_close(fig, os.path.join(out_dir, fname), dpi=100)
             n_saved += 1
@@ -410,7 +548,15 @@ def plot_ion_image_colocalization(
                 plt.close("all")
             except Exception:
                 pass
-    if n_saved == 0:
+    if n_skipped:
+        logger.info(
+            "Ion image colocalization: %d figures saved, %d skipped as a protein already "
+            "drawn this run", n_saved, n_skipped,
+        )
+    if n_saved == 0 and n_skipped == 0:
+        # Only a warning when nothing was drawn AND nothing was deliberately skipped.
+        # The ground-truth call legitimately saves nothing when every one of its proteins
+        # was already drawn, and that must not read as a feature_mz alignment fault.
         logger.warning(
             "Ion image colocalization: 0 figures saved from %d candidates "
             "(ion_image_mzs has %d entries; check feature_mz alignment)",
@@ -1016,8 +1162,11 @@ def plot_feature_importance(
 
     When structure coefficients are provided, each round produces a two-panel
     figure (paired horizontal bar chart):
-      Left  — raw LDA coefficient, normalised to [-1, 1] by the maximum absolute
-               value.  Can be inflated by collinearity between features.
+      Left  — whatever the backend reports as an importance, normalised to [-1, 1]
+               by the maximum absolute value: ``coef_`` for the linear models
+               (signed, and inflatable by collinearity), ``feature_importances_``
+               for trees, permutation importance for the kernel models that have
+               neither (H-model-2).
       Right — structure coefficient: Pearson r between each (scaled) feature and
                the discriminant score.  Bounded in [-1, 1] and unaffected by
                collinearity.  Features are sorted top-to-bottom by |structure coef|.
@@ -1085,8 +1234,12 @@ def plot_feature_importance(
             ax_raw.set_xlim(-1.12, 1.12)
             ax_raw.set_yticks(range(n_feats))
             ax_raw.set_yticklabels(plot_names, fontsize=7)
-            ax_raw.set_xlabel("Raw LDA coef  (normalised to max abs)", fontsize=9)
-            ax_raw.set_title("Raw LDA coefficient\n(can be inflated by collinearity)", fontsize=9)
+            ax_raw.set_xlabel("Reported importance  (normalised to max abs)", fontsize=9)
+            # The left panel is whatever the backend reports: coef_ for the linear
+            # models, feature_importances_ for trees, permutation importance for the
+            # kernel models that have neither (H-model-2). Only the first of those
+            # is signed, and only it can be inflated by collinearity.
+            ax_raw.set_title("Reported importance\ncoef_ / permutation importance", fontsize=9)
 
             struct_colors = ["steelblue" if v >= 0 else "tomato" for v in s_vals]
             ax_struct.barh(range(n_feats), s_vals, color=struct_colors, alpha=0.80, height=0.65)
@@ -3168,15 +3321,25 @@ def debug_pfm_explanations(
     output_dir: str,
     n_decoys: int = 10,
     fdr_threshold: float | None = None,
+    max_targets: int = 200,
+    kernel_background: int = 25,
+    kernel_nsamples: int = 512,
 ) -> None:
     """
-    Per-PFM SHAP explanation figures for the linear rescoring model.
+    Per-PFM SHAP explanation figures for the rescoring model.
 
-    For a set of selected peptide-feature matches (PFMs) — all target TDC winners
-    passing FDR plus a random sample of decoy winners — this computes SHAP values
-    with ``shap.LinearExplainer`` (``feature_perturbation="interventional"``) on
-    the bare linear estimator inside ``svm_pipeline`` and saves a three-panel
-    figure per candidate plus a summary TSV.
+    For a set of selected peptide-feature matches (PFMs) — target winners passing
+    FDR plus a random sample of decoy winners — this computes SHAP values and saves
+    a three-panel figure per candidate plus a summary TSV.
+
+    The explainer follows the estimator. With ``coef_`` (lda, svm) it is
+    ``shap.LinearExplainer`` (``feature_perturbation="interventional"``) on the bare
+    coefficients, which is exact. Without it (rbf_svm, whose decision function lives
+    in kernel space) it is ``shap.KernelExplainer`` on the estimator's
+    ``decision_function``, with a ``kernel_background``-row k-means summary of the
+    training matrix and ``kernel_nsamples`` coalitions per candidate. That is
+    affordable only because it runs on the selected candidates rather than on every
+    candidate row, which is the whole point of restricting it (H-model-2).
 
     ``result_df`` must be aligned row-for-row with ``X`` (the raw, pre-pipeline
     feature matrix the model was trained on, one row per winner).  ``feature_names``
@@ -3185,9 +3348,16 @@ def debug_pfm_explanations(
 
     Selection
     ---------
-    Targets: all TDC winners with ``q_value <= fdr_threshold`` (default 0.01),
-    falling back to 0.05 when fewer than one target passes at 1%.  Decoys:
-    ``n_decoys`` random TDC winners with ``is_decoy=True`` (``random.seed(42)``).
+    The reported population, which is peptide-level since F-029: where
+    ``is_peptide_winner``/``peptide_q_value`` are present they are used, and the
+    per-feature ``is_tdc_winner``/``q_value`` only otherwise. Explaining feature
+    winners while the run reports peptides would explain the same peptide several
+    times over and misstate how many identifications were covered.
+
+    Targets: winners with q <= ``fdr_threshold`` (default 0.01), falling back to
+    0.05 when fewer than one target passes at 1%, best q first, at most
+    ``max_targets``.  Decoys: ``n_decoys`` random winners with ``is_decoy=True``
+    (``random.seed(42)``).
 
     Outputs (``<output_dir>/pfm_explanations/``)
     --------------------------------------------
@@ -3227,14 +3397,18 @@ def debug_pfm_explanations(
         )
         return
 
-    # TDC-winner population (the rows passed are winners, but guard anyway).
-    if "is_tdc_winner" in res.columns:
-        winner_mask = res["is_tdc_winner"].fillna(False).astype(bool).values
+    # The reported population — peptide-level where the run computed it (F-029),
+    # per-feature otherwise.
+    winner_col, q_col = "is_peptide_winner", "peptide_q_value"
+    if winner_col not in res.columns or q_col not in res.columns:
+        winner_col, q_col = "is_tdc_winner", "q_value"
+    if winner_col in res.columns:
+        winner_mask = res[winner_col].fillna(False).astype(bool).values
     else:
         winner_mask = np.ones(len(res), dtype=bool)
     is_decoy = res.get("is_decoy", pd.Series(False, index=res.index)).fillna(False).astype(bool).values
     q_value = pd.to_numeric(
-        res.get("q_value", pd.Series(np.nan, index=res.index)), errors="coerce"
+        res.get(q_col, pd.Series(np.nan, index=res.index)), errors="coerce"
     ).values
 
     # --- Select targets at FDR (fall back 1% → 5%) ---
@@ -3247,8 +3421,8 @@ def debug_pfm_explanations(
     else:
         thr = float(fdr_threshold)
         target_pos = np.where(winner_mask & ~is_decoy & (q_value <= thr))[0]
-    # Rank targets by q_value ascending.
-    target_pos = target_pos[np.argsort(q_value[target_pos], kind="stable")]
+    # Rank targets by q_value ascending; the cap bounds the KernelExplainer cost.
+    target_pos = target_pos[np.argsort(q_value[target_pos], kind="stable")][:max_targets]
 
     # --- Sample decoy winners ---
     decoy_candidates = np.where(winner_mask & is_decoy)[0].tolist()
@@ -3271,14 +3445,18 @@ def debug_pfm_explanations(
         pre = svm_pipeline[:-1]
         estimator = svm_pipeline[-1]
         Xt_all = np.asarray(pre.transform(X), dtype=np.float64)
-        coef = np.asarray(estimator.coef_, dtype=np.float64).ravel()
-        intercept = float(np.asarray(estimator.intercept_).ravel()[0])
     except Exception as exc:
         logger.warning(
             "debug_pfm_explanations: could not decompose pipeline / estimator (%s) — skipping.",
             exc,
         )
         return
+    is_linear = hasattr(estimator, "coef_")
+    if is_linear:
+        coef = np.asarray(estimator.coef_, dtype=np.float64).ravel()
+        intercept = float(np.asarray(estimator.intercept_).ravel()[0])
+    else:
+        coef = np.array([])
 
     # The transformed matrix may have more columns than feature_names when a
     # polynomial-interaction step expands the inputs; in that case raw-value and
@@ -3295,16 +3473,44 @@ def debug_pfm_explanations(
             Xt_all.shape[1], len(feature_names),
         )
 
-    # --- SHAP LinearExplainer on the bare linear estimator ---
+    # --- SHAP explainer ---
+    # Linear estimators: LinearExplainer on the bare coefficients,
     # feature_perturbation="interventional" with the full transformed training
-    # matrix as background.
+    # matrix as background. Exact and effectively free.
+    #
+    # Kernel estimators (rbf_svm) have no coef_, so this used to skip entirely.
+    # KernelExplainer covers them, and is affordable here for one reason: it runs
+    # on the selected candidates only -- the few hundred that get reported -- not
+    # on the ~12 K candidate rows (H-model-2). It is still ~n_background *
+    # kernel_nsamples decision_function evaluations per candidate, so the
+    # background is a k-means summary of the training matrix rather than all of
+    # it, which is what shap's own documentation recommends for this explainer.
     try:
-        explainer = shap.LinearExplainer(
-            (coef, intercept), Xt_all, feature_perturbation="interventional"
-        )
-        base_value = float(np.asarray(explainer.expected_value).ravel()[0])
+        if is_linear:
+            explainer = shap.LinearExplainer(
+                (coef, intercept), Xt_all, feature_perturbation="interventional"
+            )
+            base_value = float(np.asarray(explainer.expected_value).ravel()[0])
+
+            def _shap_row(xt):
+                return np.asarray(explainer.shap_values(xt)).reshape(-1)
+        else:
+            bg = shap.kmeans(Xt_all, min(kernel_background, Xt_all.shape[0]))
+            explainer = shap.KernelExplainer(estimator.decision_function, bg)
+            base_value = float(np.asarray(explainer.expected_value).ravel()[0])
+            logger.info(
+                "debug_pfm_explanations: %s has no coef_ — using KernelExplainer "
+                "(%d background rows, %d samples per candidate) on %d candidates",
+                type(estimator).__name__, kernel_background, kernel_nsamples,
+                len(target_pos) + len(decoy_pos),
+            )
+
+            def _shap_row(xt):
+                return np.asarray(
+                    explainer.shap_values(xt, nsamples=kernel_nsamples, silent=True)
+                ).reshape(-1)
     except Exception as exc:
-        logger.warning("debug_pfm_explanations: LinearExplainer failed (%s) — skipping.", exc)
+        logger.warning("debug_pfm_explanations: SHAP explainer failed (%s) — skipping.", exc)
         return
 
     # Per-column training distributions for percentile ranks (raw space when aligned).
@@ -3319,10 +3525,10 @@ def debug_pfm_explanations(
         peptide = str(row.get("peptide", "unknown"))
         protein = str(row.get("protein", ""))
         feature_mz = _get(row, "feature_mz")
-        qv = _get(row, "q_value")
+        qv = _get(row, q_col)
 
         xt = Xt_all[pos : pos + 1]
-        shap_vals = np.asarray(explainer.shap_values(xt)).reshape(-1)
+        shap_vals = _shap_row(xt)
         final_score = base_value + float(shap_vals.sum())
 
         order = np.argsort(np.abs(shap_vals))[::-1][:top_k]
@@ -3680,6 +3886,13 @@ def save_debug_figures(
         Random seed for reproducible sampling.
     """
     os.makedirs(debug_dir, exist_ok=True)
+    # Empty ion_images/ first. Figure names carry a rank, and a protein's rank moves
+    # between runs, so re-running into an existing directory leaves both copies under
+    # different names with nothing to tell them apart. kidney's E025 directory held 103
+    # files for 59 figures for exactly that reason. The sibling figure directories
+    # (features/, isotope_envelopes/, feature_importance/, pfm_explanations/) have the
+    # same property and are deliberately left alone here — see PROGRESS.md.
+    _reset_figure_dir(os.path.join(debug_dir, "ion_images"))
 
     subset = _sample_subset(features_df, result_df, n=n_subset, seed=seed)
     logger.info("Debug viz: sampled %d candidates from %d", len(subset), len(features_df))

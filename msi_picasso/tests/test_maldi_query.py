@@ -11,7 +11,12 @@ from msi_picasso import maldi_query
 
 
 def _stub_5tuple(query_mzs):
-    """A stand-in for extract_maldi_data's 6-tuple output."""
+    """A stand-in for extract_maldi_data's output.
+
+    Seventh element is the on-tissue TIC, added so the mask can be computed over
+    every peak while ion images are kept only for the peaks a candidate matched
+    (PROGRESS.md F-048). None here: raw-query mode passes no keep_mask.
+    """
     n = len(query_mzs)
     ion_images = np.ones((n, 3, 3), dtype=np.float32)
     extra = {k: np.ones((n, 3, 3), dtype=np.float32) for k in ("m1", "m2", "na", "k", "chca")}
@@ -24,7 +29,8 @@ def _stub_5tuple(query_mzs):
     envelopes = {float(mz): [1.0, 0.5, 0.2] for mz in query_mzs}
     xs = np.array([0, 1, 2], dtype=np.int32)
     ys = np.array([0, 1, 2], dtype=np.int32)
-    return np.asarray(query_mzs, dtype=np.float64), ion_images, extra, spatial, envelopes, (xs, ys)
+    return (np.asarray(query_mzs, dtype=np.float64), ion_images, extra, spatial,
+            envelopes, (xs, ys), None, None)
 
 
 class TestQueryRawMaldiAssertions:
@@ -171,11 +177,11 @@ class TestWeightedMeanInvK0:
         assert out[1] == pytest.approx(1.0)
 
     def test_ccs_conversion_propagates_nan(self):
-        from msi_picasso.maldi_imzml import one_over_k0_to_ccs
+        from im2deep.utils import im2ccs
 
         query = np.array([1000.0, 1500.0], dtype=np.float64)
         mean_k0 = np.array([0.9, np.nan])
-        ccs = np.asarray(one_over_k0_to_ccs(mean_k0, query, charge=1), dtype=float)
+        ccs = np.asarray(im2ccs(mean_k0, query, 1), dtype=float)
         assert np.isfinite(ccs[0]) and ccs[0] > 0
         assert np.isnan(ccs[1])
 

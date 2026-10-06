@@ -223,23 +223,52 @@ def _write_results(
 ) -> None:
     """Write rescoring results to TSV files in ``output_dir``.
 
-    Writes all candidates (targets and decoys) with q-value annotation.
-    No hard filtering is applied — downstream consumers can filter by
-    ``reweighted_q_value``, ``is_tdc_winner``, and ``is_decoy`` as needed.
+    ``ms1rescore_matches.tsv`` gets every candidate, targets and decoys, with its
+    q-value annotation and no filtering: downstream consumers filter on
+    ``is_peptide_winner``/``peptide_q_value`` (or the feature-level equivalents for
+    results predating F-029) and ``is_decoy`` themselves.
+
+    ``ms1rescore_peptides.tsv`` is the confident-identification list, so it is
+    filtered: targets only, one row per peptide, at 1% FDR. It previously did none
+    of those things despite its name -- it kept every peptide-feature pair, applied
+    the feature-level q-value, and **did not exclude decoys**, so amyloidosis E018
+    shipped 1294 rows covering 308 peptides of which 11 were decoys, where the
+    reported count was 247 target peptides. See PROGRESS.md F-035.
     """
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, "ms1rescore_matches.tsv")
     result.to_csv(out_path, sep="\t", index=False)
     n_winners = result.get("is_tdc_winner", result["is_decoy"].apply(lambda x: not x)).sum()
     logger.info(f"  Wrote {len(result)} candidates ({n_winners} TDC winners) → {out_path}")
-    # Filter per-feature winners filtered by q-value
-    if "is_tdc_winner" in result.columns and "reweighted_q_value" in result.columns:
-        winners = result[result["is_tdc_winner"] & (result["reweighted_q_value"] <= 0.01)]
-        peptides_out = os.path.join(output_dir, "ms1rescore_peptides.tsv")
-        cols = [c for c in ["feature_idx", "feature_mz", "feature_ccs", "peptide", "protein", "reweighted_q_value"] if c in winners.columns]
-        peptides = winners[cols].drop_duplicates().sort_values("reweighted_q_value")
-        peptides.to_csv(peptides_out, sep="\t", index=False)
-        logger.info(f"  Wrote {len(peptides)} peptide-level winners → {peptides_out}")
+
+    # Prefer the peptide-level population, matching the reported ID count (F-029).
+    # Fall back to feature level for raw-query results, which have no peptide-level
+    # columns; the log line says which was used.
+    if "is_peptide_winner" in result.columns and "peptide_q_value" in result.columns:
+        win_col, q_col, level = "is_peptide_winner", "peptide_q_value", "peptide-level"
+    elif "is_tdc_winner" in result.columns and "reweighted_q_value" in result.columns:
+        win_col, q_col, level = "is_tdc_winner", "reweighted_q_value", "feature-level"
+    else:
+        return
+
+    confident = result[
+        result[win_col].astype(bool)
+        & ~result["is_decoy"].astype(bool)
+        & (result[q_col] <= 0.01)
+    ]
+    cols = [c for c in ["feature_idx", "feature_mz", "feature_ccs", "peptide", "protein",
+                        q_col] if c in confident.columns]
+    peptides = (
+        confident[cols]
+        .sort_values(q_col)
+        .drop_duplicates(subset=["peptide"], keep="first")
+    )
+    peptides_out = os.path.join(output_dir, "ms1rescore_peptides.tsv")
+    peptides.to_csv(peptides_out, sep="\t", index=False)
+    logger.info(
+        "  Wrote %d confident target peptides at 1%% FDR (%s) → %s",
+        len(peptides), level, peptides_out,
+    )
 
 # ---------------------------------------------------------------------------
 # Argument parser
@@ -355,23 +384,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     maldi_exc.add_argument(
-        "--maldi-imzml",
-        metavar="PATH",
-        help=(
-            "imzML file (.imzML + .ibd). SCiLS Lab-style interval-based "
-            "feature extraction is performed automatically. Ion images and "
-            "spatial features are reconstructed from the interval intensity "
-            "matrix. Use --maldi-d instead when the raw Bruker .d directory "
-            "is available to obtain full adduct/isotope extra images."
-        ),
-    )
-    maldi_exc.add_argument(
         "--maldi-d",
         metavar="PATH",
         help=(
             "Bruker .d directory (preferred raw path; provides full ion image "
-            "extraction including adduct and isotopologue extra images). Use "
-            "instead of --maldi-imzml when the raw data is available. "
+            "extraction including adduct and isotopologue extra images). "
             "Functionally equivalent to --maldi-raw."
         ),
     )
@@ -387,6 +404,25 @@ def build_parser() -> argparse.ArgumentParser:
             "a SCiLS Lab CSV export (semicolon-delimited, '#' comment lines, first "
             "data column = m/z)."
         ),
+    )
+    maldi_group.add_argument(
+        "--images-path",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Write ion images to a memory-mapped file at PATH instead of holding "
+            "the full (n_features, H, W) float32 array in RAM. Needed when the "
+            "feature list is large: 54326 features x 52019 pixels is 42 GB for the "
+            "main array alone, before the mobility-colocalization pass adds its own. "
+            "Transparent to all downstream code."
+        ),
+    )
+    maldi_group.add_argument(
+        "--image-batch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Features per batch when --images-path is set (default 100).",
     )
     maldi_group.add_argument(
         "--maldi-query-raw",
@@ -419,13 +455,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     raw_grp.add_argument(
-        "--ppm-bin",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="Peak-binning tolerance for feature detection (ppm). Default: 5.0.",
-    )
-    raw_grp.add_argument(
         "--extraction-ppm",
         type=float,
         default=None,
@@ -444,203 +473,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "m/z window for candidate matching (ppm). Applied when linking "
             "peptide candidates to detected MALDI features. Default: 20.0."
-        ),
-    )
-    raw_grp.add_argument(
-        "--min-fraction",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Minimum fraction of pixels a peak must be detected in to be "
-            "kept as a feature. Default: 0.01 (1%%)."
-        ),
-    )
-    raw_grp.add_argument(
-        "--peak-prominence",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Minimum peak prominence for SCiLS-style feature detection on profile "
-            "data, as a fraction of the mean-spectrum maximum. Lower values detect "
-            "more (weaker) features; higher values are more conservative. "
-            "Default: 0.01. Typical range: 0.001–0.05."
-        ),
-    )
-    raw_grp.add_argument(
-        "--smoothing-window",
-        type=int,
-        default=None,
-        metavar="INT",
-        help=(
-            "Savitzky-Golay smoothing window length (odd integer ≥ 3) applied to "
-            "the mean spectrum before peak detection (profile mode only). "
-            "Larger values smooth more but can shift peak apices. Default: 11."
-        ),
-    )
-    raw_grp.add_argument(
-        "--smoothing-polyorder",
-        type=int,
-        default=None,
-        metavar="INT",
-        help=(
-            "Savitzky-Golay polynomial order for mean-spectrum smoothing "
-            "(must be < --smoothing-window). Default: 2."
-        ),
-    )
-    raw_grp.add_argument(
-        "--interval-ppm-tolerance",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Fallback interval half-width (ppm) used when no valley flanks a "
-            "detected peak in the mean spectrum (profile mode only). Default: 5.0."
-        ),
-    )
-    raw_grp.add_argument(
-        "--min-interval-width-ppm",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Minimum interval full-width (ppm). Intervals narrower than this are "
-            "symmetrically expanded around the apex (profile mode only). Default: 1.0."
-        ),
-    )
-    raw_grp.add_argument(
-        "--normalize-rms",
-        action="store_true",
-        help=(
-            "RMS-normalize each pixel spectrum before mean spectrum accumulation "
-            "(profile mode only). Takes priority over the default TIC normalization. "
-            "Matches the SCiLS Lab default normalization."
-        ),
-    )
-    raw_grp.add_argument(
-        "--baseline-correction",
-        action="store_true",
-        help=(
-            "Apply rolling-minimum baseline subtraction to the mean spectrum before "
-            "peak detection (profile mode only)."
-        ),
-    )
-    raw_grp.add_argument(
-        "--baseline-window-ppm",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="Half-width (ppm) of the rolling-minimum baseline window. Default: 500.0.",
-    )
-    raw_grp.add_argument(
-        "--calibrant-mzs",
-        type=float,
-        nargs="*",
-        default=None,
-        metavar="MZ",
-        help=(
-            "Theoretical m/z values of internal calibrants (e.g. trypsin autolysis "
-            "peaks). When provided, detected apices are used to fit a linear ppm "
-            "correction and all intervals are recalibrated (profile mode only). "
-            "Example: --calibrant-mzs 842.51 870.54 1045.56"
-        ),
-    )
-    raw_grp.add_argument(
-        "--calibrant-tol-ppm",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="Search window (ppm) for matching detected apices to calibrant m/z. Default: 200.0.",
-    )
-    raw_grp.add_argument(
-        "--deisotope",
-        action="store_true",
-        help=(
-            "Remove isotope satellite peaks using ms_deisotope after interval "
-            "detection, retaining only monoisotopic peaks (profile mode only)."
-        ),
-    )
-    raw_grp.add_argument(
-        "--deisotope-error-ppm",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="PPM error tolerance for isotope envelope fitting. Default: 15.0.",
-    )
-    raw_grp.add_argument(
-        "--deisotope-min-score",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="Minimum MSDeconV fit score to accept an isotope envelope. Default: 10.0.",
-    )
-    raw_grp.add_argument(
-        "--deisotope-averagine",
-        default=None,
-        choices=["peptide", "glycopeptide", "glycan", "heparin"],
-        metavar="MODEL",
-        help="Averagine model for isotope envelope prediction. Default: peptide.",
-    )
-    raw_grp.add_argument(
-        "--deisotope-scorer",
-        default=None,
-        choices=["MSDeconVFitter", "PenalizedMSDeconVFitter"],
-        metavar="SCORER",
-        help="ms_deisotope scoring function. Default: MSDeconVFitter.",
-    )
-    raw_grp.add_argument(
-        "--deisotope-charge-range",
-        type=int,
-        nargs=2,
-        default=None,
-        metavar=("MIN", "MAX"),
-        help="Charge range for deconvolution. Default: 1 1 (MALDI [M+H]+).",
-    )
-    raw_grp.add_argument(
-        "--filter-mass-defect",
-        action="store_true",
-        help=(
-            "Apply Senko-plot peptide corridor mass defect filter after interval "
-            "detection (profile mode only). Removes lipids and matrix clusters."
-        ),
-    )
-    raw_grp.add_argument(
-        "--mass-defect-halfwidth",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Half-width of the mass defect corridor. Default 0.5 passes all peaks "
-            "(effectively disabled). Use 0.15–0.20 for a meaningful peptide filter."
-        ),
-    )
-    raw_grp.add_argument(
-        "--picking-height",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Picking height for apex m/z centroid refinement (mMass-style). "
-            "The apex is reported as the midpoint of the two interpolated "
-            "crossing points at this fraction of the peak maximum. "
-            "Default 0.75 matches the mMass 75%% setting. Use 0.0 to disable "
-            "(raw smoothed-spectrum apex)."
-        ),
-    )
-    raw_grp.add_argument(
-        "--local-prominence-window-da",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "Half-width in Da of the sliding-window local maximum used as the "
-            "reference for the peak height threshold. When > 0, the threshold "
-            "for each peak is peak_prominence × local_max(±window) instead of "
-            "peak_prominence × global_max. This reduces the effective threshold "
-            "in low-signal m/z regions (e.g. >1600 Da) where genuine peptide "
-            "peaks would otherwise fall below the global threshold. "
-            "Default 0 (global max, disabled). Suggested value: 200."
         ),
     )
     raw_grp.add_argument(
@@ -820,6 +652,78 @@ def build_parser() -> argparse.ArgumentParser:
             "substitution only: minimum absolute mass shift in Da. Default: auto "
             "(matching_ppm × mh_mz / 1e6 per peptide). For single-residue substitution "
             "this threshold is always satisfied automatically (N↔D minimum is ~0.96 Da)."
+        ),
+    )
+    cand.add_argument(
+        "--substitution-mass-shift-max-da",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "substitution only: maximum absolute NET mass shift in Da; a substitution "
+            "exceeding it is rejected and resampled, so no decoy is lost. Default: unset "
+            "(no cap). H-fdr-10: a large shift leaves the decoy's elemental composition far "
+            "from its source target's, and the isotope-envelope features read composition, "
+            "so those decoys separate from targets for a construction reason rather than a "
+            "spectral one. Measured AUC 0.58-0.66 above ~120 Da against 0.50-0.53 below "
+            "(PROGRESS.md F-036). Two substitutions cannot exceed ~258 Da, so a cap above "
+            "that is a no-op."
+        ),
+    )
+    cand.add_argument(
+        "--substitution-residue-weighting",
+        choices=("uniform", "target_frequency"),
+        default=None,
+        help=(
+            "substitution only: how the replacement residue is drawn. 'uniform' "
+            "(default) draws evenly over the 18-letter alphabet, so every residue "
+            "appears 5.6%% of the time whatever its real abundance. "
+            "'target_frequency' draws from the empirical residue frequency of the "
+            "target peptides instead (H-decoy-15). Cys and Met are 2 of 18 letters "
+            "but only 1.4-1.8%% of real residues, so the uniform draw over-produces "
+            "sulfur by 6-8x and leaves decoys with twice the sulfur of targets; "
+            "features that read composition then partially read the target/decoy "
+            "label (PROGRESS.md F-036, F-042). Acts on every composition axis."
+        ),
+    )
+    cand.add_argument(
+        "--substitution-preserve-sulfur",
+        action="store_true",
+        default=None,
+        help=(
+            "substitution only: never substitute Cys or Met in or out, so every "
+            "decoy carries exactly its source target's sulfur count. Narrower than "
+            "--substitution-residue-weighting but exact on the axis that dominates "
+            "isotope-envelope shape. The two compose."
+        ),
+    )
+    cand.add_argument(
+        "--feature-mzs-keep",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Peak list naming the peaks to KEEP ion images for, produced by "
+            "scripts/prefilter_peaklist.py. Ion images are extracted at every m/z in "
+            "--feature-mzs, the on-tissue TIC mask is computed over all of them, and "
+            "only the peaks listed here are retained. Only 18-34%% of peaks are ever "
+            "matched by a candidate, so this cuts ion-image memory 3-5x with no change "
+            "to any feature. Do NOT pass the reduced list as --feature-mzs instead: the "
+            "mask is a sum over every peak and drops with them (PROGRESS.md F-048)."
+        ),
+    )
+    cand.add_argument(
+        "--protein-size-residualize",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Replace the size-driven protein-level features with size-free companions "
+            "(log_protein_n_features, protein_colocalization_n_partners, protein_coverage, "
+            "is_single_peptide_protein, protein_best_ratio -> *_sizeresid), ranking each "
+            "within bins of the protein's tryptic count. Default ON. In feature-list mode "
+            "targets and decoys match detected peaks at the same rate, so these features "
+            "mostly read how many peptides a protein HAS rather than whether it is present "
+            "(PROGRESS.md F-045). Use --no-protein-size-residualize to reproduce a run "
+            "from before E025."
         ),
     )
     cand.add_argument(
@@ -1133,6 +1037,72 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     rescore_grp.add_argument(
+        "--decoy-split",
+        action="store_true",
+        default=None,
+        help=(
+            "H-fdr-2 (Percolator-RESET, Freestone et al. 2025): split decoys into a "
+            "training half and a held-out half. The final reported FDR is always "
+            "estimated against the held-out half only, so the same decoy never both "
+            "teaches the discriminant and gets counted against it. Whether the seed "
+            "search and pseudo-label iteration ALSO see only the training half is "
+            "controlled by --decoy-split-final-only. {lda,svm,gbt,rbf_svm} backends "
+            "only. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--decoy-split-final-only",
+        action="store_true",
+        default=None,
+        help=(
+            "H-fdr-2b, only meaningful with --decoy-split. PROGRESS.md F-024: splitting "
+            "the decoy pool for the ENTIRE seed-search-and-training procedure (the "
+            "default when --decoy-split is set alone) costs more statistical power than "
+            "it buys back at small candidate counts. With this flag, the split applies "
+            "ONLY to the final reported FDR; the seed search and iteration loop use the "
+            "full, unsplit decoy pool, exactly as without --decoy-split at all. Disabled "
+            "by default (reproduces H-fdr-2's original full-split behaviour)."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--train-fdr-escalate",
+        action="store_true",
+        default=None,
+        help=(
+            "H-fdr-2: if init_fdr/train_fdr would otherwise yield zero pseudo-positives "
+            "at the seed step or a pseudo-label iteration, retry at increasing "
+            "thresholds (steps of 0.005, capped at 0.5) instead of giving up. A no-op "
+            "whenever the configured threshold already succeeds. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--pseudo-label-growth-cap",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "H-fdr-5: stop the self-training loop (keeping the previous iteration's "
+            "model) once the pseudo-positive count exceeds this multiple of the "
+            "initial seed size, regardless of convergence. Guards against the loop "
+            "amplifying a weak or leaking seed into a runaway positive set. Unset "
+            "(default) disables the cap."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--model-repeats",
+        type=int,
+        default=None,
+        metavar="INT",
+        help=(
+            "H-fdr-6: average the scores of this many independent replicate fits, "
+            "each with its own CV partition. The self-training loop does not converge, "
+            "so one fit's q-value floor is a draw rather than a property of the data -- "
+            "on kidney, twelve partitions gave 0 to 63 peptides at 5%% FDR with nothing "
+            "else changed. 1 (default) is a single fit and reproduces results predating "
+            "this."
+        ),
+    )
+    rescore_grp.add_argument(
         "--fragment-tol-da",
         type=float,
         default=None,
@@ -1191,7 +1161,34 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FLOAT",
         help=(
             "CCS filter threshold = multiplier × p95 |delta_CCS%%| on single-candidate "
-            "calibration matches. Analogous to --rt-window-multiplier. Default 2.0."
+            "calibration matches. Analogous to --rt-window-multiplier. Default 2.0. "
+            "Ignored when --ccs-window-pct is set."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--save-ion-images",
+        action="store_true",
+        default=None,
+        help=(
+            "Write the full ion-image array to 2_ion_images.npy. Off by default: nothing "
+            "in the pipeline reads it back, it is there for the notebooks, and it is the "
+            "largest thing a run writes (123 GB for her2 at min_regions=1). Leaving it on "
+            "filled the disk and killed four runs."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--ccs-window-pct",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Fixed CCS filter threshold in percent, overriding --ccs-window-multiplier. "
+            "The multiplier scales a p95 measured on whichever calibration peptides the "
+            "run has, and a denser peak list raises it (amyloidosis 3.18%% at "
+            "min_regions=2, 4.06%% at 1), so two runs cannot share a threshold unless it "
+            "is fixed. Keep it above the ground truth's own CCS error: the reachable "
+            "confirmed peptides need 1.84%% on amyloidosis, 1.45%% on her2, 0.90%% on "
+            "kidney (PROGRESS.md F-050)."
         ),
     )
     rescore_grp.add_argument(
@@ -1268,8 +1265,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Restrict colocalization to pixels that were actually rastered, using the "
             "pixel coordinate list from the MALDI data source rather than the TIC > 0 "
             "heuristic. Useful for partial-raster acquisitions where only a sub-region "
-            "of the slide was scanned. Supported for --maldi-raw/--maldi-d and "
-            "--maldi-imzml inputs; no-op for NPZ/m/z-list inputs."
+            "of the slide was scanned. Supported for --maldi-raw/--maldi-d inputs; "
+            "no-op for NPZ/m/z-list inputs."
         ),
     )
     rescore_grp.add_argument(
@@ -1308,6 +1305,21 @@ def build_parser() -> argparse.ArgumentParser:
             "rather than merely sharing a region average. Also emits a dominant-region-"
             "only variant (colocalization restricted to the single largest region). "
             "Experimental / unvalidated — see O3. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--cosine-coloc",
+        action="store_true",
+        default=None,
+        help=(
+            "Compute median-thresholded cosine within-protein colocalization features "
+            "(protein_colocalization_cosine*; PROGRESS.md H-feat-3/H-decoy-9). Each on-tissue "
+            "ion image is thresholded at its own median, then compared by cosine similarity — "
+            "Ovchinnikova et al. 2020 (ColocML) validated this at Spearman 0.794 against 42 "
+            "expert raters, matching a trained deep model. Takes only the observed ion images, "
+            "so it is safe by construction under every decoy method including mz_shuffle. "
+            "Requires ion images; protein-level, so also needs --use-protein-level-feats. "
+            "Disabled by default."
         ),
     )
     rescore_grp.add_argument(
@@ -1431,7 +1443,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="METHOD",
         help=(
             "CCS calibration strategy for IM2Deep predictions when observed CCS "
-            "values are provided (via --feature-mzs or --maldi-imzml). "
+            "values are provided (via --feature-mzs). "
             "'linear' applies a global additive shift (default); "
             "'spline' fits a piecewise spline for non-linear bias correction; "
             "'finetune' adapts the neural network weights to the observed MALDI CCS "
@@ -1500,9 +1512,10 @@ def main() -> None:
         "verbose", "storey_pi0", "lda_r2_median_filter",
         "only_main_features", "use_protein_level_feats", "match_ccs",
         "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc", "mob_protein_coloc",
-        "drop_zero_signal", "entrapment", "coloc_measured_mask",
-        "region_coloc", "within_region_coloc", "coloc_tic_normalize", "coloc_common_mode",
-        "substitution_no_collision_filter",
+        "drop_zero_signal", "entrapment", "coloc_measured_mask", "save_ion_images",
+        "region_coloc", "within_region_coloc", "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
+        "substitution_no_collision_filter", "decoy_split", "decoy_split_final_only",
+        "train_fdr_escalate", "substitution_preserve_sulfur",
     })
 
     # Only pass top-level configurable params (not file paths or extraction params)
@@ -1518,7 +1531,10 @@ def main() -> None:
         "decoy_method", "mz_shift_delta_min", "mz_shift_delta_max",
         "mz_shift_snap_tolerance_ppm", "max_shuffle_rounds", "decoy_target_ratio",
         "substitution_n_residues", "substitution_seed", "substitution_no_collision_filter",
-        "substitution_mass_shift_min_da", "substitution_collision_ppm",
+        "substitution_mass_shift_min_da", "substitution_mass_shift_max_da",
+        "substitution_collision_ppm",
+        "substitution_residue_weighting", "substitution_preserve_sulfur",
+        "protein_size_residualize", "feature_mzs_keep",
         "protein_fdr", "peptide_fdr", "lcms_id_format",
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
         "features_preset", "features_exclude", "seed_features",
@@ -1526,17 +1542,19 @@ def main() -> None:
         "max_iter", "init_fdr", "min_seed_positives",
         "matching_ppm", "fragment_tol_da", "winner_percentile",
         "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
-        "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_protein_coloc", "mob_window_multiplier",
+        "match_ccs", "ccs_window_multiplier", "ccs_window_pct", "mob_coloc", "mob_protein_coloc", "mob_window_multiplier",
         "mob_quality_mz_window_ppm", "mob_quality_k0_tol",
         "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
-        "coloc_tic_normalize", "coloc_common_mode",
+        "cosine_coloc", "coloc_tic_normalize", "coloc_common_mode",
+        "decoy_split", "decoy_split_final_only", "train_fdr_escalate", "pseudo_label_growth_cap",
+        "model_repeats",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
         "calibration_percentile", "maldi_query_raw", "raw_query_cache_dir",
         # file paths
         "fasta", "extra_fasta", "entrapment_fasta", "mzml",
-        "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d",
-        "feature_mzs", "save_npz", "save_spatial", "spatial_features",
+        "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_d",
+        "feature_mzs", "images_path", "image_batch_size", "save_npz", "save_spatial", "spatial_features",
         "lcms_peptides", "lcms_proteins", "lcms_psms", "msf",
         "debug_gt", "psm_utils_reader",
     )
@@ -1551,22 +1569,11 @@ def main() -> None:
 
     # Extraction params: config defaults overridden by non-None CLI args.
     _extraction = dict(_ms1cfg.get("maldi_extraction", {}))
-    _EXTRACTION_SCALAR_ATTRS = (
-        "ppm_bin", "extraction_ppm", "matching_ppm", "min_fraction",
-        "peak_prominence", "smoothing_window", "smoothing_polyorder",
-        "interval_ppm_tolerance", "min_interval_width_ppm", "baseline_window_ppm",
-        "calibrant_tol_ppm", "deisotope_error_ppm", "deisotope_min_score",
-        "deisotope_averagine", "deisotope_scorer", "deisotope_charge_range",
-        "mass_defect_halfwidth", "picking_height", "local_prominence_window_da",
-        "calibrant_mzs",
-    )
+    _EXTRACTION_SCALAR_ATTRS = ("extraction_ppm", "matching_ppm")
     for _attr in _EXTRACTION_SCALAR_ATTRS:
         _val = getattr(args, _attr, None)
         if _val is not None:
             _extraction[_attr] = _val
-    for _bkey in ("normalize_rms", "baseline_correction", "deisotope", "filter_mass_defect"):
-        if getattr(args, _bkey, False):
-            _extraction[_bkey] = True
 
     # Convenience aliases from config
     output_dir = _ms1cfg["output_dir"]
@@ -1593,7 +1600,10 @@ def main() -> None:
         stream=sys.stderr,
     )
     # Third-party loggers that emit excessive DEBUG noise regardless of user intent.
-    for _noisy in ("numba", "numba.core", "imzy", "koyo",
+    # `shap` is the worst of them: KernelExplainer logs its sampling weights per
+    # explained candidate, which was 2394 lines — 45% of a kidney run's log — all of it
+    # `subset_size = 1` and `weight_vector = array([...])` with nothing run-specific in it.
+    for _noisy in ("numba", "numba.core", "imzy", "koyo", "shap",
                    "matplotlib", "matplotlib.font_manager", "matplotlib.pyplot",
                    "matplotlib.backends", "PIL"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
@@ -1603,7 +1613,7 @@ def main() -> None:
         parser.error("--digest requires --fasta.")
 
     # Validate mutually exclusive MALDI inputs (argparse enforces CLI; check config too)
-    _maldi_input_keys = ("maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d")
+    _maldi_input_keys = ("maldi_npz", "maldi_mzs", "maldi_raw", "maldi_d")
     _active_maldi = [k for k in _maldi_input_keys if _ms1cfg.get(k)]
     if len(_active_maldi) > 1:
         parser.error(
@@ -1612,7 +1622,7 @@ def main() -> None:
     if len(_active_maldi) == 0:
         parser.error(
             "No MALDI input specified. Provide one of: --maldi-npz, --maldi-mzs, "
-            "--maldi-raw, --maldi-imzml, --maldi-d (or set the equivalent key in "
+            "--maldi-raw, --maldi-d (or set the equivalent key in "
             "the config file)."
         )
 
@@ -1634,7 +1644,6 @@ def main() -> None:
     _measured_pixel_mask: "np.ndarray | None" = None  # built when --coloc-measured-mask is set
 
     _maldi_raw_path: str | None = _ms1cfg.get("maldi_raw") or _ms1cfg.get("maldi_d")
-    _maldi_imzml_path: str | None = _ms1cfg.get("maldi_imzml")
     _feature_mzs_path: str | None = _ms1cfg.get("feature_mzs")
     _maldi_query_raw = bool(_ms1cfg.get("maldi_query_raw"))
     if _maldi_raw_path and _maldi_query_raw:
@@ -1645,6 +1654,17 @@ def main() -> None:
             "from %s at candidate m/z values during candidate generation.",
             _maldi_raw_path,
         )
+        logger.warning(
+            "Raw-query mode is SUPERSEDED by feature-list extraction and is kept "
+            "only to reproduce results predating it. It cannot produce negative "
+            "evidence (every candidate is 'observed' by construction, F-012), it "
+            "yields no target-decoy competition (0.00%% of features carry both a "
+            "target and a decoy, F-010), and its candidates are one per feature so "
+            "peptide-level FDR is a no-op. Use --feature-mzs with a peak list from "
+            "the TIMSImaging fork for new work."
+        )
+        _tic_image = None
+        _tic_n_features = None
         maldi_mzs = np.array([], dtype=np.float64)
         ion_images = None
         ion_image_mzs = None
@@ -1653,9 +1673,10 @@ def main() -> None:
         from msi_picasso.maldi_extraction import extract_maldi_data
 
         logger.info(
-            "MALDI features detected from raw data (detect_features). "
-            "LC-MS/MS identifications will be used for candidate generation and "
-            "prior features only, not for feature selection."
+            "Feature-list mode: ion images and spatial features are extracted at the "
+            "m/z values supplied via --feature-mzs (from the TIMSImaging fork's 2D "
+            "peak picking). LC-MS/MS identifications are used for candidate generation "
+            "and prior features only, not for feature selection."
         )
         precomputed_mzs = None
         if _feature_mzs_path:
@@ -1668,38 +1689,59 @@ def main() -> None:
                 sys.exit(1)
             logger.info(f"  {len(precomputed_mzs)} features loaded (skipping detection)")
 
+        _keep_mask = None
+        _keep_path = _ms1cfg.get("feature_mzs_keep")
+        if _keep_path and precomputed_mzs is not None:
+            try:
+                _keep_mzs, _, _ = _read_feature_mzs(_keep_path)
+            except Exception as exc:
+                logger.error(f"Could not read --feature-mzs-keep {_keep_path!r}: {exc}")
+                sys.exit(1)
+            # Match by nearest within a hair's breadth rather than by equality: a
+            # keep list written through a CSV can lose the last bit of a float
+            # (measured: 17 of 7842 kidney m/z off by ~5e-13). The tolerance is
+            # 1e-9 relative, about a thousandth of a ppm, far below any real peak
+            # spacing, so it identifies the same peak and nothing else.
+            _order = np.argsort(precomputed_mzs)
+            _srt = precomputed_mzs[_order]
+            _pos = np.clip(np.searchsorted(_srt, _keep_mzs), 1, len(_srt) - 1)
+            _left = np.abs(_keep_mzs - _srt[_pos - 1])
+            _right = np.abs(_keep_mzs - _srt[np.minimum(_pos, len(_srt) - 1)])
+            _near = np.where(_left <= _right, _pos - 1, np.minimum(_pos, len(_srt) - 1))
+            _dist = np.minimum(_left, _right)
+            _hit = _dist <= 1e-9 * np.abs(_keep_mzs)
+            _keep_mask = np.zeros(len(precomputed_mzs), dtype=bool)
+            _keep_mask[_order[_near[_hit]]] = True
+            _missing = int((~_hit).sum())
+            if _missing:
+                logger.error(
+                    "  %d of %d m/z in --feature-mzs-keep are absent from --feature-mzs. "
+                    "The two lists must come from the same peak-finding run.",
+                    _missing, len(_keep_mzs),
+                )
+                sys.exit(1)
+            logger.info(
+                "  Keeping ion images for %d of %d peaks (%.1f%%) from %s; the "
+                "on-tissue mask is still computed over all of them.",
+                int(_keep_mask.sum()), len(precomputed_mzs),
+                100.0 * _keep_mask.mean(), _keep_path,
+            )
+
         logger.info(f"Extracting MALDI features from raw data: {_maldi_raw_path}")
-        maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes, _raw_pixel_coords = extract_maldi_data(
+        (maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes,
+         _raw_pixel_coords, _tic_image, _tic_n_features) = extract_maldi_data(
             _maldi_raw_path,
             feature_mzs=precomputed_mzs,
-            ppm_bin=_extraction["ppm_bin"],
+            keep_mask=_keep_mask,
             extraction_ppm=_extraction["extraction_ppm"],
             matching_ppm=_extraction["matching_ppm"],
-            min_fraction=_extraction["min_fraction"],
-            peak_prominence=_extraction["peak_prominence"],
-            smoothing_window=_extraction["smoothing_window"],
-            smoothing_polyorder=_extraction["smoothing_polyorder"],
-            ppm_tolerance=_extraction["interval_ppm_tolerance"],
-            min_interval_width_ppm=_extraction["min_interval_width_ppm"],
-            normalize_rms=_extraction["normalize_rms"],
-            baseline_correction=_extraction["baseline_correction"],
-            baseline_window_ppm=_extraction["baseline_window_ppm"],
-            calibrant_mzs=_extraction["calibrant_mzs"],
-            calibrant_tol_ppm=_extraction["calibrant_tol_ppm"],
-            deisotope=_extraction["deisotope"],
-            deisotope_averagine=_extraction["deisotope_averagine"],
-            deisotope_scorer=_extraction["deisotope_scorer"],
-            deisotope_min_score=_extraction["deisotope_min_score"],
-            deisotope_charge_range=tuple(_extraction["deisotope_charge_range"]),
-            deisotope_error_ppm=_extraction["deisotope_error_ppm"],
-            filter_mass_defect=_extraction["filter_mass_defect"],
-            mass_defect_halfwidth=_extraction["mass_defect_halfwidth"],
-            picking_height=_extraction["picking_height"],
-            local_prominence_window_da=_extraction["local_prominence_window_da"],
+            images_path=_ms1cfg.get("images_path"),
+            image_batch_size=_ms1cfg.get("image_batch_size") or 100,
             output_npz=_ms1cfg.get("save_npz"),
             output_spatial_tsv=_ms1cfg.get("save_spatial"),
             output_dir=output_dir,
             verbose=verbose,
+            save_ion_images=bool(_ms1cfg.get("save_ion_images", False)),
         )
         ion_image_mzs = maldi_mzs if ion_images is not None else None
         logger.info(
@@ -1711,78 +1753,6 @@ def main() -> None:
             _H, _W = ion_images.shape[1], ion_images.shape[2]
             _measured_pixel_mask = np.zeros(_H * _W, dtype=bool)
             _measured_pixel_mask[np.asarray(_yc, dtype=np.int64) * _W + np.asarray(_xc, dtype=np.int64)] = True
-            logger.info(f"  Measured-pixel mask: {int(_measured_pixel_mask.sum())}/{_measured_pixel_mask.size} pixels rastered")
-    elif _maldi_imzml_path:
-        from msi_picasso.maldi_imzml import (
-            SCiLSConfig, extract_scils_features,
-            reconstruct_ion_images_from_intervals, build_envelopes_from_intervals,
-        )
-
-        logger.info(
-            "MALDI features extracted from imzML data (SCiLS Lab-style interval extraction). "
-            "Ion images reconstructed from interval intensity matrix."
-        )
-        logger.info(f"Extracting MALDI features from imzML: {_maldi_imzml_path}")
-        cfg = SCiLSConfig(
-            min_pixel_fraction=_extraction["min_fraction"],
-            peak_prominence=_extraction["peak_prominence"],
-            smoothing_window=_extraction["smoothing_window"],
-            smoothing_polyorder=_extraction["smoothing_polyorder"],
-            ppm_tolerance=_extraction["interval_ppm_tolerance"],
-            min_interval_width_ppm=_extraction["min_interval_width_ppm"],
-            normalize_rms=_extraction["normalize_rms"],
-            baseline_correction=_extraction["baseline_correction"],
-            baseline_window_ppm=_extraction["baseline_window_ppm"],
-            calibrant_mzs=_extraction.get("calibrant_mzs") or [],
-            calibrant_tol_ppm=_extraction["calibrant_tol_ppm"],
-            deisotope=_extraction["deisotope"],
-            deisotope_averagine=_extraction["deisotope_averagine"],
-            deisotope_scorer=_extraction["deisotope_scorer"],
-            deisotope_min_score=_extraction["deisotope_min_score"],
-            deisotope_charge_range=tuple(_extraction["deisotope_charge_range"]),
-            deisotope_error_ppm=_extraction["deisotope_error_ppm"],
-            filter_mass_defect=_extraction["filter_mass_defect"],
-            mass_defect_halfwidth=_extraction["mass_defect_halfwidth"],
-            picking_height=_extraction["picking_height"],
-            local_prominence_window_da=_extraction["local_prominence_window_da"],
-        )
-        intervals, intensity_matrix, pixel_coords, mean_1_over_k0 = extract_scils_features(
-            _maldi_imzml_path,
-            config=cfg,
-            output_dir=output_dir,
-            visualize=False,
-        )
-        maldi_mzs = np.array([apex for _, _, apex in intervals])
-
-        # Reconstruct 3D ion images from the flat interval intensity matrix
-        ion_images = reconstruct_ion_images_from_intervals(
-            intensity_matrix, pixel_coords, len(intervals)
-        )
-        ion_image_mzs = maldi_mzs if len(intervals) > 0 else None
-        extra_ion_images = None  # adduct images unavailable from pre-integrated intervals
-
-        # Compute spatial features from reconstructed ion images
-        if len(intervals) > 0:
-            from msi_picasso.maldi_extraction import compute_spatial_features as _csf
-            spatial_features = _csf(ion_images, maldi_mzs, len(pixel_coords))
-
-        # Build approximate isotope envelopes from interval mean intensities
-        maldi_envelopes = build_envelopes_from_intervals(intervals, intensity_matrix)
-
-        logger.info(
-            f"  {len(maldi_mzs)} intervals extracted"
-            + (f", ion images {ion_images.shape[1:]}" if len(intervals) > 0 else "")
-        )
-        if mean_1_over_k0 is not None and len(mean_1_over_k0) == len(maldi_mzs):
-            from msi_picasso.maldi_imzml import one_over_k0_to_ccs
-            _ccs_arr = one_over_k0_to_ccs(mean_1_over_k0, maldi_mzs)
-            logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
-        if bool(_ms1cfg.get("coloc_measured_mask", False)) and ion_images is not None and len(intervals) > 0:
-            _coords_arr = np.asarray(pixel_coords, dtype=np.int64)
-            _xs_c, _ys_c = _coords_arr[:, 0], _coords_arr[:, 1]
-            _H, _W = ion_images.shape[1], ion_images.shape[2]
-            _measured_pixel_mask = np.zeros(_H * _W, dtype=bool)
-            _measured_pixel_mask[_ys_c * _W + _xs_c] = True
             logger.info(f"  Measured-pixel mask: {int(_measured_pixel_mask.sum())}/{_measured_pixel_mask.size} pixels rastered")
     else:
         maldi_mzs, ion_images, ion_image_mzs, _ccs_arr, extra_ion_images, _mzs_intensities = _load_maldi(
@@ -1946,6 +1916,8 @@ def main() -> None:
         storey_pi0=_ms1cfg["storey_pi0"],
         only_main_features=_ms1cfg["only_main_features"],
         lcms_proteins_path=_ms1cfg.get("lcms_proteins"),
+        tic_image=_tic_image,
+        tic_n_features=_tic_n_features,
         lcms_peptides_path=lcms_peptides_path,
         lcms_psms_path=_ms1cfg.get("lcms_psms"),
         lcms_id_format=lcms_id_format,
@@ -1994,6 +1966,7 @@ def main() -> None:
         spatial_prior_weight=_ms1cfg["spatial_prior_weight"],
         match_ccs=bool(_ms1cfg.get("match_ccs", False)),
         ccs_window_multiplier=_ms1cfg["ccs_window_multiplier"],
+        ccs_window_pct=_ms1cfg.get("ccs_window_pct"),
         tdf_path=_maldi_raw_path,
         mob_coloc=bool(_ms1cfg.get("mob_coloc", False)),
         mob_protein_coloc=bool(_ms1cfg.get("mob_protein_coloc", False)),
@@ -2007,12 +1980,22 @@ def main() -> None:
         region_coloc=bool(_ms1cfg.get("region_coloc", False)),
         region_coloc_k=_ms1cfg["region_coloc_k"],
         within_region_coloc=bool(_ms1cfg.get("within_region_coloc", False)),
+        cosine_coloc=bool(_ms1cfg.get("cosine_coloc", False)),
+        decoy_split=bool(_ms1cfg.get("decoy_split", False)),
+        decoy_split_final_only=bool(_ms1cfg.get("decoy_split_final_only", False)),
+        train_fdr_escalate=bool(_ms1cfg.get("train_fdr_escalate", False)),
+        pseudo_label_growth_cap=_ms1cfg.get("pseudo_label_growth_cap"),
+        model_repeats=_ms1cfg.get("model_repeats", 1),
         drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),
         entrapment=bool(_ms1cfg.get("entrapment", False)),
         substitution_n_residues=_ms1cfg["substitution_n_residues"],
         substitution_seed=_ms1cfg["substitution_seed"],
         substitution_collision_filter=not bool(_ms1cfg.get("substitution_no_collision_filter", False)),
         substitution_mass_shift_min_da=_ms1cfg.get("substitution_mass_shift_min_da"),
+        substitution_mass_shift_max_da=_ms1cfg.get("substitution_mass_shift_max_da"),
+        substitution_residue_weighting=_ms1cfg.get("substitution_residue_weighting"),
+        substitution_preserve_sulfur=_ms1cfg.get("substitution_preserve_sulfur"),
+        protein_size_residualize=_ms1cfg.get("protein_size_residualize", True),
         substitution_collision_ppm=_ms1cfg.get("substitution_collision_ppm"),
     )
 
@@ -2024,30 +2007,33 @@ def main() -> None:
     _write_results(result_df, output_dir)
     if gt_peptides and "is_tdc_winner" in result_df.columns:
         gt_set = set(gt_peptides)
-        winners = result_df[result_df["is_tdc_winner"] & ~result_df["is_decoy"].astype(bool)]
-        n_gt_winners = winners.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
+        is_target = ~result_df["is_decoy"].astype(bool)
+        winners = result_df[result_df["is_tdc_winner"] & is_target]
         logger.info(
-            "%d/%d GT peptides are round-2 (feature-level) winners.",
-            n_gt_winners, len(gt_set),
+            "%d/%d GT peptides are feature-level winners.",
+            winners.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum(),
+            len(gt_set),
         )
-        winners_fdr = winners[winners['reweighted_q_value'] <= 0.01]
-        n_gt_winners_fdr = winners_fdr.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
-        logger.info(
-            "%d/%d GT peptides are round-2 winners at 1%% FDR.",
-            n_gt_winners_fdr, len(gt_set),
-        )
-        winners_fdr_5 = winners[winners['reweighted_q_value'] <= 0.05]
-        n_gt_winners_fdr_5 = winners_fdr_5.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
-        logger.info(
-            "%d/%d GT peptides are round-2 winners at 5%% FDR.",
-            n_gt_winners_fdr_5, len(gt_set),
-        )
-        winners_fdr_10 = winners[winners['reweighted_q_value'] <= 0.10]
-        n_gt_winners_fdr_10 = winners_fdr_10.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
-        logger.info(
-            "%d/%d GT peptides are round-2 winners at 10%% FDR.",
-            n_gt_winners_fdr_10, len(gt_set),
-        )   
+
+        # Report GT recovery on the SAME population the reported ID count uses.
+        # F-029 moved ID counting to peptide level but left this block at feature
+        # level, so every log from E015 on printed the two on different footings.
+        # amyloidosis E018 read 7/10 GT at 1% FDR against E016's 8/10 -- looking
+        # like GT had been lost while the count rose, which PROGRESS.md sec.1 calls a
+        # red flag for an over-optimistic FDR. At peptide level the same two runs
+        # give 6/10 and 7/10: GT rose with the count. See PROGRESS.md F-034.
+        if "is_peptide_winner" in result_df.columns:
+            pep_col, q_col, level = "is_peptide_winner", "peptide_q_value", "peptide-level"
+        else:
+            pep_col, q_col, level = "is_tdc_winner", "reweighted_q_value", "feature-level"
+        reported = result_df[result_df[pep_col] & is_target]
+        for alpha in (0.01, 0.05, 0.10):
+            passing = reported[reported[q_col] <= alpha].drop_duplicates(subset=["peptide"])
+            logger.info(
+                "%d/%d GT peptides at %g%% FDR (%s, same population as the reported "
+                "ID count).",
+                passing["peptide"].isin(gt_set).sum(), len(gt_set), alpha * 100, level,
+            )
     logger.info("Done.")
 
 

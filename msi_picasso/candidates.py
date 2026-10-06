@@ -1,6 +1,7 @@
 """FASTA digest, decoy generation, and MALDI m/z matching."""
 
 import bisect
+import collections
 import hashlib
 import logging
 import random
@@ -31,6 +32,61 @@ _AA_RESIDUE_MASSES: dict[str, float] = {
     "N": 114.04293, "Q": 128.05858,
 }
 _SUB_ALPHABET: tuple[str, ...] = tuple(sorted(_AA_RESIDUE_MASSES))  # 18 AAs, no K/R
+
+# The two sulfur-carrying residues. Sulfur dominates isotope-envelope shape, so it is
+# the composition axis the ranker is most sensitive to (PROGRESS.md F-036, F-042).
+_SULFUR_RESIDUES: frozenset[str] = frozenset("CM")
+
+
+def target_rows(peptide_db):
+    """The target rows every decoy generator is fed. Drop decoys, change nothing else.
+
+    Use this rather than re-filtering by hand. Decoy placement consumes one RNG draw
+    per row and avoids m/z already taken, so altering the row set -- de-duplicating
+    peptides, restricting to a peak m/z range -- shifts the entire decoy stream, not
+    just the rows removed. ``scripts/prefilter_peaklist.py`` re-implemented this with
+    two extra filters and silently produced a different decoy set (PROGRESS.md F-049).
+    """
+    return peptide_db[~peptide_db["is_decoy"].astype(bool)].reset_index(drop=True)
+
+
+def _residue_frequencies(peptides) -> dict[str, float] | None:
+    """Empirical frequency of each substitutable residue in a peptide set.
+
+    H-decoy-15. `rng.choice(pool)` draws uniformly over the 18-letter alphabet, so
+    every residue is produced 5.6% of the time whatever its real abundance. Cys and
+    Met together are 11.1% of a uniform draw against 1.4-1.8% of the residues in
+    these datasets' own target peptides, which is a 6-8x over-production and the
+    whole source of the decoys' doubled sulfur content (PROGRESS.md F-042). Drawing
+    from these weights instead removes the asymmetry at its source, and does so on
+    every composition axis at once rather than only on sulfur.
+
+    Returns None when the peptide set carries no substitutable residue at all, in
+    which case the caller falls back to the uniform draw.
+    """
+    counts: collections.Counter = collections.Counter()
+    for pep in peptides:
+        counts.update(pep)
+    total = sum(counts[aa] for aa in _SUB_ALPHABET)
+    if total <= 0:
+        return None
+    return {aa: counts[aa] / total for aa in _SUB_ALPHABET}
+
+
+def _draw_replacement(rng, pool: list[str], weights: dict[str, float] | None) -> str:
+    """Pick one replacement residue from `pool`, weighted by `weights` if given.
+
+    `pool` is already filtered to the residues that satisfy this substitution's mass
+    constraints, so the weights are renormalised over what survived. Falls back to a
+    uniform draw when every surviving residue has zero weight, which keeps a decoy
+    that would otherwise be lost.
+    """
+    if weights is None:
+        return str(rng.choice(pool))
+    w = np.array([weights.get(aa, 0.0) for aa in pool], dtype=float)
+    if not np.isfinite(w).all() or w.sum() <= 0:
+        return str(rng.choice(pool))
+    return str(rng.choice(pool, p=w / w.sum()))
 
 
 def _assign_mass_columns(df, sequences=None, log=False):
@@ -697,12 +753,15 @@ def generate_substitution_candidates(
     n_residues: int = 1,
     random_seed: int = 42,
     mass_shift_min_da: float | None = None,
+    mass_shift_max_da: float | None = None,
     collision_filter: bool = True,
     collision_ppm: float | None = None,
     snap_to_features: bool = False,
     maldi_intensities: np.ndarray | None = None,
     maldi_intensities_p90: np.ndarray | None = None,
     maldi_intensities_sum: np.ndarray | None = None,
+    residue_weighting: str = "uniform",
+    preserve_sulfur: bool = False,
 ) -> pd.DataFrame:
     """
     Generate sequence-space substitution decoys and return a combined
@@ -725,7 +784,36 @@ def generate_substitution_candidates(
     of the MD5 hash of the peptide sequence.  K and R are excluded from both the
     substitution alphabet and the substitution targets to preserve tryptic cleavage.
     The L/I isobaric pair (both 113.084 Da) is handled automatically by excluding
-    any replacement with the same residue mass as the current residue.
+    any replacement with the same replacement mass as the current residue.
+
+    **Elemental composition is NOT preserved, and that has consequences** — see
+    invariant 3 in CLAUDE.md, and PROGRESS.md F-003, F-036 and F-042. Two options
+    control how far the decoys' composition is allowed to drift from the targets',
+    both off by default so that every result predating them reproduces exactly:
+
+    ``residue_weighting``
+        ``"uniform"`` (default) draws the replacement residue uniformly over the
+        18-letter alphabet, so each residue appears 5.6% of the time whatever its
+        real abundance.  ``"target_frequency"`` draws it from the empirical residue
+        frequency of the target peptides instead (H-decoy-15).  This matters because
+        Cys and Met are 2 of 18 letters but only 1.4-1.8% of the residues in real
+        peptides, so the uniform draw over-produces sulfur by 6-8x and gives decoys
+        roughly twice the sulfur content of targets.  Features that read composition
+        then partially read the target/decoy label with no spectral evidence
+        involved: F-036 measured that for the isotope-envelope family, F-042 for
+        four more ranker features.  Weighting acts on every composition axis, not
+        only sulfur.
+
+    ``preserve_sulfur``
+        When True, Cys and Met are removed from the substitution alphabet *and*
+        positions already holding one are removed from the eligible set, so a decoy
+        carries exactly its source target's sulfur count.  Narrower than the
+        weighting above but exact on the axis that dominates isotope-envelope shape.
+        The two compose, and using both is the strongest available guarantee.
+
+    Composition symmetry is a property of the decoys and is cheap to check directly:
+    compare mean ``n_S`` between the classes on the returned frame, or run
+    ``scripts/audit_composition_leak.py`` on a finished run.
 
     LC-MS/MS evidence columns are wiped for decoy rows: p′ is a fictional sequence
     not present in the LC-MS/MS run, so inheriting evidence would break TDC symmetry.
@@ -748,6 +836,38 @@ def generate_substitution_candidates(
     )
     n_unique = len(unique_pep)
     target_mzs_sorted = np.sort(unique_pep["mh_mz"].values.astype(np.float64))
+
+    # Composition-symmetry options (H-decoy-15 / F-042). Both narrow what may be
+    # substituted, so they are resolved once here rather than per peptide.
+    if residue_weighting not in ("uniform", "target_frequency"):
+        raise ValueError(
+            f"residue_weighting must be 'uniform' or 'target_frequency', "
+            f"got {residue_weighting!r}"
+        )
+    sub_alphabet = tuple(
+        aa for aa in _SUB_ALPHABET if not (preserve_sulfur and aa in _SULFUR_RESIDUES)
+    )
+    residue_weights = (
+        _residue_frequencies(unique_pep["peptide"].astype(str))
+        if residue_weighting == "target_frequency" else None
+    )
+    if residue_weighting == "target_frequency" and residue_weights is None:
+        logger.warning(
+            "substitution: residue_weighting='target_frequency' requested but the "
+            "target peptides carry no substitutable residue; falling back to uniform"
+        )
+    if residue_weights is not None:
+        _sulfur_freq = sum(residue_weights.get(aa, 0.0) for aa in _SULFUR_RESIDUES)
+        logger.info(
+            "substitution: drawing replacements from the target residue frequency "
+            "(C+M %.2f%% of target residues against %.2f%% under a uniform draw)",
+            100.0 * _sulfur_freq, 100.0 * len(_SULFUR_RESIDUES) / len(_SUB_ALPHABET),
+        )
+    if preserve_sulfur:
+        logger.info(
+            "substitution: preserving sulfur — C and M are neither substituted in "
+            "nor out, so every decoy carries its source target's sulfur count"
+        )
 
     used_decoy_mz: list[float] = []
     next_decoy_idx = n_features
@@ -780,8 +900,14 @@ def generate_substitution_candidates(
         upshift = bool(int.from_bytes(_digest[8:12], "little") % 2 == 0)
         rng = np.random.default_rng(random_seed ^ _pep_hash_int)
 
-        # Eligible positions: interior (index 1..L-2), non-K/R
-        eligible = [pos for pos in range(1, L - 1) if peptide[pos] not in "KR"]
+        # Eligible positions: interior (index 1..L-2), non-K/R, and with
+        # preserve_sulfur also not already holding a C or M, so sulfur cannot be
+        # substituted out any more than it can be substituted in.
+        eligible = [
+            pos for pos in range(1, L - 1)
+            if peptide[pos] not in "KR"
+            and not (preserve_sulfur and peptide[pos] in _SULFUR_RESIDUES)
+        ]
         if len(eligible) < n_residues:
             logger.debug(
                 "substitution: skipping '%s' — %d eligible positions, need %d",
@@ -809,7 +935,7 @@ def generate_substitution_candidates(
                         if current_mass is None:
                             continue
                         sub_pool = [
-                            aa for aa in _SUB_ALPHABET
+                            aa for aa in sub_alphabet
                             if aa != current_aa and _AA_RESIDUE_MASSES[aa] != current_mass
                         ]
                         up_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] > current_mass]
@@ -819,7 +945,7 @@ def generate_substitution_candidates(
                         )
                         if not pool:
                             continue
-                        replacement = str(rng.choice(pool))
+                        replacement = _draw_replacement(rng, pool, residue_weights)
                         mass_delta = _AA_RESIDUE_MASSES[replacement] - current_mass
                         approx_mhz = orig_mhz + mass_delta
 
@@ -828,6 +954,14 @@ def generate_substitution_candidates(
                             else matching_ppm * orig_mhz / 1e6
                         )
                         if abs(mass_delta) < min_shift:
+                            continue
+                        # Upper bound: H-fdr-10. A large shift leaves the decoy with a
+                        # composition far from its source target's, and the isotope-envelope
+                        # features read composition, so those decoys separate from targets for
+                        # a construction reason rather than a spectral one (PROGRESS.md F-036:
+                        # AUC 0.58-0.66 above ~120 Da, against 0.50-0.53 below). Rejecting
+                        # here resamples the substitution rather than dropping the decoy.
+                        if mass_shift_max_da is not None and abs(mass_delta) > mass_shift_max_da:
                             continue
 
                         if collision_filter:
@@ -889,7 +1023,7 @@ def generate_substitution_candidates(
                         if current_mass is None:
                             continue
                         sub_pool = [
-                            aa for aa in _SUB_ALPHABET
+                            aa for aa in sub_alphabet
                             if aa != current_aa and _AA_RESIDUE_MASSES[aa] != current_mass
                         ]
                         up_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] > current_mass]
@@ -899,7 +1033,7 @@ def generate_substitution_candidates(
                         )
                         if not pool:
                             continue
-                        replacement = str(rng.choice(pool))
+                        replacement = _draw_replacement(rng, pool, residue_weights)
                         delta = _AA_RESIDUE_MASSES[replacement] - current_mass
                         seq[pos] = replacement
                         net_delta += delta
@@ -929,6 +1063,15 @@ def generate_substitution_candidates(
                     logger.debug(
                         "substitution: '%s' net shift %.4f Da < min %.4f Da — retrying",
                         peptide, abs(net_delta), min_shift,
+                    )
+                    continue
+                # See the matching guard above: H-fdr-10 / F-036. This is the binding one,
+                # since it is the NET shift across all substituted residues that determines
+                # how far the decoy's composition has moved from its source target's.
+                if mass_shift_max_da is not None and abs(net_delta) > mass_shift_max_da:
+                    logger.debug(
+                        "substitution: '%s' net shift %.4f Da > max %.4f Da — retrying",
+                        peptide, abs(net_delta), mass_shift_max_da,
                     )
                     continue
 

@@ -15,7 +15,7 @@ import pandas as pd
 
 from msi_picasso.utils import (
     AVERAGINE_C, AVERAGINE_H, AVERAGINE_N, AVERAGINE_O,
-    NEUTRON, theoretical_isotope_distribution,
+    NEUTRON, PROTON, theoretical_isotope_distribution,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,6 +250,7 @@ def compute_spatial_features(
 def compute_tissue_mask(
     ion_images: np.ndarray,
     tic_quantile: float = 0.0,
+    tic_image: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Build an on-tissue pixel mask from a total-ion-current (TIC) proxy.
@@ -262,7 +263,14 @@ def compute_tissue_mask(
     co-distribution within the tissue.  Restricting the correlation to
     on-tissue pixels removes that common component.
 
-    The TIC proxy is the per-pixel sum over all supplied ion images.  Pixels
+    The TIC proxy is the per-pixel sum over all supplied ion images. ``tic_image``
+    overrides that with a sum computed elsewhere, which is what lets the caller
+    keep ion images for only the peaks a candidate matched: the mask must still be
+    built from **every** extracted peak, matched or not, or the tissue outline it
+    traces changes and every masked correlation moves with it. Measured when this
+    was got wrong: dropping the 78% of kidney peaks that no candidate matches
+    shifted the whole protein_colocalization_* family on ~100% of rows, by a median
+    of 0.07% to 20% depending on the feature.  Pixels
     with TIC == 0 are unmeasured padding and are always excluded.  When
     ``tic_quantile > 0`` the threshold is raised to that quantile of the
     measured-pixel TIC, additionally trimming low-signal tissue edges.
@@ -278,8 +286,16 @@ def compute_tissue_mask(
     -------
     (H*W,) boolean mask over flattened pixels (True = on-tissue / keep).
     """
-    n_feat = ion_images.shape[0]
-    tic = ion_images.reshape(n_feat, -1).sum(axis=0)
+    if tic_image is not None:
+        tic = np.asarray(tic_image, dtype=np.float64).reshape(-1)
+        if ion_images is not None and tic.size != int(np.prod(ion_images.shape[1:])):
+            raise ValueError(
+                f"tic_image has {tic.size} pixels but ion images have "
+                f"{int(np.prod(ion_images.shape[1:]))}"
+            )
+    else:
+        n_feat = ion_images.shape[0]
+        tic = ion_images.reshape(n_feat, -1).sum(axis=0)
     measured = tic > 0
     if tic_quantile and tic_quantile > 0.0 and measured.any():
         thr = float(np.quantile(tic[measured], tic_quantile))
@@ -293,6 +309,8 @@ def _pearson_r_matrix(
     pixel_mask: np.ndarray | None = None,
     tic_normalize: bool = False,
     common_mode_removal: bool = False,
+    full_tic: np.ndarray | None = None,
+    full_n_features: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Compute the full (n_valid × n_valid) Pearson correlation matrix.
@@ -341,11 +359,36 @@ def _pearson_r_matrix(
         # ion_images; the in-place transforms below must not mutate the caller's
         # array).
         flat_all = flat_all.astype(np.float32, copy=True)
+        # Both transforms are per-pixel aggregates ACROSS features, so they read every
+        # image, not just the ones being correlated. When ``ion_images`` has been
+        # reduced to the peaks candidates matched (``keep_mask``), computing them here
+        # would silently use the reduced set and shift every r. ``full_tic`` carries
+        # the per-pixel sum over all extracted peaks so the result matches a full run.
+        # Same reasoning as compute_tissue_mask; PROGRESS.md F-048.
+        full_col_tic = None
+        if full_tic is not None:
+            full_col_tic = np.asarray(full_tic, dtype=np.float32).reshape(-1)
+            if pixel_mask is not None:
+                full_col_tic = full_col_tic[np.asarray(pixel_mask, dtype=bool)]
+            if full_col_tic.size != flat_all.shape[1]:
+                raise ValueError(
+                    f"full_tic has {full_col_tic.size} pixels but the correlation uses "
+                    f"{flat_all.shape[1]}"
+                )
+            full_col_tic = full_col_tic[None, :]
+        n_full = int(full_n_features) if full_n_features else flat_all.shape[0]
         if tic_normalize:
-            col_tic = flat_all.sum(axis=0, keepdims=True)
+            col_tic = full_col_tic if full_col_tic is not None else flat_all.sum(axis=0, keepdims=True)
             np.divide(flat_all, col_tic, out=flat_all, where=col_tic > 0)
         if common_mode_removal:
-            flat_all -= flat_all.mean(axis=0, keepdims=True)
+            if full_col_tic is None:
+                flat_all -= flat_all.mean(axis=0, keepdims=True)
+            elif tic_normalize:
+                # Post-normalisation each pixel sums to 1 over the full set, so the
+                # common mode is the constant 1/n and per-image centring removes it.
+                flat_all -= np.float32(1.0 / n_full)
+            else:
+                flat_all -= full_col_tic / np.float32(n_full)
 
     stds = flat_all.std(axis=1)
     valid_mask = stds > 1e-10
@@ -367,6 +410,57 @@ def _pearson_r_matrix(
 
     mz_to_idx = {float(mz): i for i, mz in enumerate(valid_mz_arr)}
     return corr_matrix, valid_mz_arr, mz_to_idx
+
+
+def _median_thresholded_cosine_matrix(
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Full (n_valid x n_valid) median-thresholded cosine similarity matrix
+    (Ovchinnikova et al. 2020, ColocML — median-thresholded cosine scored
+    Spearman 0.794 against 42 expert raters, matching a trained deep model
+    with a one-line metric; see PROGRESS.md H-feat-3).
+
+    Each on-tissue image is thresholded at its OWN median (values <= the
+    image's median are zeroed, keeping only its above-median signal), then
+    L2-normalised; the pairwise similarity is the cosine of the thresholded
+    vectors. This asks whether two images' *bright regions* overlap, which is
+    a different (and per Ovchinnikova et al., better-validated) question than
+    Pearson r's "do the raw intensities co-vary everywhere".
+
+    Contract matches ``_pearson_r_matrix`` exactly so it plugs directly into
+    ``_aggregate_protein_pairwise_corr``. Takes only the observed ion images —
+    no candidate mass, composition, or ``is_decoy`` — so it is safe by
+    construction under every decoy method, including ``mz_shuffle`` (no
+    F-020-style construction-leak vector exists for it to be audited for).
+    """
+    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
+    n_feat = len(mz_arr)
+    n_pix = ion_images.shape[1] * ion_images.shape[2]
+
+    flat_all = ion_images.reshape(n_feat, n_pix)
+    if pixel_mask is not None:
+        flat_all = flat_all[:, np.asarray(pixel_mask, dtype=bool)]
+
+    X = flat_all.astype(np.float32, copy=True)
+    medians = np.median(X, axis=1, keepdims=True)
+    X[X <= medians] = 0.0
+
+    stds = X.std(axis=1)
+    valid_mask = stds > 1e-10
+    valid_mz_arr = mz_arr[valid_mask]
+
+    X = X[valid_mask]
+    norms = np.sqrt((X * X).sum(axis=1, keepdims=True))
+    X /= np.where(norms > 1e-10, norms, 1.0)
+
+    cos_matrix = X @ X.T
+    del X
+
+    mz_to_idx = {float(mz): i for i, mz in enumerate(valid_mz_arr)}
+    return cos_matrix, valid_mz_arr, mz_to_idx
 
 
 def _find_partner_indices(
@@ -603,6 +697,46 @@ def _aggregate_protein_pairwise_corr(
     for col in cols:
         df[col] = df[col].fillna(fill_value)
     return df
+
+
+_COSINE_COLOC_COLS = [
+    "protein_colocalization_cosine",
+    "protein_colocalization_cosine_max",
+    "protein_colocalization_cosine_median",
+]
+
+
+def compute_cosine_colocalization_features(
+    df: pd.DataFrame,
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+    _corr_cache: tuple | None = None,
+) -> pd.DataFrame:
+    """Within-protein median-thresholded cosine colocalization (opt-in, ``--cosine-coloc``).
+
+    Mirrors ``compute_colocalization_features`` but the pairwise quantity is
+    the median-thresholded cosine similarity of the raw ion images (see
+    ``_median_thresholded_cosine_matrix``) instead of Pearson r. Ovchinnikova
+    et al. (2020, ColocML) validated this metric against 42 expert raters
+    (Spearman 0.794, matching a trained deep model) as a replacement for
+    Pearson-plus-TIC-mask colocalization (PROGRESS.md H-feat-3).
+
+    Features added: ``protein_colocalization_cosine`` (mean), ``_max``,
+    ``_median`` — the within-protein mean/max/median pairwise cosine
+    similarity. Pass ``_corr_cache`` (the return of
+    ``_median_thresholded_cosine_matrix``) to reuse one already computed for
+    the same ion images.
+    """
+    if _corr_cache is not None:
+        cos_matrix, valid_mz_arr, mz_to_idx = _corr_cache
+    else:
+        cos_matrix, valid_mz_arr, mz_to_idx = _median_thresholded_cosine_matrix(
+            ion_images, ion_image_mzs, pixel_mask=pixel_mask,
+        )
+    return _aggregate_protein_pairwise_corr(
+        df, cos_matrix, valid_mz_arr, mz_to_idx, "protein_colocalization_cosine",
+    )
 
 
 def _region_profile_corr_matrix(
@@ -931,6 +1065,35 @@ def compute_within_region_colocalization_features(
     return df
 
 
+# Columns set in the "MALDI envelope comparison" block below: candidate's OWN theoretical
+# isotope pattern (from its OWN mass) compared against the OBSERVED envelope at feature_mz.
+# Under mz_shuffle, feature_mz is the co-located TARGET's feature, not the decoy's own mass
+# — and the derangement deliberately creates a large mass-rank gap (PROGRESS.md F-020
+# measured median 429-480 Da, up to 2109 Da). Isotope envelope shape scales with mass, so
+# these leak the mass-gap construction artifact under mz_shuffle at Spearman 0.70-0.80
+# (theo_isotope_kl), the same class of trivial "small error = target, huge error = decoy"
+# leak ppm_error is deliberately protected against (see candidates.py,
+# generate_mz_shuffle_candidates docstring, and pipeline.py's mz_shuffle exclusion).
+# Excluded from the ranker under mz_shuffle by pipeline._mz_shuffle_leaking_features.
+#
+# averagine_deviation / averagine_deviation_sulfur / monoisotopic_confidence are NOT in this
+# set: they compare the candidate's own theoretical pattern against a generic averagine
+# model or against itself, never against maldi_envelopes/feature_mz, so they carry no
+# feature-dependent information and cannot leak this way. Verified by inspection (no
+# feature_mz or maldi_envelopes reference in their computation), not by measurement — they
+# are already excluded from the ranker in every current config for unrelated reasons, so
+# there is no debug table to measure them against.
+#
+# If you add a new column to the "MALDI envelope comparison" block below, add it here too.
+MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES = frozenset([
+    "theo_isotope_cosine",
+    "theo_isotope_chi2",
+    "theo_isotope_kl",
+    "theo_m1_ratio_diff",
+    "theo_m2_ratio_diff",
+])
+
+
 def compute_theoretical_isotope_features(
     df: pd.DataFrame,
     maldi_envelopes: dict | None = None,
@@ -940,6 +1103,11 @@ def compute_theoretical_isotope_features(
 
     Vectorized: uses pre-computed n_C/n_H/n_N/n_O/n_S and mass columns
     from the digest DataFrame. No pyteomics calls in the hot path.
+
+    The five columns set in the "MALDI envelope comparison" block compare the candidate's
+    own theoretical isotope pattern (from its own mass) against the *observed* envelope at
+    feature_mz. See MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES above — under mz_shuffle decoys
+    this leaks the derangement's mass gap (PROGRESS.md F-020).
     """
     n = len(df)
 
@@ -1023,9 +1191,133 @@ def compute_theoretical_isotope_features(
     df["theo_isotope_cosine"] = theo_cosine
     df["theo_isotope_chi2"] = theo_chi2
     df["theo_isotope_kl"] = theo_kl
+
+    # --- H-decoy-13: the same envelope comparison, referenced to averagine -------------
+    # The three columns above predict the isotope pattern from the CANDIDATE's own
+    # elemental formula. That makes them read composition, and `substitution` decoys
+    # differ from targets in composition by construction, so they partly read the
+    # target/decoy label with no spectral evidence involved (PROGRESS.md F-036: AUC
+    # 0.58-0.66 among the decoys whose substitution moved the mass furthest; and among
+    # targets alone the feature separates sulfur-bearing from sulfur-free peptides at
+    # AUC 0.61-0.70).
+    #
+    # Sulfur is not the whole story -- the leak survives restricting both classes to zero
+    # sulfur on kidney (0.593) and her2 (0.609) -- so blinding the feature to sulfur alone
+    # would not fix it. The candidate's composition has to leave the calculation entirely.
+    #
+    # These columns predict from averagine at the MATCHED PEAK's implied mass instead, so
+    # the value depends only on the peak and is identical for every candidate matched to
+    # it. That is symmetric between the classes by construction, which is the point, and
+    # it changes what the feature measures: "is the signal at this peak isotopically
+    # consistent with a peptide of this mass at all", rather than "does this particular
+    # candidate explain it". It therefore cannot separate candidates competing for the
+    # same peak, only rank one peak against another. Averagine also assumes zero sulfur,
+    # so genuinely sulfur-bearing targets are penalised -- a real cost, borne by both
+    # classes in proportion to their sulfur.
+    avg_env_kl = np.zeros(n)
+    avg_env_m1_diff = np.full(n, np.nan)
+    avg_env_m2_diff = np.full(n, np.nan)
+
+    if maldi_envelopes:
+        feature_mzs = df["feature_mz"].values.astype(float)
+        # Averagine composition from the peak, not from the candidate. Charge 1, standard
+        # for MALDI singly-protonated ions, matching `implied_mass` elsewhere in this file.
+        feat_mass = feature_mzs - PROTON
+        fa_comps = list(zip(
+            np.round(feat_mass * AVERAGINE_C).astype(int).tolist(),
+            np.round(feat_mass * AVERAGINE_H).astype(int).tolist(),
+            np.round(feat_mass * AVERAGINE_N).astype(int).tolist(),
+            np.round(feat_mass * AVERAGINE_O).astype(int).tolist(),
+            [0] * n,
+        ))
+        fa_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in set(fa_comps)}
+        for i in range(n):
+            maldi_env = maldi_envelopes.get(feature_mzs[i])
+            if maldi_env is None or len(maldi_env) < 3:
+                continue
+            obs = np.array(maldi_env[:3], dtype=np.float64)
+            a = np.asarray(fa_cache[fa_comps[i]], dtype=np.float64)
+            obs_s = obs.sum()
+            if obs_s > 0:
+                obs_norm = obs / obs_s
+                a_safe = np.clip(a, 1e-10, None)
+                obs_safe = np.clip(obs_norm, 1e-10, None)
+                avg_env_kl[i] = np.sum(obs_safe * np.log(obs_safe / a_safe))
+            if obs[0] > 0 and a[0] > 0:
+                avg_env_m1_diff[i] = abs(obs[1] / obs[0] - a[1] / a[0])
+                avg_env_m2_diff[i] = abs(obs[2] / obs[0] - a[2] / a[0])
+
+    df["averagine_envelope_kl"] = avg_env_kl
+    df["averagine_envelope_m1_ratio_diff"] = avg_env_m1_diff
+    df["averagine_envelope_m2_ratio_diff"] = avg_env_m2_diff
     df["theo_m1_ratio_diff"] = theo_m1_diff
     df["theo_m2_ratio_diff"] = theo_m2_diff
     df["monoisotopic_confidence"] = mono_conf
+
+    # --- Mass-normalized variant, for mz_shuffle only (PROGRESS.md H-decoy-7a) ---
+    #
+    # theo_isotope_kl above leaks under mz_shuffle (F-020, Spearman 0.70-0.80 with the
+    # derangement's construction mass gap): it builds the theoretical envelope from the
+    # candidate's OWN mass, then compares it to the observed envelope at the assigned
+    # feature, which mz_shuffle deliberately places far away in mass. Since isotope shape
+    # scales with mass, that comparison is dominated by the raw mass mismatch rather than
+    # by any chemical evidence.
+    #
+    # Here the candidate's elemental composition is rescaled (n_C, n_H, n_N, n_O, n_S all
+    # scaled by the same factor) so its THEORETICAL envelope is built for the mass IMPLIED
+    # BY THE FEATURE it is placed on, not its own mass. For a co-located mz_shuffle pair,
+    # feature_mz is shared, so the scale factor differs between the target and decoy only
+    # through their own composition-to-mass ratio -- the raw mass confound is removed while
+    # whatever composition-type signal remains (sulfur content, C:H:N:O ratio) is kept. This
+    # is a genuinely new, more experimental feature, not a drop-in fix: it may turn out to be
+    # symmetric-but-uninformative (AUC ~0.5, like the intrinsic mob_* family) rather than
+    # informative. Measure before trusting; see PROGRESS.md H-decoy-7 for the readout.
+    theo_kl_mn = np.zeros(n)
+    theo_m1_diff_mn = np.full(n, np.nan)
+    theo_m2_diff_mn = np.full(n, np.nan)
+
+    if maldi_envelopes:
+        implied_mass = feature_mzs - PROTON  # charge 1, standard for MALDI singly-protonated ions
+        own_mass = pep_mass
+        safe_own_mass = np.where(own_mass > 0, own_mass, 1.0)
+        scale = np.clip(implied_mass / safe_own_mass, 0.05, 20.0)  # guard against divide-by-~0
+
+        nc_mn = np.round(comp_arr[:, 0] * scale).astype(int)
+        nh_mn = np.round(comp_arr[:, 1] * scale).astype(int)
+        nn_mn = np.round(comp_arr[:, 2] * scale).astype(int)
+        no_mn = np.round(comp_arr[:, 3] * scale).astype(int)
+        ns_mn = np.round(comp_arr[:, 4] * scale).astype(int)
+        mn_comps = list(zip(
+            np.clip(nc_mn, 0, None).tolist(), np.clip(nh_mn, 0, None).tolist(),
+            np.clip(nn_mn, 0, None).tolist(), np.clip(no_mn, 0, None).tolist(),
+            np.clip(ns_mn, 0, None).tolist(),
+        ))
+        unique_mn = set(mn_comps)
+        mn_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in unique_mn}
+        mn_dist = np.array([mn_cache[k] for k in mn_comps])  # (n, 3)
+        mn_m0, mn_m1, mn_m2 = mn_dist[:, 0], mn_dist[:, 1], mn_dist[:, 2]
+        norm_mn = np.sqrt(mn_m0**2 + mn_m1**2 + mn_m2**2)
+
+        for i in range(n):
+            maldi_env = maldi_envelopes.get(feature_mzs[i])
+            if maldi_env is None or len(maldi_env) < 3:
+                continue
+            obs = np.array(maldi_env[:3], dtype=np.float64)
+            obs_s = obs.sum()
+            if obs_s <= 0:
+                continue
+            obs_norm = obs / obs_s
+            t = np.array([mn_m0[i], mn_m1[i], mn_m2[i]])
+            theo_safe = np.clip(t, 1e-10, None)
+            obs_safe = np.clip(obs_norm, 1e-10, None)
+            theo_kl_mn[i] = np.sum(obs_safe * np.log(obs_safe / theo_safe))
+            if obs[0] > 0 and t[0] > 0:
+                theo_m1_diff_mn[i] = abs(obs[1] / obs[0] - t[1] / t[0])
+                theo_m2_diff_mn[i] = abs(obs[2] / obs[0] - t[2] / t[0])
+
+    df["theo_isotope_kl_massnorm"] = theo_kl_mn
+    df["theo_m1_ratio_diff_massnorm"] = theo_m1_diff_mn
+    df["theo_m2_ratio_diff_massnorm"] = theo_m2_diff_mn
 
     logger.info(f"Theoretical isotope features: {(theo_cosine > 0).sum()}/{n} scored")
     return df
@@ -1935,6 +2227,59 @@ def _log_progress(prefix: str, n_done: int, n_total: int, t_start: float, every:
     )
 
 
+
+def _available_memory_bytes() -> int | None:
+    """Memory obtainable without swapping, or ``None`` where the OS will not say.
+
+    Prefers ``MemAvailable``, which counts the page cache the kernel would
+    reclaim under pressure; ``SC_AVPHYS_PAGES`` counts only genuinely free pages
+    and badly understates what a large allocation can actually get. The gap is
+    not academic: reading it partway through a run that had already filled the
+    cache reported 49 GB against a real 450 GB, which throttled a thread pool to
+    3 workers and turned a ~30 minute step into 4 hours. Falls back to the
+    sysconf value where /proc is unavailable.
+    """
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _memory_capped_workers(
+    bytes_per_worker: int,
+    available: int | None = None,
+    max_workers: int = 64,
+    headroom: float = 0.5,
+) -> int:
+    """Thread count that fits ``bytes_per_worker`` x workers in free memory.
+
+    Threading a step whose per-call temporaries scale with the whole dataset
+    multiplies peak memory by the worker count. The mobility-colocalization M0
+    rebuild does exactly that -- two length-N boolean masks per call, N being the
+    3.16e9 relevant peaks on a whole section -- so 64 threads asked for 405 GB of
+    transient masks and the process died silently, three runs in a row, with the
+    CPU count alone deciding the pool size.
+
+    ``available`` defaults to the real free memory rather than to "no cap", so
+    forgetting to pass it cannot silently restore the behaviour this exists to
+    prevent.
+
+    Returns at least 1: better slow than not running.
+    """
+    if available is None:
+        available = _available_memory_bytes()
+    workers = min(os.cpu_count() or 1, max_workers)
+    if available and bytes_per_worker > 0:
+        workers = min(workers, int(headroom * available / bytes_per_worker))
+    return max(1, workers)
+
 def compute_mobility_colocalization_features(
     df: pd.DataFrame,
     tdf_path: str,
@@ -2348,7 +2693,11 @@ def compute_mobility_colocalization_features(
                 # search per feature would cut this further, at the cost of a
                 # full extra sorted copy of mzs_all/pix_ids/scan_ids/ints_all.
                 # Revisit if threading alone isn't enough headroom.
-                mz_mask = (mzs_all >= mz_lo) & (mzs_all <= mz_hi)
+                # In-place &= so only two length-N boolean temporaries are alive
+                # instead of three; see the worker-count cap below, which is
+                # sized against exactly this.
+                mz_mask = mzs_all >= mz_lo
+                mz_mask &= mzs_all <= mz_hi
                 if not mz_mask.any():
                     return []
                 sub_pix  = pix_ids[mz_mask]
@@ -2379,10 +2728,21 @@ def compute_mobility_colocalization_features(
 
             _needed_groups = [grp for _, grp in groups if any(i in _needs_img for i in grp.index)]
             _n_groups_needed = len(_needed_groups)
-            _n_workers = min(os.cpu_count() or 1, 64)
+            # Each worker's m/z window scan holds two length-N boolean temporaries
+            # (N = len(mzs_all)), so peak RAM here is workers x 2N, NOT 2N. On a
+            # whole section that product is what runs the machine out of memory:
+            # her2 has 3.16e9 relevant peaks, so 64 threads is 64 x 6.3 GB = 405 GB
+            # of transient masks on top of ~60 GB of base arrays and a 42 GB image
+            # array. It died silently at exactly this line three times before the
+            # count was capped. Size the pool against free memory instead.
+            _mask_bytes_per_worker = 2 * mzs_all.size
+            _avail = _available_memory_bytes()
+            _n_workers = _memory_capped_workers(_mask_bytes_per_worker, available=_avail)
             logger.info(
                 f"Mobility colocalization: rebuilding per-candidate M0 images for "
                 f"{_n_groups_needed} feature groups across {_n_workers} threads "
+                f"({_mask_bytes_per_worker / 1e9:.1f} GB of scan masks per thread, "
+                f"{(_avail / 1e9) if _avail else float('nan'):.0f} GB free) "
                 f"(this is the O(N) full-array-scan step — watch the progress line below "
                 f"for how it's tracking)…"
             )
