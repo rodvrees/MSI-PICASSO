@@ -1,4 +1,4 @@
-"""Shared utilities: isotope distributions, spectral angle, mass calculations."""
+"""Shared utilities: isotope distributions, compositions, m/z lookup."""
 
 from functools import lru_cache
 
@@ -62,39 +62,34 @@ AVERAGINE_O = 0.01329
 AVERAGINE_S = 0.00037
 
 
-def averagine_composition(mass: float) -> dict[str, int]:
-    """Compute averagine elemental composition for a given mass."""
-    return {
-        "C": int(round(mass * AVERAGINE_C)),
-        "H": int(round(mass * AVERAGINE_H)),
-        "N": int(round(mass * AVERAGINE_N)),
-        "O": int(round(mass * AVERAGINE_O)),
-        "S": int(round(mass * AVERAGINE_S)),
+def averagine_composition(mass):
+    """Averagine elemental composition {C, H, N, O, S} for a mass or an array of masses.
+
+    Atom counts are rounded half to even (``np.round``, the same rule as ``round``).
+    A scalar mass gives ``int`` counts, an array gives int arrays.
+    """
+    m = np.asarray(mass, dtype=np.float64)
+    comp = {
+        el: np.round(m * per_da).astype(int)
+        for el, per_da in (("C", AVERAGINE_C), ("H", AVERAGINE_H), ("N", AVERAGINE_N),
+                           ("O", AVERAGINE_O), ("S", AVERAGINE_S))
     }
+    if m.ndim == 0:
+        return {el: int(v) for el, v in comp.items()}
+    return comp
 
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two vectors. Returns 0 if either is zero."""
-    dot = np.dot(a, b)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return float(dot / (norm_a * norm_b))
+def values_at_mz(values, mzs, query_mzs) -> np.ndarray:
+    """Look up ``values`` (aligned with ``mzs``) at each of ``query_mzs`` by exact m/z.
 
+    Non-finite values count as absent, and a repeated m/z keeps its last finite
+    value. Returns a float64 array aligned with ``query_mzs``, NaN where absent.
+    """
+    import pandas as pd
 
-def spectral_angle(a: np.ndarray, b: np.ndarray) -> float:
-    """Spectral angle: 1 - arccos(cosine) / pi. Range [0, 1], 1 = identical."""
-    cos = cosine_similarity(a, b)
-    cos = np.clip(cos, -1.0, 1.0)
-    return float(1.0 - np.arccos(cos) / np.pi)
-
-
-def mz_to_mass(mz: float, charge: int) -> float:
-    """Convert m/z to neutral mass."""
-    return mz * charge - charge * PROTON
-
-
-def mass_to_mz(mass: float, charge: int) -> float:
-    """Convert neutral mass to m/z."""
-    return (mass + charge * PROTON) / charge
+    values = np.asarray(values, dtype=np.float64)
+    mzs = np.asarray(mzs, dtype=np.float64)
+    keep = np.isfinite(values) & ~np.isnan(mzs)
+    lookup = pd.Series(values[keep], index=mzs[keep])
+    lookup = lookup[~lookup.index.duplicated(keep="last")]
+    return lookup.reindex(np.asarray(query_mzs, dtype=np.float64)).to_numpy(dtype=np.float64)

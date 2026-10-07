@@ -1,32 +1,25 @@
 """
 MSI-PICASSO feature generator: orchestrates all feature categories.
 
-Converts a candidate DataFrame (from match_to_maldi_features) into a PSMList
-with all rescoring features populated.
+Adds every rescoring feature column to a candidate DataFrame (from
+match_to_maldi_features).
 """
 
 import logging
 
 import numpy as np
 import pandas as pd
-from psm_utils.psm import PSM
-from psm_utils.psm_list import PSMList
-from psm_utils.peptidoform import Peptidoform
 
 from msi_picasso.maldi_features import (
     _pearson_r_matrix,
     _median_thresholded_cosine_matrix,
     compute_tissue_mask,
-    compute_region_colocalization_features,
-    compute_within_region_colocalization_features,
     compute_adduct_colocalization,
-    compute_calibrated_ppm_features,
     compute_candidate_ambiguity_features,
     compute_chca_cluster_features,
     compute_colocalization_features,
     compute_cosine_colocalization_features,
     compute_im2deep_features,
-    compute_lcms_ccs_features,
     compute_isotopologue_colocalization,
     compute_maldi_ionization_features,
     compute_maldi_signal_features,
@@ -50,12 +43,11 @@ logger = logging.getLogger(__name__)
 # properties. These are the sole input to the ranker/SVM so that the model
 # scores MALDI match quality, not LC-MS/MS identification quality.
 #
-# Optional features are included in the list but filtered out by
-# get_feature_names() when the required data was not provided.
+# Optional features are listed here too; the pipeline keeps only the columns that
+# were actually computed.
 MALDI_INTRINSIC_FEATURES = [
     # --- mass accuracy (A-group) ---
     "ppm_error_abs", "ppm_rank", "ppm_best_ratio", "log_ppm_best_ratio",
-    "ppm_error_calibrated_z",  # A3 — optional, requires pixel_coords
     "ppm_error_pct", "ppm_error_squared",
     # --- ambiguity ---
     "n_candidates", "log_n_candidates",
@@ -221,16 +213,6 @@ PROTEIN_LEVEL_FEATURES = [
     "protein_colocalization_top2", "protein_colocalization_top3", "protein_colocalization_top5",
 ]
 
-# Region-profile colocalization (opt-in via --region-coloc, requires ion_images).
-# Within-protein Pearson r of per-region composition fingerprints — asks whether
-# same-protein peptides occupy the same tissue regions, a sharper question than
-# global ion-image Pearson r (which is dominated by the shared tissue envelope).
-# Protein-level, so valid only because decoys occupy a separate protein namespace.
-# Appended to the ranker pool at runtime in pipeline.py when the flag is set.
-REGION_COLOCALIZATION_FEATURES = [
-    "protein_region_colocalization",
-]
-
 # Median-thresholded cosine colocalization (opt-in via --cosine-coloc, requires
 # ion_images). Ovchinnikova et al. (2020, ColocML): median-thresholded cosine
 # similarity of raw ion images, validated at Spearman 0.794 against 42 expert
@@ -246,78 +228,9 @@ COSINE_COLOCALIZATION_FEATURES = [
     "protein_colocalization_cosine_median",
 ]
 
-# Within-region and dominant-region Pearson-r colocalization (opt-in via
-# --within-region-coloc, requires ion_images). O3 :
-# unlike REGION_COLOCALIZATION_FEATURES (per-region MEAN fingerprint), these
-# correlate RAW pixel intensities restricted to a region, asking whether
-# same-protein peptides co-vary pixel-to-pixel inside a shared region rather
-# than merely sharing a region average. Experimental / unvalidated — see the note below on
-# validation protocol before removing these from features-exclude in any config.
-WITHIN_REGION_COLOCALIZATION_FEATURES = [
-    "protein_within_region_colocalization",
-    "protein_dominant_region_colocalization",
-]
-
-# LC-MS/MS prior features: NOT passed to the ranker/SVM — doing so would cause
-# the model to score LC-MS/MS identification quality rather than MALDI match
-# quality. Applied as a multiplicative Bayesian prior after MALDI-intrinsic
-# scoring (see pipeline.compute_lcms_prior).
-#
-# Split into two sub-groups so compute_all_features can handle them differently:
-#   _LCMS_MZML_FEATURES  — derived from raw mzML (always populated by lcms_evidence)
-#   _LCMS_ID_FEATURES    — derived from LC-MS/MS IDs (Strategy C, via lcms_ids.py)
-
-_LCMS_MZML_FEATURES = [
-    "lcms_ms2_spectral_angle", "lcms_ms2_n_matches",
-    # DeepLC-anchored MS1 signal features
-    "lcms_ms1_intensity", "lcms_ms1_snr",
-    # DeepLC-anchored MS1 isotope features (per-candidate, fully symmetric)
-    "lcms_ms1_isotope_cosine",
-    "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
-    "log_theo_m1_ratio_diff_lcms", "log_theo_m2_ratio_diff_lcms",
-    # DeepLC-anchored RT-consistency and apex features
-    "lcms_ms1_apex_rt_delta",
-    "lcms_ms1_frac_apex_signal",
-    "lcms_ms1_n_scans_with_signal",
-    "lcms_ms2_rt_delta",
-    "isotope_envelope_cosine",
-    "isotope_envelope_pearson",
-    "isotope_envelope_mse",
-    "isotope_n_matched",
-    "isotope_absolute_diff",
-    "log_isotope_m1_ratio_diff",
-    "log_isotope_m2_ratio_diff",
-]
-
-_LCMS_ID_FEATURES = [
-    "lcms_q_value", "lcms_pep", "lcms_score",
-    "n_psms", "lcms_intensity",
-]
-
-# MALDI-vs-LC-MS/MS CCS comparison (optional: requires ion mobility in LC-MS/MS data).
-_LCMS_CCS_FEATURES = ["lcms_ccs_delta", "lcms_ccs_abs_pct"]
-
-LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_CCS_FEATURES 
-
-# Spatial prior features: ion-image-level quality signals applied as a
-# multiplicative prior after scoring (analogous to LCMS_PRIOR_FEATURES).
-# Excluded from the ranker because they are feature-level, not candidate-level
-# — all candidates at the same m/z feature share identical values, so they
-# cannot discriminate between candidate sequences within a feature.
-SPATIAL_PRIOR_FEATURES = [
-    "spatial_autocorrelation", "fraction_detected", "intensity_cv",
-    "log_mean_intensity", "spatial_entropy",
-    "spatial_morans_i", "spatial_gearys_c",
-    # per-candidate mobility-filtered spatial quality (optional, requires tdf_path + im2deep)
-    "fraction_detected_mob", "intensity_cv_mob",
-    "log_mean_intensity_mob", "spatial_morans_i_mob",
-]
-
-# Spatial ranker features: opt-in (--use-spatial-ranker-features), permitted ONLY
-# with decoy methods whose decoys land on real MALDI features (entrapment, mz_shift).
-# With shuffle/balanced_shuffle/paired_shuffle there is no consistent spatial anchor
-# for decoys, so including these features produces an asymmetric null (guarded in
-# pipeline.py).  The protein_colocalization_* members overlap PROTEIN_LEVEL_FEATURES;
+# Spatial ranker features: opt-in (--use-spatial-ranker-features). Both remaining
+# decoy methods put each decoy on a real MALDI feature, so these have a symmetric
+# null. The protein_colocalization_* members overlap PROTEIN_LEVEL_FEATURES;
 # pipeline.py deduplicates when both opt-in flags are active.
 SPATIAL_RANKER_FEATURES = [
     # Feature-level spatial quality
@@ -366,7 +279,7 @@ MZ_SHUFFLE_MASSNORM_ISOTOPE_FEATURES = [
 LDA_FEATURES = MALDI_INTRINSIC_FEATURES
 
 # Reduced feature set: one representative per collinear group.
-# Use with --only-main-features to cut the feature count from ~46 to ~19
+# Use with --features-preset main to cut the feature count from ~46 to ~19
 # and remove inter-feature redundancy before training.
 MAIN_FEATURES = [
     # ppm (from 6 → 1)
@@ -412,11 +325,8 @@ MAIN_FEATURES = [
 #   "col_max"  — fill with np.nanmax of that column (worst-case penalty)
 #   "col_min"  — fill with np.nanmin of that column
 FEATURE_NAN_FILL: dict[str, float | str] = {
-    # No LC-MS/MS envelope match → worst ratio deviation (largest observed error)
-    "log_isotope_m1_ratio_diff": "col_max",
-    "log_isotope_m2_ratio_diff": "col_max",
     # 2D peak quality: a candidate whose m/z window has no observed peak (e.g. a
-    # substitution/mz_shift decoy in empty m/z) gets the worst-case, not the median.
+    # substitution decoy in empty m/z) gets the worst-case, not the median.
     "mob_2d_concentration": 0.0,      # no peak → zero concentration
     "mob_peak_snr": "col_min",        # no peak → lowest observed signal contrast
     "mob_k0_spread": "col_max",       # no peak → widest (worst) mobility spread
@@ -435,108 +345,13 @@ FEATURE_NAN_FILL: dict[str, float | str] = {
     "averagine_envelope_m2_ratio_diff": "col_max",
 }
 
-# ---------------------------------------------------------------------------
-# Optional-feature membership sets (used by get_feature_names)
-# ---------------------------------------------------------------------------
-_SPATIAL_FEATS = frozenset([
-    "spatial_autocorrelation", "fraction_detected", "intensity_cv",
-    "log_mean_intensity", "spatial_entropy",
-])
-_COLOC_FEATS = frozenset([
-    "protein_colocalization", "protein_colocalization_max",
-    "protein_colocalization_median", "protein_colocalization_n_partners",
-    "has_coloc",
-])
-_PIXEL_FEATS = frozenset(["ppm_error_calibrated_z"])
-_CCS_FEATS = frozenset([
-    "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
-    "im2deep_ccs_zscore", "im2deep_ccs_rank",
-    "im2deep_delta_ccs_resid", "im2deep_abs_delta_ccs_pct_resid",
-    "im2deep_ccs_zscore_resid", "im2deep_ccs_rank_resid",
-])
-_ISOTOPOLOGUE_COLOC_FEATS = frozenset([
-    "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
-    "isotope_image_colocalization_mean",
-])
-_ADDUCT_COLOC_FEATS = frozenset([
-    "adduct_colocalization_na", "adduct_colocalization_k", "adduct_colocalization_chca",
-])
-_MORANS_FEATS = frozenset(["spatial_morans_i", "spatial_gearys_c"])
-_MOB_COLOC_FEATS = frozenset([
-    "isotope_colocalization_m1_mob", "isotope_colocalization_m2_mob",
-    "isotope_colocalization_mean_mob",
-    "adduct_colocalization_na_mob", "adduct_colocalization_k_mob",
-    "adduct_colocalization_chca_mob",
-])
-_MOB_SPATIAL_FEATS = frozenset([
-    "fraction_detected_mob", "intensity_cv_mob",
-    "log_mean_intensity_mob", "spatial_morans_i_mob",
-])
-
-
-def get_feature_names(
-    has_spatial: bool = False,  # kept for backwards compatibility; no longer used
-    has_ion_images: bool = False,
-    has_envelopes: bool = False,  # kept for backwards compatibility; no longer used
-    has_pixel_coords: bool = False,
-    has_ccs: bool = False,
-    has_mob_coloc: bool = False,
-) -> list[str]:
-    """Return the full list of feature names based on available data.
-
-    Optional feature groups are included only when the corresponding data
-    was computed. ``MALDI_INTRINSIC_FEATURES + LCMS_PRIOR_FEATURES`` is the
-    superset; this function selects the applicable subset.
-    """
-    intrinsic = [
-        f for f in MALDI_INTRINSIC_FEATURES
-        if (f not in _COLOC_FEATS or has_ion_images)
-        and (f not in _ISOTOPOLOGUE_COLOC_FEATS or has_ion_images)
-        and (f not in _ADDUCT_COLOC_FEATS or has_ion_images)
-        and (f not in _PIXEL_FEATS or has_pixel_coords)
-        and (f not in _CCS_FEATS or has_ccs)
-        and (f not in _MOB_COLOC_FEATS or has_mob_coloc)
-    ]
-    return intrinsic + LCMS_PRIOR_FEATURES
-
-
-def candidates_to_psm_list(candidates_df: pd.DataFrame) -> PSMList:
-    """Convert a candidate DataFrame to a PSMList for mokapot."""
-    meta_cols = [
-        c for c in candidates_df.columns if c not in ("peptide", "protein", "is_decoy")
-    ]
-    psms = []
-    for row in candidates_df.itertuples(index=False):
-        peptide = row.peptide
-        psm = PSM(
-            peptidoform=Peptidoform(f"{peptide}/1"),
-            spectrum_id=f"maldi_feature_{getattr(row, 'feature_idx', 0)}",
-            run="maldi",
-            is_decoy=bool(row.is_decoy),
-            protein_list=[str(getattr(row, "protein", ""))],
-            precursor_mz=float(getattr(row, "feature_mz", getattr(row, "mh_mz", 0))),
-            score=float(-getattr(row, "ppm_error_abs", 0)),
-            metadata={c: str(getattr(row, c)) for c in meta_cols},
-        )
-        psms.append(psm)
-
-    psm_list = PSMList(psm_list=psms)
-    n_target = sum(not p.is_decoy for p in psm_list)
-    n_decoy = sum(p.is_decoy for p in psm_list)
-    logger.info(f"Built PSMList: {n_target} target + {n_decoy} decoy PSMs")
-    return psm_list
-
-
 def compute_all_features(
     candidates_df: pd.DataFrame,
-    lcms_evidence: dict[int, dict[str, float]] | None = None,
     spatial_features: pd.DataFrame | None = None,
     ion_images: np.ndarray | None = None,
     ion_image_mzs: np.ndarray | None = None,
     extra_ion_images: dict | None = None,
     maldi_envelopes: dict | None = None,
-    pixel_coords: np.ndarray | None = None,
-    maldi_mzs: np.ndarray | None = None,
     observed_ccs_per_feature: dict | None = None,
     im2deep_calibration: str = "linear",
     im2deep_kwargs: dict | None = None,
@@ -546,11 +361,6 @@ def compute_all_features(
     coloc_measured_pixel_mask: "np.ndarray | None" = None,
     coloc_tic_normalize: bool = False,
     coloc_common_mode: bool = False,
-    region_coloc: bool = False,
-    region_coloc_k: int = 20,
-    region_coloc_debug: dict | None = None,
-    within_region_coloc: bool = False,
-    within_region_coloc_debug: dict | None = None,
     cosine_coloc: bool = False,
 ) -> pd.DataFrame:
     """
@@ -560,8 +370,6 @@ def compute_all_features(
     ----------
     candidates_df
         Output of match_to_maldi_features().
-    lcms_evidence
-        Pre-computed LC-MS/MS evidence dict from compute_all_lcms_evidence().
     spatial_features
         Pre-computed per-feature spatial statistics DataFrame (optional).
     ion_images
@@ -570,12 +378,6 @@ def compute_all_features(
         m/z values aligned with ion_images (optional).
     maldi_envelopes
         MALDI isotope envelopes: feature_mz → array (optional).
-    pixel_coords
-        (N_features,) or (N_features, 2) pixel coordinates aligned with
-        maldi_mzs, used for LOWESS ppm calibration (A3, optional).
-    maldi_mzs
-        Array of MALDI feature m/z values in feature-index order (required
-        for A3 if pixel_coords is provided).
     observed_ccs_per_feature
         Dict mapping feature_idx → observed CCS value for IM2Deep features (optional).
 
@@ -595,46 +397,6 @@ def compute_all_features(
     df = compute_mass_defect_features(df)               # A11
     df = compute_chca_cluster_features(df)              # A12
 
-    # --- LC-MS/MS mzML evidence (pre-computed per candidate via compute_all_lcms_evidence) ---
-    # All features in _LCMS_MZML_FEATURES are computed symmetrically per-candidate
-    # (targets and decoys receive identical treatment; no is_decoy branching).
-    # Isotope envelope similarity features (isotope_envelope_*) are included here
-    # when maldi_envelopes was passed to compute_all_lcms_evidence.
-    # All evidence columns that need to be in features_df:
-    #   _LCMS_MZML_FEATURES      → applied as prior (lcms_present in pipeline)
-    #   _LCMS_RANKER_FROM_EVIDENCE → also in MALDI_INTRINSIC_FEATURES (ranker)
-    _ALL_EVIDENCE_COLS = _LCMS_MZML_FEATURES
-    if lcms_evidence is not None:
-        ev_df = pd.DataFrame.from_dict(lcms_evidence, orient="index", dtype=float)
-        ev_df = ev_df.reindex(columns=_ALL_EVIDENCE_COLS)
-        df = df.join(ev_df, how="left")
-        df[_ALL_EVIDENCE_COLS] = df[_ALL_EVIDENCE_COLS].fillna(0.0)
-        # For similarity/ratio features and NaN-sentinel RT-delta features, replace
-        # 0-fill with column median so candidates without signal are not penalised.
-        _median_fill_feats = [
-            "lcms_ms1_isotope_cosine",
-            "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
-            "log_theo_m1_ratio_diff_lcms", "log_theo_m2_ratio_diff_lcms",
-            "isotope_envelope_pearson",
-            "lcms_ms1_apex_rt_delta",
-            "lcms_ms2_rt_delta",
-        ]
-        for feat in _median_fill_feats:
-            if feat not in df.columns:
-                continue
-            valid = df[feat].replace(0.0, np.nan).dropna()
-            fill = float(valid.median()) if len(valid) > 0 else 0.0
-            df[feat] = df[feat].replace(0.0, fill)
-    else:
-        for feat in _ALL_EVIDENCE_COLS:
-            df[feat] = 0.0
-
-    # --- MALDI vs LC-MS/MS CCS features (optional) ---
-    df = compute_lcms_ccs_features(df, observed_ccs_per_feature=observed_ccs_per_feature)
-    for feat in _LCMS_CCS_FEATURES:
-        if feat not in df.columns:
-            df[feat] = 0.0
-
     # --- Theoretical isotope (adds monoisotopic_confidence, A8) ---
     df = compute_theoretical_isotope_features(
         df,
@@ -643,11 +405,6 @@ def compute_all_features(
 
     # --- MALDI ionization ---
     df = compute_maldi_ionization_features(df)
-
-    # --- A3: LOWESS ppm calibration (optional) ---
-    if pixel_coords is not None:
-        logger.debug("Computing LOWESS ppm calibration features (A3) using pixel coordinates")
-        df = compute_calibrated_ppm_features(df, maldi_mzs=maldi_mzs, pixel_coords=pixel_coords)
 
     # --- B: IM2Deep CCS features (optional) ---
     if observed_ccs_per_feature is not None:
@@ -707,34 +464,6 @@ def compute_all_features(
         df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images, pixel_mask=pixel_mask)  # E1
         df = compute_adduct_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images, pixel_mask=pixel_mask)        # E2
         df = compute_spatial_autocorrelation_full(df, ion_images, ion_image_mzs)                         # E5/E6
-        if region_coloc:
-            df = compute_region_colocalization_features(
-                df, ion_images, ion_image_mzs, pixel_mask=pixel_mask,
-                n_regions=region_coloc_k, debug=region_coloc_debug,
-            )
-        if within_region_coloc:
-            # Reuse protein_corr_cache's preprocessing recipe (coloc_tic_normalize /
-            # coloc_common_mode) so the per-region correlation uses the same
-            # best-performing recipe as compute_colocalization_features (O2,
-            #) rather than raw pixels.
-            df = compute_within_region_colocalization_features(
-                df, ion_images, ion_image_mzs, pixel_mask=pixel_mask,
-                n_regions=region_coloc_k, tic_normalize=coloc_tic_normalize,
-                common_mode_removal=coloc_common_mode,
-                _global_corr_cache=protein_corr_cache, debug=within_region_coloc_debug,
-            )
 
     return df
 
-
-def populate_psm_features(
-    psm_list: PSMList,
-    features_df: pd.DataFrame,
-    feature_names: list[str],
-) -> None:
-    """Write feature values from DataFrame into PSMList rescoring_features."""
-    for i, psm in enumerate(psm_list):
-        psm.rescoring_features = {
-            feat: float(features_df.iloc[i].get(feat, 0.0))
-            for feat in feature_names
-        }

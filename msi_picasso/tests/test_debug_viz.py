@@ -8,7 +8,10 @@ from msi_picasso.debug_viz import (
     _co_feature_panels,
     _fdr_frame_color,
     _one_row_per_peptide,
+    _pairwise_r,
+    _pearson_r,
     _reset_figure_dir,
+    save_debug_figures,
 )
 
 
@@ -72,7 +75,7 @@ class TestPfmExplanations:
         pipe.fit(X, (~is_decoy).astype(float))
         debug_pfm_explanations(
             res, X, pipe, ["good_feature", "noise_feature"],
-            ion_images=None, feature_mzs=None, spatial_df=None,
+            ion_images=None, feature_mzs=None,
             output_dir=str(tmp_path), n_decoys=2, max_targets=3,
             kernel_background=5, kernel_nsamples=64,
         )
@@ -113,7 +116,7 @@ class TestOneRowPerPeptide:
             "peptide": ["PEPTIDEK", "PEPTIDEK", "PEPTIDEK", "OTHERR", "OTHERR"],
             "is_decoy": [False, False, False, False, False],
             "feature_mz": [1000.1, 1000.2, 1000.3, 1200.1, 1200.2],
-            "reweighted_q_value": [0.30, 0.01, 0.50, 0.40, 0.02],
+            "q_value": [0.30, 0.01, 0.50, 0.40, 0.02],
         })
 
     def test_keeps_the_best_q_value_match(self):
@@ -142,16 +145,16 @@ class TestOneRowPerPeptide:
 
     def test_nan_q_values_lose_to_real_ones(self):
         rows = self._rows()
-        rows.loc[1, "reweighted_q_value"] = np.nan
+        rows.loc[1, "q_value"] = np.nan
         out = _one_row_per_peptide(rows)
         assert out.set_index("peptide").loc["PEPTIDEK", "feature_mz"] == 1000.1
 
-    def test_falls_back_to_q_value_then_to_first_row(self):
-        rows = self._rows().drop(columns=["reweighted_q_value"])
-        rows["q_value"] = [0.3, 0.4, 0.05, 0.4, 0.02]
+    def test_falls_back_to_peptide_q_value_then_to_first_row(self):
+        rows = self._rows().drop(columns=["q_value"])
+        rows["peptide_q_value"] = [0.3, 0.4, 0.05, 0.4, 0.02]
         assert _one_row_per_peptide(rows).set_index("peptide").loc[
             "PEPTIDEK", "feature_mz"] == 1000.3
-        bare = self._rows().drop(columns=["reweighted_q_value"])
+        bare = self._rows().drop(columns=["q_value"])
         out = _one_row_per_peptide(bare)
         assert len(out) == 2
         assert out.set_index("peptide").loc["PEPTIDEK", "feature_mz"] == 1000.1
@@ -233,3 +236,69 @@ class TestCoFeaturePanels:
 
     def test_unknown_protein_gives_nothing(self):
         assert _co_feature_panels(self._prot(), "NOPE", 1.0, "AAAK", None, None) == []
+
+
+class TestPairwiseR:
+    def test_matches_pearson_r_and_skips_constant_rows(self):
+        rng = np.random.default_rng(0)
+        imgs = rng.random((4, 50))
+        imgs[2] = 3.0                                  # zero variance
+        r, iu, ju = _pairwise_r(imgs)
+        assert 2 not in iu and 2 not in ju
+        assert list(zip(iu, ju)) == [(0, 1), (0, 3), (1, 3)]
+        for v, i, j in zip(r, iu, ju):
+            assert np.isclose(v, _pearson_r(imgs[i], imgs[j]))
+
+    def test_fewer_than_two_usable_rows(self):
+        r, iu, ju = _pairwise_r(np.ones((3, 10)))
+        assert len(r) == len(iu) == len(ju) == 0
+
+
+class TestSaveDebugFigures:
+    """Smoke test: every figure step runs on a small synthetic run without warnings."""
+
+    def test_synthetic_run(self, tmp_path, caplog):
+        import logging
+
+        rng = np.random.default_rng(1)
+        n, H, W = 40, 6, 7
+        mzs = 800.0 + 10.0 * np.arange(n)
+        is_decoy = np.arange(n) % 2 == 1
+        feat = pd.DataFrame({
+            "peptide": [f"PEP{i}K" for i in range(n)],
+            "protein": [("DECOY_" if d else "") + f"P{i // 8}" for i, d in enumerate(is_decoy)],
+            "feature_mz": mzs,
+            "is_decoy": is_decoy,
+            "fraction_detected": rng.random(n),
+            "protein_colocalization": rng.uniform(-1, 1, n),
+            "im2deep_observed_ccs": 300 + rng.normal(0, 5, n),
+            "im2deep_predicted_ccs": 300 + rng.normal(0, 5, n),
+            "n_C": 40, "n_H": 60, "n_N": 10, "n_O": 12, "n_S": 0,
+        })
+        score = rng.normal(size=n) + (~is_decoy) * 2
+        res = pd.DataFrame({
+            "peptide": feat["peptide"], "protein": feat["protein"],
+            "feature_mz": mzs, "is_decoy": is_decoy,
+            "svm_score_r1": score,
+            "q_value": np.where(is_decoy, 0.5, np.linspace(0, 0.1, n)),
+            "pep": rng.random(n), "is_tdc_winner": True, "score": score,
+        })
+        images = rng.random((n, H, W)).astype(np.float32)
+        with caplog.at_level(logging.WARNING, logger="msi_picasso.debug_viz"):
+            save_debug_figures(
+                feat, res, ion_images=images, ion_image_mzs=mzs,
+                maldi_envelopes={float(m): [1.0, 0.5, 0.2] for m in mzs},
+                feature_names=["fraction_detected"], model_name="svm",
+                importances=np.array([0.5]), importance_names=["fraction_detected"],
+                debug_dir=str(tmp_path), n_subset=10,
+                gt_peptides=["PEP0K", "NOTACANDIDATE"],
+            )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        for f in ["ids_vs_fdr.png", "score_pp_plot.png", "score_distributions.png",
+                  "ion_image_pearson_distribution.png", "protein_spatial_coherence.png",
+                  "candidate_competition.png", "target_decoy_mz_distribution.png",
+                  "ccs_scatter.png", "pep_mixture.png"]:
+            assert (tmp_path / f).exists(), f
+        assert list((tmp_path / "ion_images").glob("*.png"))
+        assert list((tmp_path / "features").glob("GT_*.png"))
+        assert list((tmp_path / "feature_importance").glob("*.png"))

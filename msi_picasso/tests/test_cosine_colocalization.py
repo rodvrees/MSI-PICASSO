@@ -11,11 +11,16 @@ import pandas as pd
 import pytest
 
 from msi_picasso.maldi_features import (
-    _COSINE_COLOC_COLS,
     _median_thresholded_cosine_matrix,
     compute_cosine_colocalization_features,
     compute_tissue_mask,
 )
+
+_COSINE_COLOC_COLS = [
+    "protein_colocalization_cosine",
+    "protein_colocalization_cosine_max",
+    "protein_colocalization_cosine_median",
+]
 
 
 def _images_with_shared_region():

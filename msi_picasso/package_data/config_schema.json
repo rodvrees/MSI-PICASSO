@@ -15,20 +15,13 @@
 
         "model": {
           "type": ["string", "null"],
-          "enum": ["lda", "qda", "svm", "gbt", "rbf_svm", null]
+          "enum": ["lda", "svm", "rbf_svm", null]
         },
         "svm_c":                  {"type": ["number", "null"], "exclusiveMinimum": 0},
-        "gbt_n_estimators":       {"type": ["integer", "null"], "minimum": 1},
-        "gbt_max_depth":          {"type": ["integer", "null"], "minimum": 1},
-        "gbt_learning_rate":      {"type": ["number", "null"], "exclusiveMinimum": 0},
         "rbf_svm_c":              {"type": ["number", "null"], "exclusiveMinimum": 0},
         "rbf_svm_gamma":          {"type": ["string", "number", "null"]},
-        "single_round":           {"type": ["boolean", "null"]},
         "init_fdr":               {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "train_fdr":              {"type": ["number", "null"], "minimum": 0, "maximum": 1},
-        "n_interaction_features": {"type": ["integer", "null"], "minimum": 0},
-        "storey_pi0":             {"type": ["boolean", "null"]},
-        "lda_r2_median_filter":   {"type": ["boolean", "null"]},
         "only_main_features":     {"type": ["boolean", "null"]},
         "use_protein_level_feats":{"type": ["boolean", "null"]},
         "use_spatial_ranker_features":{"type": ["boolean", "null"]},
@@ -48,19 +41,13 @@
           "items": {"type": "string"}
         },
 
-        "pseudo_label_max_iter":  {"type": ["integer", "null"], "minimum": 1},
-        "pseudo_label_fdr":       {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "r1_seed_percentile":     {"type": ["number", "null"], "minimum": 0, "maximum": 1},
-        "r2_seed_percentile":     {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_iter":               {"type": ["integer", "null"], "minimum": 1},
         "min_seed_positives":     {"type": ["integer", "null"], "minimum": 0},
-        "decoy_split":            {"type": ["boolean", "null"]},
-        "decoy_split_final_only": {"type": ["boolean", "null"]},
         "train_fdr_escalate":     {"type": ["boolean", "null"]},
         "pseudo_label_growth_cap": {"type": ["number", "null"], "exclusiveMinimum": 0},
         "model_repeats": {"type": ["integer", "null"], "minimum": 1},
         "init_ppm_threshold":     {"type": ["number", "null"], "minimum": 0},
-        "init_isotope_threshold": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
 
         "ppm_tolerance":   {"type": ["number", "null"], "minimum": 0},
         "missed_cleavages":{"type": ["integer", "null"], "minimum": 0},
@@ -69,13 +56,8 @@
 
         "decoy_method": {
           "type": ["string", "null"],
-          "enum": ["shuffle", "mz_shift", "mz_shuffle", "entrapment", "balanced_shuffle", "paired_shuffle", "substitution", null]
+          "enum": ["substitution", "mz_shuffle", null]
         },
-        "mz_shift_delta_min":          {"type": ["number", "null"], "minimum": 0},
-        "mz_shift_delta_max":          {"type": ["number", "null"], "minimum": 0},
-        "mz_shift_snap_tolerance_ppm": {"type": ["number", "null"], "minimum": 0},
-        "max_shuffle_rounds":          {"type": ["integer", "null"], "minimum": 1},
-        "decoy_target_ratio":          {"type": ["number", "null"], "minimum": 0},
         "substitution_n_residues":          {"type": ["integer", "null"], "minimum": 1},
         "substitution_seed":                {"type": ["integer", "null"]},
         "substitution_no_collision_filter": {"type": ["boolean", "null"]},
@@ -92,20 +74,14 @@
 
         "lcms_id_format": {
           "type": ["string", "null"],
-          "enum": ["percolator", "mzidentml", "psm_utils", "msf", null]
+          "enum": ["percolator", "mzidentml", "psm_utils", "msf", "ms2rescore", null]
         },
 
         "fasta":            {"type": ["string", "null"]},
+        "digest":           {"type": ["boolean", "null"]},
         "extra_fasta":      {"type": ["string", "null"]},
-        "entrapment_fasta": {"type": ["string", "null"]},
-        "mzml":             {"type": ["array", "null"], "items": {"type": "string"}},
-        "maldi_npz":        {"type": ["string", "null"]},
-        "maldi_mzs":        {"type": ["string", "null"]},
-        "maldi_raw":        {"type": ["string", "null"]},
         "maldi_d":          {"type": ["string", "null"]},
         "feature_mzs":      {"type": ["string", "null"]},
-        "images_path":      {"type": ["string", "null"]},
-        "image_batch_size": {"type": ["integer", "null"], "exclusiveMinimum": 0},
         "save_npz":         {"type": ["string", "null"]},
         "save_spatial":     {"type": ["string", "null"]},
         "spatial_features": {"type": ["string", "null"]},
@@ -131,11 +107,7 @@
           }
         },
         "matching_ppm":        {"type": ["number", "null"], "minimum": 0},
-        "fragment_tol_da":     {"type": ["number", "null"], "exclusiveMinimum": 0},
         "winner_percentile":   {"type": ["number", "null"], "minimum": 0, "maximum": 1},
-        "rt_window_multiplier":{"type": ["number", "null"], "minimum": 0},
-        "lcms_prior_weight":   {"type": ["number", "null"], "minimum": 0},
-        "spatial_prior_weight":{"type": ["number", "null"], "minimum": 0},
         "match_ccs":              {"type": ["boolean", "null"]},
         "ccs_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
         "ccs_window_pct":         {"type": ["number", "null"], "minimum": 0},
@@ -148,26 +120,19 @@
         "mob_quality_mz_window_ppm": {"type": ["number", "null"], "exclusiveMinimum": 0},
         "mob_quality_k0_tol":     {"type": ["number", "null"], "exclusiveMinimum": 0},
         "coloc_tic_quantile":     {"type": ["number", "null"], "minimum": 0, "exclusiveMaximum": 1},
-        "region_coloc":           {"type": ["boolean", "null"]},
-        "region_coloc_k":         {"type": ["integer", "null"], "minimum": 2},
-        "within_region_coloc":    {"type": ["boolean", "null"]},
         "cosine_coloc":           {"type": ["boolean", "null"]},
         "coloc_tic_normalize":    {"type": ["boolean", "null"]},
         "coloc_common_mode":      {"type": ["boolean", "null"]},
         "drop_zero_signal":       {"type": ["boolean", "null"]},
         "entrapment":             {"type": ["boolean", "null"]},
         "coloc_measured_mask":    {"type": ["boolean", "null"]},
-        "deeplc_finetune_epochs":   {"type": ["integer", "null"], "minimum": 1},
-        "deeplc_finetune_lr":       {"type": ["number",  "null"], "minimum": 0},
-        "deeplc_finetune_patience": {"type": ["integer", "null"], "minimum": 1},
         "calibration_percentile":   {"type": ["number",  "null"], "minimum": 0, "maximum": 1},
 
         "maldi_extraction": {
           "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "extraction_ppm":            {"type": "number", "exclusiveMinimum": 0},
-            "matching_ppm":              {"type": "number", "minimum": 0}
+            "extraction_ppm":            {"type": "number", "exclusiveMinimum": 0}
           }
         }
       }

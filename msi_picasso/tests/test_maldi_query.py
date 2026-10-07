@@ -1,7 +1,6 @@
 """Tests for query_raw_maldi() and the raw-query pipeline interaction."""
 
 import sys
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -97,41 +96,12 @@ class TestRawQueryPipelineInteraction:
         with pytest.raises(ValueError, match="maldi_query_raw=True requires maldi_d_path"):
             pipeline.rescore(
                 fasta_path=str(fasta),
-                mzml_paths=[],
                 maldi_mzs=np.array([], dtype=np.float64),
                 digest=True,
                 maldi_query_raw=True,
                 maldi_d_path=None,
                 output_dir=str(tmp_path / "out"),
             )
-
-    def test_mz_shift_low_delta_warns(self, tmp_path):
-        """mz_shift + maldi_query_raw + delta_min < 10 emits a UserWarning before
-        extraction (extraction then fails on the bogus .d path, which we swallow)."""
-        from msi_picasso import pipeline
-
-        fasta = tmp_path / "t.fasta"
-        fasta.write_text(">sp|P1|T_HUMAN x\nMALPVTALLLLAAGLLAHAAGTSQVQVSTQILHQKPEPTIDEKVFGR\n")
-        with warnings.catch_warnings(record=True) as rec:
-            warnings.simplefilter("always")
-            try:
-                pipeline.rescore(
-                    fasta_path=str(fasta),
-                    mzml_paths=[],
-                    maldi_mzs=np.array([], dtype=np.float64),
-                    digest=True,
-                    decoy_method="mz_shift",
-                    mz_shift_delta_min=5.0,
-                    maldi_query_raw=True,
-                    maldi_d_path=str(tmp_path / "nonexistent.d"),
-                    output_dir=str(tmp_path / "out"),
-                )
-            except Exception:
-                pass
-        assert any(
-            issubclass(w.category, UserWarning) and "zero-signal" in str(w.message)
-            for w in rec
-        ), "expected a zero-signal UserWarning for mz_shift + raw-query with low delta_min"
 
 
 class TestWeightedMeanInvK0:
@@ -143,7 +113,7 @@ class TestWeightedMeanInvK0:
         peak_mzs = np.array([1000.0, 1000.005, 1500.0, 2000.0])  # last is outside any window
         peak_ints = np.array([3.0, 1.0, 5.0, 9.0])
         peak_mob = np.array([0.80, 0.90, 1.20, 1.50])
-        out = maldi_query._weighted_mean_inv_k0(peak_mzs, peak_ints, peak_mob, query, ppm=25.0)
+        out = maldi_query._weighted_mean_in_windows(peak_mzs, peak_ints, peak_mob, query, ppm=25.0)
         # window 0: (3*0.80 + 1*0.90)/(3+1) = (2.4+0.9)/4 = 0.825
         assert out[0] == pytest.approx(0.825)
         # window 1: single peak -> 1.20
@@ -152,7 +122,7 @@ class TestWeightedMeanInvK0:
     def test_empty_window_is_nan(self):
         query = np.array([1000.0, 1500.0], dtype=np.float64)
         # only the 1000 window has signal
-        out = maldi_query._weighted_mean_inv_k0(
+        out = maldi_query._weighted_mean_in_windows(
             np.array([1000.0]), np.array([2.0]), np.array([0.95]), query, ppm=25.0
         )
         assert out[0] == pytest.approx(0.95)
@@ -160,7 +130,7 @@ class TestWeightedMeanInvK0:
 
     def test_no_peaks_all_nan(self):
         query = np.array([800.0, 900.0], dtype=np.float64)
-        out = maldi_query._weighted_mean_inv_k0(
+        out = maldi_query._weighted_mean_in_windows(
             np.array([]), np.array([]), np.array([]), query, ppm=25.0
         )
         assert out.shape == (2,)
@@ -170,7 +140,7 @@ class TestWeightedMeanInvK0:
         # Two query m/z closer than the ppm tolerance -> a peak between them
         # falls in both windows.
         query = np.array([1000.000, 1000.010], dtype=np.float64)  # ~10 ppm apart
-        out = maldi_query._weighted_mean_inv_k0(
+        out = maldi_query._weighted_mean_in_windows(
             np.array([1000.005]), np.array([4.0]), np.array([1.0]), query, ppm=25.0
         )
         assert out[0] == pytest.approx(1.0)

@@ -21,7 +21,7 @@ def _result():
         "feature_idx":        [1, 2, 3, 4, 5],
         "is_decoy":           [False, False, False, True, False],
         "is_tdc_winner":      [True, True, True, True, True],
-        "reweighted_q_value": [0.001, 0.002, 0.004, 0.003, 0.5],
+        "q_value":            [0.001, 0.002, 0.004, 0.003, 0.5],
         "is_peptide_winner":  [False, True, True, True, True],
         "peptide_q_value":    [np.nan, 0.002, 0.004, 0.003, 0.5],
     })

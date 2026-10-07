@@ -12,11 +12,9 @@ dependencies = [
     "pandas>=2.0",
     "pyteomics>=4.7",
     "psm_utils>=1.1",
-    "ms2pip>=4.0.0a1",
-    "deeplc>=4.0.0a1",
     "scikit-learn>=1.3",
     "brain-isotopic-distribution>=1.5",
-    "cascade_config>=0.4",
+    "jsonschema>=4.0",
 ]
 
 [project.optional-dependencies]

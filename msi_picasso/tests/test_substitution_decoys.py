@@ -399,6 +399,26 @@ class TestProperties:
         assert int(result["is_decoy"].sum()) == 0
         assert int((~result["is_decoy"]).sum()) == 0  # also no targets (too short to match empty grid)
 
+    def test_single_residue_decoy_differs_at_one_position(self):
+        """n_residues=1 (via the shared retry loop): exactly one interior non-K/R position
+        changes, and decoy_delta_da equals that residue-mass difference."""
+        target_df = _make_target_df(_PEPTIDES_60)
+        result = generate_substitution_candidates(
+            target_df, _empty_features(), matching_ppm=20.0, n_residues=1,
+            collision_filter=True, snap_to_features=False,
+        )
+        decoys = result[result["is_decoy"]]
+        assert len(decoys) >= 0.95 * len(_PEPTIDES_60)
+        for row in decoys.itertuples(index=False):
+            src = min(_PEPTIDES_60, key=lambda p: (len(p) != len(row.peptide),
+                      sum(a != b for a, b in zip(p, row.peptide))))
+            diff = [i for i, (a, b) in enumerate(zip(src, row.peptide)) if a != b]
+            assert len(diff) == 1, f"{src} -> {row.peptide}"
+            pos = diff[0]
+            assert 0 < pos < len(src) - 1 and src[pos] not in "KR"
+            expected = _AA_RESIDUE_MASSES[row.peptide[pos]] - _AA_RESIDUE_MASSES[src[pos]]
+            assert abs(row.decoy_delta_da - expected) < 1e-3
+
     def test_leu_ile_isobar_not_substituted_for_each_other(self):
         """L and I have the same residue mass (113.084 Da); they must not substitute for each other."""
         # A peptide with both L and I in the interior — neither should appear as the substituted AA
