@@ -9,7 +9,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from msi_picasso.pipeline import _rescore_lda, _rescore_svm
+from msi_picasso.pipeline import _estimator_factory, _rescore_linear
+
+
+def _rescore_svm(df, feats, init_ppm_threshold, svm_c=1.0, **kwargs):
+    """The rescore() call for model="svm"."""
+    return _rescore_linear(
+        df, feats, init_ppm_threshold, clf_name="svm",
+        make_clf=_estimator_factory("svm", svm_c=svm_c), **kwargs,
+    )
 
 
 def _synthetic_features(n=400, seed=0):
@@ -59,7 +67,7 @@ class TestRescoreSvm:
     def test_matches_lda_interface_shape(self):
         """SVM and LDA return the same 5-tuple shape so the dispatch is shared."""
         df, feats = _synthetic_features()
-        lda_out = _rescore_lda(df, feats, init_ppm_threshold=5.0)
+        lda_out = _rescore_linear(df, feats, init_ppm_threshold=5.0)
         svm_out = _rescore_svm(df, feats, init_ppm_threshold=5.0)
         assert len(lda_out) == len(svm_out) == 5
         assert lda_out[0].shape == svm_out[0].shape

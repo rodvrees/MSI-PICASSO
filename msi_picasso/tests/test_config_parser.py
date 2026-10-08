@@ -12,19 +12,19 @@ from msi_picasso.config_parser import parse_configurations
 def test_defaults_returned_when_no_config():
     config = parse_configurations()["MSI-PICASSO"]
     assert config["model"] == "lda"
-    assert config["decoy_method"] == "balanced_shuffle"
+    assert config["decoy_method"] == "substitution"
     assert config["features_exclude"] == []
     assert config["im2deep_calibration"] == "finetune"
-    assert config["pseudo_label_fdr"] == pytest.approx(0.10)
+    assert config["r1_seed_percentile"] == pytest.approx(0.10)
 
 
 def test_toml_overrides_defaults(tmp_path):
     toml = tmp_path / "cfg.toml"
-    toml.write_text('[MSI-PICASSO]\nmodel = "qda"\nfeatures_exclude = ["peptide_length"]\n')
+    toml.write_text('[MSI-PICASSO]\nmodel = "svm"\nfeatures_exclude = ["peptide_length"]\n')
     config = parse_configurations([str(toml)])["MSI-PICASSO"]
-    assert config["model"] == "qda"
+    assert config["model"] == "svm"
     assert config["features_exclude"] == ["peptide_length"]
-    assert config["decoy_method"] == "balanced_shuffle"
+    assert config["decoy_method"] == "substitution"
 
 
 def test_json_overrides_defaults(tmp_path):
@@ -37,7 +37,7 @@ def test_json_overrides_defaults(tmp_path):
 
 def test_cli_namespace_overrides_file(tmp_path):
     toml = tmp_path / "cfg.toml"
-    toml.write_text('[MSI-PICASSO]\nmodel = "qda"\n')
+    toml.write_text('[MSI-PICASSO]\nmodel = "svm"\n')
     ns = Namespace(model="lda", train_fdr=None)
     config = parse_configurations([str(toml), ns])["MSI-PICASSO"]
     assert config["model"] == "lda"
@@ -46,10 +46,10 @@ def test_cli_namespace_overrides_file(tmp_path):
 
 def test_none_does_not_override(tmp_path):
     toml = tmp_path / "cfg.toml"
-    toml.write_text('[MSI-PICASSO]\npseudo_label_fdr = 0.05\n')
-    ns = Namespace(pseudo_label_fdr=None)
+    toml.write_text('[MSI-PICASSO]\nr1_seed_percentile = 0.05\n')
+    ns = Namespace(r1_seed_percentile=None)
     config = parse_configurations([str(toml), ns])["MSI-PICASSO"]
-    assert config["pseudo_label_fdr"] == pytest.approx(0.05)
+    assert config["r1_seed_percentile"] == pytest.approx(0.05)
 
 
 def test_schema_rejects_invalid_model(tmp_path):
@@ -68,10 +68,9 @@ def test_features_exclude_unknown_names_allowed():
 def test_explicit_falsy_zero_is_honored():
     """A legitimate explicit 0 (param with minimum 0) must survive the cascade,
     not be silently dropped to the default (cascade_config falsy-drop bug)."""
-    # n_interaction_features default is 0 already; use a non-default falsy case:
-    # set it explicitly and confirm it round-trips.
-    config = parse_configurations([Namespace(n_interaction_features=0)])["MSI-PICASSO"]
-    assert config["n_interaction_features"] == 0
+    # winner_percentile defaults to 0.02; an explicit 0 must round-trip.
+    config = parse_configurations([Namespace(winner_percentile=0)])["MSI-PICASSO"]
+    assert config["winner_percentile"] == 0
 
 
 def test_explicit_matching_ppm_zero_honored():
@@ -92,11 +91,9 @@ def test_negative_matching_ppm_rejected():
 
 def test_maldi_extraction_section_preserved(tmp_path):
     toml = tmp_path / "cfg.toml"
-    toml.write_text('[MSI-PICASSO.maldi_extraction]\nmatching_ppm = 15.0\n')
+    toml.write_text('[MSI-PICASSO.maldi_extraction]\nextraction_ppm = 15.0\n')
     config = parse_configurations([str(toml)])["MSI-PICASSO"]
-    assert config["maldi_extraction"]["matching_ppm"] == pytest.approx(15.0)
-    # the untouched sibling key still comes from the packaged defaults
-    assert config["maldi_extraction"]["extraction_ppm"] == pytest.approx(25.0)
+    assert config["maldi_extraction"]["extraction_ppm"] == pytest.approx(15.0)
 
 
 def test_removed_feature_detection_keys_are_rejected(tmp_path):
@@ -122,32 +119,28 @@ def test_im2deep_section_preserved(tmp_path):
 
 
 def test_dict_source_overrides(tmp_path):
-    override = {"MSI-PICASSO": {"n_interaction_features": 3}}
+    override = {"MSI-PICASSO": {"model_repeats": 3}}
     config = parse_configurations([override])["MSI-PICASSO"]
-    assert config["n_interaction_features"] == 3
+    assert config["model_repeats"] == 3
     assert config["model"] == "lda"
 
 
-def test_images_path_and_batch_size_round_trip(tmp_path):
-    """Memmapped ion images are reachable from a config.
-
-    `extract_maldi_data` has taken `images_path` all along and CLAUDE.md
-    documented it, but it was never wired through the CLI or the config, so it
-    was unreachable — and feature-list extraction is where it became necessary
-    (54326 features x 52019 pixels is 42 GB for the main array alone).
-    """
+def test_feature_mzs_keep_round_trip(tmp_path):
+    """A path-valued key set in TOML with hyphens reaches the config."""
     toml = tmp_path / "cfg.toml"
-    toml.write_text('[MSI-PICASSO]\nimages-path = "/tmp/ion.dat"\nimage-batch-size = 50\n')
+    toml.write_text('[MSI-PICASSO]\nfeature-mzs-keep = "/tmp/keep.csv"\n')
     config = parse_configurations([str(toml)])["MSI-PICASSO"]
-    assert config["images_path"] == "/tmp/ion.dat"
-    assert config["image_batch_size"] == 50
+    assert config["feature_mzs_keep"] == "/tmp/keep.csv"
 
 
-def test_images_path_defaults_to_ram():
-    """Absent the key, images stay in RAM — the prior behaviour."""
-    config = parse_configurations([{}])["MSI-PICASSO"]
-    assert config["images_path"] is None
-    assert config["image_batch_size"] == 100
+def test_removed_keys_are_rejected(tmp_path):
+    """Options deleted in the cleanup are unknown keys now, so a stale config fails loudly."""
+    for dead_key in ("single_round = true", 'model = "qda"', "decoy_split = true",
+                     "images_path = \"/tmp/x\"", "lcms_prior_weight = 0.0"):
+        toml = tmp_path / "cfg.toml"
+        toml.write_text(f"[MSI-PICASSO]\n{dead_key}\n")
+        with pytest.raises(Exception):
+            parse_configurations([str(toml)])
 
 
 def test_model_repeats_round_trip(tmp_path):

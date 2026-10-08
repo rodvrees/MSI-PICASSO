@@ -18,6 +18,12 @@ import os
 import numpy as np
 import pandas as pd
 
+from msi_picasso.maldi_features import (
+    _available_memory_bytes,
+    _morans_i_batch,
+    _queen_weights,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -123,61 +129,6 @@ def _extract_centroid_fast(reader, feature_mzs: np.ndarray, ppm: float) -> np.nd
             weights=raw_int[valid].astype(np.float64),
             minlength=n_features,
         ).astype(np.float32)
-
-    return reader.reshape_batch(output)
-
-
-def _extract_profile_fast(reader, feature_mzs: np.ndarray, ppm: float) -> np.ndarray | None:
-    """
-    Fast vectorized ion image extraction for profile-mode MALDI data.
-
-    Profile data has a **fixed m/z axis** shared across all pixels.  imzy's
-    default path wraps 1,400 numpy index arrays into a ``numba.typed.List``
-    on every one of the 49 K pixels (49 K × 1,400 typed-list entries), which
-    dominates runtime.
-
-    This function pre-computes the start/end bin indices for every feature
-    window **once** on the shared m/z axis, then per pixel uses a cumulative-
-    sum trick to accumulate all feature intensities in a single O(n_mz_points)
-    pass — no inner Python loop over features, no numba typed-list overhead.
-
-    Per pixel work:
-      ``cumsum = np.cumsum(y)``              # O(n_mz_points), vectorised
-      ``out[px] = cumsum[hi] - cumsum[lo]``  # O(n_features), vectorised
-
-    Returns ``None`` when the reader reports centroid data (use
-    ``_extract_centroid_fast`` instead) or when ``get_spectrum`` is
-    unavailable.
-    """
-    if reader.is_centroid:
-        return None
-
-    try:
-        mz_axis, _ = reader.get_spectrum(0)
-    except Exception:
-        return None
-
-    mz_axis = np.asarray(mz_axis, dtype=np.float64)
-    ppm_factor = ppm * 1e-6
-    feat_mz = np.asarray(feature_mzs, dtype=np.float64)
-    mz_min = feat_mz * (1.0 - ppm_factor)
-    mz_max = feat_mz * (1.0 + ppm_factor)
-
-    # Window bounds into the fixed profile m/z axis — computed once.
-    lo = np.searchsorted(mz_axis, mz_min, side="left")
-    hi = np.searchsorted(mz_axis, mz_max, side="right")
-
-    n_pixels = reader.n_pixels
-    n_features = len(feature_mzs)
-    output = np.zeros((n_pixels, n_features), dtype=np.float32)
-    cs = np.empty(len(mz_axis) + 1, dtype=np.float64)
-    cs[0] = 0.0
-
-    for px_i, (_, ints) in enumerate(reader.spectra_iter(silent=False)):
-        if len(ints) == 0:
-            continue
-        np.cumsum(np.asarray(ints, dtype=np.float64), out=cs[1:])
-        output[px_i] = (cs[hi] - cs[lo]).astype(np.float32)
 
     return reader.reshape_batch(output)
 
@@ -292,9 +243,9 @@ def extract_ion_images(
     1. **Bruker TSF centroid** (``_extract_centroid_fast``): skips the
        per-pixel ``tsf_index_to_mz`` DLL call entirely; uses pre-converted
        raw index windows and ``np.bincount`` accumulation.
-    2. **Profile mode** (``_extract_profile_fast``): replaces imzy's
-       per-pixel ``numba.typed.List`` construction with a vectorised
-       cumulative-sum trick on the fixed profile m/z axis.
+    2. **Profile mode** (``_extract_profile_fast_multi``): one
+       ``spectra_iter`` pass over the fixed profile m/z axis, windows summed by
+       the Rust ``accumulate_profile_chunk``.
     3. **Fallback**: ``reader.get_ion_images()`` — single streaming pass
        via imzy.
 
@@ -307,9 +258,10 @@ def extract_ion_images(
     if images is not None:
         logger.debug("  Used fast centroid extraction (skipped per-pixel tsf_index_to_mz).")
     else:
-        images = _extract_profile_fast(reader, feature_mzs, ppm)
+        multi = _extract_profile_fast_multi(reader, [feature_mzs], ppm)
+        images = multi[0] if multi is not None else None
         if images is not None:
-            logger.debug("  Used fast profile extraction (vectorised cumsum, no numba typed-list).")
+            logger.debug("  Used fast profile extraction.")
         else:
             images = reader.get_ion_images(
                 np.asarray(feature_mzs, dtype=np.float64),
@@ -320,106 +272,6 @@ def extract_ion_images(
 
     logger.info(f"  Ion image array: shape={images.shape}, dtype={images.dtype}")
     return images.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Isotope envelope mean extraction (single streaming pass)
-# ---------------------------------------------------------------------------
-
-
-def _collect_pixel_spectra(reader) -> tuple[np.ndarray, np.ndarray, list[int]]:
-    """Stream all pixels and return flat CSR arrays for Rust consumption.
-
-    Returns
-    -------
-    flat_mzs : np.ndarray, float64
-        All pixel m/z values concatenated.
-    flat_ints : np.ndarray, float32
-        All pixel intensities concatenated.
-    pixel_offsets : list[int]
-        CSR-style offsets; pixel i spans ``[offsets[i], offsets[i+1])``.
-    """
-    n_pixels = reader.n_pixels
-
-    # Profile fast path: all pixels share a fixed m/z axis.
-    # Pre-allocate flat arrays to avoid per-pixel list appends + final concatenate.
-    if not reader.is_centroid:
-        try:
-            mz_axis, _ = reader.get_spectrum(0)
-            mz_axis = np.asarray(mz_axis, dtype=np.float64)
-            n_mz = len(mz_axis)
-            flat_mzs = np.tile(mz_axis, n_pixels)
-            flat_ints = np.empty(n_pixels * n_mz, dtype=np.float32)
-            pixel_offsets = list(range(0, (n_pixels + 1) * n_mz, n_mz))
-            for i, (_, ints) in enumerate(reader.spectra_iter(silent=True)):
-                flat_ints[i * n_mz : (i + 1) * n_mz] = np.asarray(ints, dtype=np.float32)
-            return flat_mzs, flat_ints, pixel_offsets
-        except Exception:
-            pass  # fall through to generic path
-
-    # Centroid path: variable-length spectra, pre-allocated growing buffer.
-    # Initial capacity: ~1000 peaks/pixel; doubles on overflow.
-    cap = n_pixels * 1000
-    flat_mzs = np.empty(cap, dtype=np.float64)
-    flat_ints = np.empty(cap, dtype=np.float32)
-    pixel_offsets = [0] * (n_pixels + 1)
-    pos = 0
-    for i, (mzs, ints) in enumerate(reader.spectra_iter(silent=True)):
-        mz_arr = np.asarray(mzs, dtype=np.float64)
-        int_arr = np.asarray(ints, dtype=np.float32)
-        n = len(mz_arr)
-        if pos + n > cap:
-            cap = max(pos + n, cap * 2)
-            new_mzs = np.empty(cap, dtype=np.float64)
-            new_ints = np.empty(cap, dtype=np.float32)
-            new_mzs[:pos] = flat_mzs[:pos]
-            new_ints[:pos] = flat_ints[:pos]
-            flat_mzs = new_mzs
-            flat_ints = new_ints
-        flat_mzs[pos : pos + n] = mz_arr
-        flat_ints[pos : pos + n] = int_arr
-        pos += n
-        pixel_offsets[i + 1] = pos
-    return flat_mzs[:pos].copy(), flat_ints[:pos].copy(), pixel_offsets
-
-
-def _compute_isotope_means_python(
-    flat_mzs: np.ndarray,
-    flat_ints: np.ndarray,
-    pixel_offsets: list[int],
-    target_mzs: np.ndarray,
-    ppm_tolerance: float,
-) -> np.ndarray:
-    """Pure-Python fallback for compute_maldi_isotope_means (no Rust required).
-
-    Uses window-sum aggregation to match the RAM path (_extract_centroid_fast
-    uses np.bincount weighted sum) and the fixed Rust path.
-    O(n_pixels * n_targets) with small constant — acceptable for Rust-absent envs.
-    """
-    n_targets = len(target_mzs)
-    n_pixels = len(pixel_offsets) - 1
-    sums = np.zeros(n_targets, dtype=np.float64)
-    tols = target_mzs * ppm_tolerance * 1e-6
-    lo_bounds = target_mzs - tols
-    hi_bounds = target_mzs + tols
-
-    for px in range(n_pixels):
-        lo = pixel_offsets[px]
-        hi = pixel_offsets[px + 1]
-        if lo == hi:
-            continue
-        mzs = flat_mzs[lo:hi]
-        ints = flat_ints[lo:hi].astype(np.float64)
-
-        # Window-sum: for each target find all peaks within [mz-tol, mz+tol]
-        # and sum their intensities.
-        lo_idxs = np.searchsorted(mzs, lo_bounds, side="left")
-        hi_idxs = np.searchsorted(mzs, hi_bounds, side="right")
-        for ti in range(n_targets):
-            if lo_idxs[ti] < hi_idxs[ti]:
-                sums[ti] += ints[lo_idxs[ti]:hi_idxs[ti]].sum()
-
-    return sums / max(n_pixels, 1)
 
 
 def _weighted_isotope_channel(
@@ -445,75 +297,9 @@ def _weighted_isotope_channel(
     return (slope * m0_means).astype(np.float32)
 
 
-def compute_isotope_envelope_means(
-    reader,
-    feature_mzs: np.ndarray,
-    extraction_ppm: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute per-feature mean intensities for M0, M+1, and M+2 in one pass.
-
-    Streams all pixels exactly once (via ``reader.spectra_iter``), builds flat
-    CSR arrays, and dispatches to the Rust ``compute_maldi_isotope_means``
-    function if available — falling back to vectorised Python otherwise.
-
-    Returns
-    -------
-    m0_means, m1_means, m2_means : np.ndarray, shape (n_features,), float32
-        Spatial-mean intensity for each isotope peak.
-    """
-    _NEUTRON = 1.003355
-    n_feat = len(feature_mzs)
-
-    logger.info("  Streaming pixel spectra for M+1/M+2 isotope envelope extraction...")
-    flat_mzs, flat_ints, pixel_offsets = _collect_pixel_spectra(reader)
-    n_pixels = len(pixel_offsets) - 1
-    logger.debug(f"    Collected {n_pixels} pixels, {len(flat_mzs):,} total peaks")
-
-    # M0: computed from the flat arrays directly (avoids relying on ion_images).
-    # M+1 and M+2: extracted together in the same Rust call.
-    all_targets = np.concatenate([
-        feature_mzs,
-        feature_mzs + _NEUTRON,
-        feature_mzs + 2 * _NEUTRON,
-    ])  # shape (3 * n_feat,)
-
-    try:
-        from ms1rescore_rs import compute_maldi_isotope_means as _rs_means
-        means = np.asarray(
-            _rs_means(flat_mzs, flat_ints, pixel_offsets, all_targets.tolist(), extraction_ppm),
-            dtype=np.float64,
-        )
-        logger.debug("  compute_maldi_isotope_means: used Rust implementation")
-    except (ImportError, AttributeError):
-        means = _compute_isotope_means_python(
-            flat_mzs, flat_ints, pixel_offsets, all_targets, extraction_ppm
-        )
-        logger.debug("  compute_maldi_isotope_means: used Python fallback")
-
-    # Free the large flat arrays as soon as Rust is done.
-    del flat_mzs, flat_ints
-
-    m0_means = means[:n_feat].astype(np.float32)
-    m1_means = means[n_feat:2 * n_feat].astype(np.float32)
-    m2_means = means[2 * n_feat:].astype(np.float32)
-    return m0_means, m1_means, m2_means
-
-
 # ---------------------------------------------------------------------------
 # Spatial feature computation
 # ---------------------------------------------------------------------------
-
-
-def _queen_w_sum(H: int, W: int) -> float:
-    """Total queen's-contiguity weight for an H×W grid with zero boundary."""
-    ones = np.ones((H, W), dtype=np.float64)
-    pad = np.pad(ones, 1, mode="constant", constant_values=0.0)
-    nsum = (
-        pad[0:H, 0:W] + pad[0:H, 1:W+1] + pad[0:H, 2:W+2]
-        + pad[1:H+1, 0:W] + pad[1:H+1, 2:W+2]
-        + pad[2:H+2, 0:W] + pad[2:H+2, 1:W+1] + pad[2:H+2, 2:W+2]
-    )
-    return float(nsum.sum())
 
 
 def _compute_chunk(
@@ -565,31 +351,12 @@ def _compute_chunk(
     else:
         p90 = np.zeros(n_features, dtype=np.float64)
 
-    # --- Moran's I via batched zero-padded neighbour sum (no scipy) ---
+    # --- Moran's I (queen contiguity, zero boundary) ---
     imgs_f = flat32.reshape(n_features, H, W)
     dev32 = imgs_f - imgs_f.mean(axis=(1, 2), keepdims=True)
-
-    pad = np.pad(dev32, ((0, 0), (1, 1), (1, 1)), mode="constant", constant_values=0.0)
-    neighbor_dev = pad[:, 0:H, 0:W].copy()
-    neighbor_dev += pad[:, 0:H, 1:W+1]
-    neighbor_dev += pad[:, 0:H, 2:W+2]
-    neighbor_dev += pad[:, 1:H+1, 0:W]
-    neighbor_dev += pad[:, 1:H+1, 2:W+2]
-    neighbor_dev += pad[:, 2:H+2, 0:W]
-    neighbor_dev += pad[:, 2:H+2, 1:W+1]
-    neighbor_dev += pad[:, 2:H+2, 2:W+2]
-    del pad
-
-    numerators = (dev32 * neighbor_dev).sum(axis=(1, 2), dtype=np.float64)
     denominators = (dev32 * dev32).sum(axis=(1, 2), dtype=np.float64)
-    del neighbor_dev, dev32
-
-    w_sum = _queen_w_sum(H, W)
-    morans_i = np.where(
-        denominators > 1e-12,
-        (n_img / w_sum) * numerators / denominators,
-        0.0,
-    )
+    morans_i = _morans_i_batch(dev32, denominators, n_img, _queen_weights(H, W)[1])
+    del dev32
 
     # --- Spatial Shannon entropy of the per-feature intensity distribution ---
     safe_sum = np.maximum(intensity_sum, 1e-12)[:, None]
@@ -639,10 +406,7 @@ def compute_spatial_features(
     n_workers
         Number of worker threads.  ``None`` → ``os.cpu_count()``.
     """
-    import os
     from concurrent.futures import ThreadPoolExecutor
-
-    from msi_picasso.maldi_features import _available_memory_bytes
 
     n_features = len(feature_mzs)
     if n_workers is None:
@@ -709,36 +473,12 @@ def compute_spatial_features(
     return df
 
 
-# ---------------------------------------------------------------------------
-# LC-MS/MS guided feature m/z computation
-# ---------------------------------------------------------------------------
-
-
-_PROTON = 1.007276
-
-
-def _find_col(df: "pd.DataFrame", *candidates: str) -> "str | None":
-    """Return the first column whose lowercased name contains one of the candidates."""
-    lower = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand in lower:
-            return lower[cand]
-    for cand in candidates:
-        for col_lower, col_orig in lower.items():
-            if cand in col_lower:
-                return col_orig
-    return None
-
-
 def extract_maldi_data(
     d_path: str,
     extraction_ppm: float = 25.0,
-    matching_ppm: float = 20.0,
     feature_mzs: np.ndarray | None = None,
     keep_mask: np.ndarray | None = None,
     drop_zero_signal: bool = True,
-    images_path: str | None = None,
-    image_batch_size: int = 100,
     output_npz: str | None = None,
     output_spatial_tsv: str | None = None,
     output_dir: str | None = None,
@@ -756,13 +496,7 @@ def extract_maldi_data(
     ``_features_from_lcms_file_diagnostic``.
     Features with zero MALDI signal are removed after extraction.
 
-    By default ion images are loaded fully into RAM (fast, single pass).
-    For datasets where the full ``(n_features, H, W)`` float32 array does not
-    fit in RAM, set ``images_path`` to a file path: images are then written
-    directly to a memory-mapped file in batches of ``image_batch_size``
-    features, capping peak RAM at ``image_batch_size × H × W × 4`` bytes.
-    The returned ``ion_images`` is a ``np.memmap`` that is transparent to all
-    downstream code (colocalization, spatial features, NPZ saving).
+    Ion images are held fully in RAM and extracted in a single pass.
 
     Parameters
     ----------
@@ -773,12 +507,6 @@ def extract_maldi_data(
         points contribute to each ion image.  Should be slightly wider than
         the instrument's typical peak width in imaging mode to avoid cutting
         off peak tails.  Default 25.0 ppm.
-    matching_ppm
-        m/z window for candidate matching.  Applied to the detected feature
-        centroid m/z when linking peptide candidates to MALDI features.
-        Should reflect the accuracy of the centroid estimate.  Default 20.0 ppm.
-        This value is stored in the returned ``spatial_df`` as metadata but is
-        not used internally — pass it to ``match_to_maldi_features``.
     feature_mzs
         **Required.**  The detected feature m/z values to extract at, from the
         TIMSImaging fork's peak picking.  Not for LC-MS/MS guided feature
@@ -789,12 +517,6 @@ def extract_maldi_data(
         (``query_raw_maldi``): there, every candidate m/z must be retained even
         when it lands in empty m/z space, so that decoys with zero MALDI signal
         produce genuine zero-signal ion images rather than vanishing.
-    images_path
-        If given, write ion images to this path as a float32 memmap instead
-        of allocating in RAM.  Enables extraction of datasets that would
-        otherwise OOM.
-    image_batch_size
-        Features per batch when ``images_path`` is set.  Default 100.
     output_npz
         If given, save ``{mzs, images, x_coords, y_coords}`` to this path.
     output_spatial_tsv
@@ -804,7 +526,7 @@ def extract_maldi_data(
     -------
     (feature_mzs, ion_images, spatial_df)
         ``feature_mzs`` — 1D float64, shape ``(n_features,)``
-        ``ion_images``  — float32 array or memmap, shape ``(n_features, H, W)``
+        ``ion_images``  — float32 array, shape ``(n_features, H, W)``
         ``spatial_df``  — DataFrame with per-feature spatial statistics
     """
     # Checked before any I/O: a missing feature list is a caller error, and the
@@ -854,103 +576,47 @@ def extract_maldi_data(
     ]
     _extra_raw: dict | None = None
 
-    if images_path is None:
-        logger.debug("  No images_path given, extracting full ion image array in RAM.")
-        # Attempt a single spectra_iter() pass for all 6 feature sets (profile mode).
-        # The main set covers EVERY peak, because the on-tissue mask is a per-pixel
-        # sum over all of them and changes if any are missing (PROGRESS.md, the
-        # colocalization family moved on ~100% of rows when 78% of peaks were
-        # dropped). The isotope and adduct sets are read per candidate, so they are
-        # extracted only where a candidate matched -- that is five of the six
-        # arrays, and the bulk of the memory.
-        _extra_src = feature_mzs if keep_mask is None else feature_mzs[keep_mask]
-        _all_feat_mzs = [feature_mzs] + [_extra_src + d for d in _extra_deltas]
-        _multi = _extract_profile_fast_multi(reader, _all_feat_mzs, ppm=extraction_ppm)
-        if _multi is not None:
-            logger.debug(
-                "  Used fast profile multi-extraction (single spectra_iter pass, Rust rayon)."
-            )
-            ion_images = _multi[0]
-            _extra_raw = {k: _multi[i + 1] for i, k in enumerate(_extra_keys)}
-        else:
-            ion_images = extract_ion_images(reader, feature_mzs, ppm=extraction_ppm)
-
-        if verbose:
-            logger.info(f"  Ion images shape: {ion_images.shape}, dtype: {ion_images.dtype}")
-            # Nothing in the pipeline reads 2_ion_images.npy back; it exists for the
-            # notebooks. It is also the largest thing a run writes -- 123 GB for her2 at
-            # min_regions=1, and 926 GB of a 942 GB results tree -- so it is opt-in
-            # rather than a side effect of `verbose`. It filled the disk and killed
-            # her2_E030 and all three E031 runs before this was changed.
-            if output_dir and save_ion_images:
-                images_npy = os.path.join(output_dir, "2_ion_images.npy")
-                np.save(images_npy, ion_images)
-                logger.info(f"  Saved ion images → {images_npy}")
-
-        logger.info("Step 2/2: Computing spatial features...")
-        spatial_df = compute_spatial_features(
-            ion_images, feature_mzs, reader.n_pixels
+    # Attempt a single spectra_iter() pass for all 6 feature sets (profile mode).
+    # The main set covers EVERY peak, because the on-tissue mask is a per-pixel
+    # sum over all of them and changes if any are missing (PROGRESS.md, the
+    # colocalization family moved on ~100% of rows when 78% of peaks were
+    # dropped). The isotope and adduct sets are read per candidate, so they are
+    # extracted only where a candidate matched -- that is five of the six
+    # arrays, and the bulk of the memory.
+    _extra_src = feature_mzs if keep_mask is None else feature_mzs[keep_mask]
+    _all_feat_mzs = [feature_mzs] + [_extra_src + d for d in _extra_deltas]
+    _multi = _extract_profile_fast_multi(reader, _all_feat_mzs, ppm=extraction_ppm)
+    if _multi is not None:
+        logger.debug(
+            "  Used fast profile multi-extraction (single spectra_iter pass, Rust rayon)."
         )
-        if verbose:
-            logger.info(f"  Spatial features DataFrame:\n{spatial_df.head()}")
-            if output_dir:
-                spatial_csv = os.path.join(output_dir, "3_spatial_features.csv")
-                spatial_df.to_csv(spatial_csv, index=False)
-                logger.info(f"  Saved spatial features → {spatial_csv}")
+        ion_images = _multi[0]
+        _extra_raw = {k: _multi[i + 1] for i, k in enumerate(_extra_keys)}
     else:
-        # Memory-efficient: write to disk in batches, never hold full array in RAM.
-        n_features = len(feature_mzs)
-        height, width = reader.image_shape
-        ion_images = np.memmap(
-            images_path,
-            dtype=np.float32,
-            mode="w+",
-            shape=(n_features, height, width),
-        )
-        logger.info(
-            f"  Memmap {n_features} × {height} × {width} float32 → {images_path}"
-        )
-        # Two defects, measured rather than suspected, so this is a last resort:
-        #
-        # 1. It calls reader.get_ion_images() once per batch, and each call
-        #    iterates every spectrum. The in-RAM path instead makes ONE
-        #    spectra_iter pass for all six feature sets via
-        #    _extract_profile_fast_multi. Measured on her2 (54326 features,
-        #    52019 pixels, image_batch_size=100): 4m47s per batch of 100, i.e.
-        #    543 passes and ~43 hours, against ~10 minutes for the in-RAM path.
-        #    Raising image_batch_size cuts the number of passes proportionally.
-        # 2. It extracts ONLY the main feature set. The M+1, M+2, Na, K and CHCA
-        #    images are never produced, so every isotope- and adduct-
-        #    colocalization feature silently goes missing.
-        #
-        # Use this only when the array genuinely cannot fit in RAM, and expect a
-        # reduced feature set if you do.
-        logger.warning(
-            "  images_path is set: extraction falls back to a per-batch reader "
-            "loop (~%d passes over the data) and produces NO isotope/adduct "
-            "extra images, so those colocalization features will be missing. "
-            "Prefer the in-RAM path unless the %.1f GB array cannot fit.",
-            (n_features + image_batch_size - 1) // image_batch_size,
-            n_features * height * width * 4 / 1e9,
-        )
-        spatial_chunks: list[pd.DataFrame] = []
-        for batch_start in range(0, n_features, image_batch_size):
-            batch_end = min(batch_start + image_batch_size, n_features)
-            batch_mzs = feature_mzs[batch_start:batch_end]
-            batch_images = reader.get_ion_images(
-                np.asarray(batch_mzs, dtype=np.float64),
-                ppm=extraction_ppm,
-                fill_value=0.0,
-                silent=True,
-            ).astype(np.float32)
-            ion_images[batch_start:batch_end] = batch_images
-            logger.info("Step 2/2: Computing spatial features...")
-            spatial_chunks.append(
-                compute_spatial_features(batch_images, batch_mzs, reader.n_pixels)
-            )
-            del batch_images
-        ion_images.flush()
-        spatial_df = pd.concat(spatial_chunks, ignore_index=True)
+        ion_images = extract_ion_images(reader, feature_mzs, ppm=extraction_ppm)
+
+    if verbose:
+        logger.info(f"  Ion images shape: {ion_images.shape}, dtype: {ion_images.dtype}")
+        # Nothing in the pipeline reads 2_ion_images.npy back; it exists for the
+        # notebooks. It is also the largest thing a run writes -- 123 GB for her2 at
+        # min_regions=1, and 926 GB of a 942 GB results tree -- so it is opt-in
+        # rather than a side effect of `verbose`. It filled the disk and killed
+        # her2_E030 and all three E031 runs before this was changed.
+        if output_dir and save_ion_images:
+            images_npy = os.path.join(output_dir, "2_ion_images.npy")
+            np.save(images_npy, ion_images)
+            logger.info(f"  Saved ion images → {images_npy}")
+
+    logger.info("Step 2/2: Computing spatial features...")
+    spatial_df = compute_spatial_features(
+        ion_images, feature_mzs, reader.n_pixels
+    )
+    if verbose:
+        logger.info(f"  Spatial features DataFrame:\n{spatial_df.head()}")
+        if output_dir:
+            spatial_csv = os.path.join(output_dir, "3_spatial_features.csv")
+            spatial_df.to_csv(spatial_csv, index=False)
+            logger.info(f"  Saved spatial features → {spatial_csv}")
 
     # Drop features with zero MALDI signal (no pixels detected).
     # This is especially important when feature_mzs come from LC-MS/MS IDs,
@@ -981,22 +647,18 @@ def extract_maldi_data(
     # These peaks are typically absent from the feature list (monoisotopic-only detection),
     # so extracting images at their exact m/z positions is the only way to compute
     # isotopologue and adduct colocalization features.
-    # Only done for the RAM path; the memmap path (very large datasets) skips this.
-    if images_path is None:
-        if _extra_raw is not None:
-            # Already extracted in the single-pass profile extraction above.
-            extra_ion_images: dict | None = _extra_raw
-        else:
-            logger.info("  Extracting M+1/M+2 and adduct isotopologue images for colocalization...")
-            extra_ion_images = {
-                "m1":   extract_ion_images(reader, feature_mzs + _NEUTRON,               ppm=extraction_ppm),
-                "m2":   extract_ion_images(reader, feature_mzs + 2.0 * _NEUTRON,         ppm=extraction_ppm),
-                "na":   extract_ion_images(reader, feature_mzs + _ADDUCT_DELTAS["na"],   ppm=extraction_ppm),
-                "k":    extract_ion_images(reader, feature_mzs + _ADDUCT_DELTAS["k"],    ppm=extraction_ppm),
-                "chca": extract_ion_images(reader, feature_mzs + _ADDUCT_DELTAS["chca"], ppm=extraction_ppm),
-            }
+    if _extra_raw is not None:
+        # Already extracted in the single-pass profile extraction above.
+        extra_ion_images: dict = _extra_raw
     else:
-        extra_ion_images = None
+        logger.info("  Extracting M+1/M+2 and adduct isotopologue images for colocalization...")
+        extra_ion_images = {
+            "m1":   extract_ion_images(reader, feature_mzs + _NEUTRON,               ppm=extraction_ppm),
+            "m2":   extract_ion_images(reader, feature_mzs + 2.0 * _NEUTRON,         ppm=extraction_ppm),
+            "na":   extract_ion_images(reader, feature_mzs + _ADDUCT_DELTAS["na"],   ppm=extraction_ppm),
+            "k":    extract_ion_images(reader, feature_mzs + _ADDUCT_DELTAS["k"],    ppm=extraction_ppm),
+            "chca": extract_ion_images(reader, feature_mzs + _ADDUCT_DELTAS["chca"], ppm=extraction_ppm),
+        }
 
     if output_npz is not None:
         if output_dir and not os.path.isabs(str(output_npz)):
@@ -1010,9 +672,8 @@ def extract_maldi_data(
             x_coords=x_coords,
             y_coords=y_coords,
         )
-        if extra_ion_images is not None:
-            for key, arr in extra_ion_images.items():
-                save_kwargs[f"extra_{key}"] = np.asarray(arr)
+        for key, arr in extra_ion_images.items():
+            save_kwargs[f"extra_{key}"] = np.asarray(arr)
         np.savez_compressed(npz_path, **save_kwargs)
         logger.info(f"  Saved NPZ → {npz_path}")
 
@@ -1054,18 +715,10 @@ def extract_maldi_data(
 
     # --- Compute MALDI isotope envelopes (M0/M+1/M+2 mean spatial intensity) ---
     logger.info("Computing MALDI isotope envelopes...")
-    if extra_ion_images is not None:
-        # RAM path: ion_images and m1/m2 images are already in memory — compute
-        n_px = reader.n_pixels
-        m0_means = (ion_images.sum(axis=(1, 2)) / n_px).astype(np.float32)
-        m1_means = _weighted_isotope_channel(ion_images, extra_ion_images["m1"], m0_means)
-        m2_means = _weighted_isotope_channel(ion_images, extra_ion_images["m2"], m0_means)
-        logger.debug("  Computed envelope means from in-memory ion images (no extra streaming pass).")
-    else:
-        # Memmap path: images not fully in RAM; stream pixels once via Rust.
-        m0_means, m1_means, m2_means = compute_isotope_envelope_means(
-            reader, feature_mzs, extraction_ppm
-        )
+    n_px = reader.n_pixels
+    m0_means = (ion_images.sum(axis=(1, 2)) / n_px).astype(np.float32)
+    m1_means = _weighted_isotope_channel(ion_images, extra_ion_images["m1"], m0_means)
+    m2_means = _weighted_isotope_channel(ion_images, extra_ion_images["m2"], m0_means)
     maldi_envelopes = {
         float(mz): [float(m0), float(m1), float(m2)]
         for mz, m0, m1, m2 in zip(feature_mzs, m0_means, m1_means, m2_means)

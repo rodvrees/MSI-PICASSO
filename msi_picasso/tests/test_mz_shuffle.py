@@ -149,17 +149,6 @@ class TestGenerateMzShuffleCandidates:
                 assert r["protein_tryptic_count"] == tgt_tc[base]
 
 
-class TestMzShuffleSpatialGate:
-
-    def test_mz_shuffle_permitted_with_spatial_ranker(self):
-        from msi_picasso.pipeline import _resolve_spatial_ranker_features
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")  # no warning -> permitted
-            assert _resolve_spatial_ranker_features(True, "mz_shuffle") is True
-
-
 class TestCcsMzDetrend:
     """The m/z-detrended CCS residual removes the m/z-baseline leak."""
 
@@ -207,12 +196,10 @@ class TestMzShuffleExcludesRawCcs:
     """For mz_shuffle the ranker keeps only the detrended *_resid CCS features."""
 
     def test_resid_registered_and_gated(self):
-        from msi_picasso.feature_generator import MALDI_INTRINSIC_FEATURES, get_feature_names
+        from msi_picasso.feature_generator import MALDI_INTRINSIC_FEATURES
         resid = ["im2deep_delta_ccs_resid", "im2deep_abs_delta_ccs_pct_resid",
                  "im2deep_ccs_zscore_resid", "im2deep_ccs_rank_resid"]
         assert all(f in MALDI_INTRINSIC_FEATURES for f in resid)
-        assert "im2deep_abs_delta_ccs_pct_resid" in get_feature_names(has_ccs=True)
-        assert "im2deep_abs_delta_ccs_pct_resid" not in get_feature_names(has_ccs=False)
 
     def test_leak_feature_set_covers_raw_ccs_and_mob_coloc_not_resid(self):
         from msi_picasso.pipeline import _MZ_SHUFFLE_CCS_LEAK_FEATURES as L

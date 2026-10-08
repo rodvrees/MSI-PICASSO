@@ -2,7 +2,7 @@
 
 SVC(kernel="rbf") is a nonlinear, decision_function-based classifier that reuses
 the same semi-supervised CV machinery as LDA/SVM (`_rescore_linear`). Unlike the
-tree backend it produces continuous scores, and unlike the linear backends it has
+linear backends it produces nonlinear scores, and unlike the linear backends it has
 no coef_, so its importances are permutation importances (H-model-2). These tests
 check the 5-tuple shape, target/decoy separation, that hyperparameters change the
 fit, that gamma accepts both strings and floats, that scores are continuous, and
@@ -12,7 +12,16 @@ that the reported importance finds the feature the score actually rests on.
 import numpy as np
 import pandas as pd
 
-from msi_picasso.pipeline import _rescore_lda, _rescore_rbf_svm
+from msi_picasso.pipeline import _estimator_factory, _rescore_linear
+
+
+def _rescore_rbf_svm(df, feats, init_ppm_threshold, rbf_svm_c=1.0, rbf_svm_gamma="scale", **kwargs):
+    """The rescore() call for model="rbf_svm"."""
+    return _rescore_linear(
+        df, feats, init_ppm_threshold, clf_name="rbf_svm",
+        make_clf=_estimator_factory("rbf_svm", rbf_svm_c=rbf_svm_c, rbf_svm_gamma=rbf_svm_gamma),
+        **kwargs,
+    )
 
 
 def _synthetic_features(n=400, seed=0):
@@ -41,7 +50,7 @@ class TestRescoreRbfSvm:
         )
         assert scores.shape == (len(df),)
         assert np.isfinite(scores).all()
-        # kernel SVM has no coef_/feature_importances_; importances are the
+        # kernel SVM has no coef_; importances are the
         # permutation importances, aligned with the ranker's feature list
         assert importances is not None and len(importances) == len(feats)
         assert names == feats
@@ -77,8 +86,8 @@ class TestRescoreRbfSvm:
         assert scores[~d].mean() > scores[d].mean()
 
     def test_scores_are_continuous(self):
-        """Unlike the tree backend, the RBF-SVM decision function is continuous:
-        nearly every candidate gets a distinct score (no discrete leaf spikes)."""
+        """The RBF-SVM decision function is continuous: nearly every candidate
+        gets a distinct score."""
         df, feats = _synthetic_features()
         scores, *_ = _rescore_rbf_svm(df, feats, init_ppm_threshold=5.0)
         n_unique = len(np.unique(np.round(scores, 8)))
@@ -99,7 +108,7 @@ class TestRescoreRbfSvm:
 
     def test_matches_lda_interface_shape(self):
         df, feats = _synthetic_features()
-        lda_out = _rescore_lda(df, feats, init_ppm_threshold=5.0)
+        lda_out = _rescore_linear(df, feats, init_ppm_threshold=5.0)
         rbf_out = _rescore_rbf_svm(df, feats, init_ppm_threshold=5.0)
         assert len(lda_out) == len(rbf_out) == 5
         assert lda_out[0].shape == rbf_out[0].shape
@@ -114,8 +123,8 @@ class TestRescoreRbfSvm:
         assert out[1] is not None and len(out[1]) == len(feats)
         assert out[1][feats.index("good_feature")] > out[1][feats.index("noise_feature")]
 
-        lda_one = _rescore_lda(df, feats, init_ppm_threshold=5.0)
-        lda_rep = _rescore_lda(df, feats, init_ppm_threshold=5.0, model_repeats=3)
+        lda_one = _rescore_linear(df, feats, init_ppm_threshold=5.0)
+        lda_rep = _rescore_linear(df, feats, init_ppm_threshold=5.0, model_repeats=3)
         # LDA has coef_, so its importances still come from replicate 0 unchanged
         assert np.allclose(lda_one[1], lda_rep[1])
 

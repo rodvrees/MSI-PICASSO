@@ -13,56 +13,23 @@ from msi_picasso.candidates import (
     target_rows,
     digest_fasta,
     digest_identified_proteins,
-    generate_balanced_shuffle_candidates,
-    generate_mz_shift_candidates,
     generate_mz_shuffle_candidates,
-    load_entrapment_candidates,
     match_to_maldi_features,
 )
 from msi_picasso.feature_generator import (
     FEATURE_NAN_FILL,
-    LCMS_PRIOR_FEATURES,
     MAIN_FEATURES,
     MALDI_INTRINSIC_FEATURES,
     MOB_QUALITY_FEATURES,
     MZ_SHUFFLE_MASSNORM_ISOTOPE_FEATURES,
     COSINE_COLOCALIZATION_FEATURES,
-    REGION_COLOCALIZATION_FEATURES,
-    WITHIN_REGION_COLOCALIZATION_FEATURES,
     PROTEIN_LEVEL_FEATURES,
-    SPATIAL_PRIOR_FEATURES,
     SPATIAL_RANKER_FEATURES,
-    candidates_to_psm_list,
     compute_all_features,
-    get_feature_names,
-    populate_psm_features,
 )
-from msi_picasso.lcms_evidence import (
-    compute_all_lcms_evidence,
-    finetune_deeplc,
-    finetune_deeplc_from_df,
-    get_deeplc_predictions,
-    get_ms2pip_predictions,
-    load_lcms_data,
-)
+from msi_picasso.utils import values_at_mz
 
 logger = logging.getLogger(__name__)
-
-# Spatial prior: Geary's C is lower-is-better (< 1 = positive autocorrelation)
-_SPATIAL_INVERT_FEATURES = frozenset(["spatial_gearys_c"])
-
-# Decoy methods whose decoys land on real MALDI features, giving spatial ranker
-# features a symmetric null.  shuffle/balanced_shuffle/paired_shuffle do not.
-_SPATIAL_RANKER_OK_DECOYS = frozenset(["entrapment", "mz_shift", "mz_shuffle", "substitution"])
-
-# Decoy methods for which the intrinsic 2D peak-quality features (MOB_QUALITY_FEATURES)
-# enter the ranker by default. For substitution the decoy sits at a distinct (often
-# empty/noisy) m/z, so feature-level peak quality discriminates. For mz_shuffle the
-# co-located target+decoy share the feature, so these columns are exactly symmetric
-# (AUC ~= 0.5) — a harmless default and a built-in leak-safety check. No m/z-baseline
-# leak (they use only the observed peak, no prediction), so unlike the im2deep_* CCS
-# scalars they are NOT in _MZ_SHUFFLE_CCS_LEAK_FEATURES.
-_MOB_QUALITY_DEFAULT_DECOYS = frozenset(["substitution", "mz_shuffle"])
 
 # Features that use the candidate's PREDICTED CCS/mobility to gate or compare against
 # the observed feature. For mz_shuffle (peptide relocated far in mass; CCS/1-K0 ∝ m/z)
@@ -127,28 +94,6 @@ def _mz_shuffle_leaking_features(columns) -> set[str]:
     )
 
 
-def _resolve_spatial_ranker_features(
-    use_spatial_ranker_features: bool, decoy_method: str
-) -> bool:
-    """Return whether spatial ranker features may be used with this decoy method.
-
-    Emits a ``UserWarning`` and returns ``False`` when the flag is requested with
-    a decoy method that lacks a consistent spatial anchor (any shuffle variant).
-    """
-    if use_spatial_ranker_features and decoy_method not in _SPATIAL_RANKER_OK_DECOYS:
-        warnings.warn(
-            f"--use-spatial-ranker-features is only valid with --decoy-method entrapment, "
-            f"mz_shift, or mz_shuffle. With '{decoy_method}' decoys, spatial features are "
-            f"asymmetric: shuffle/balanced_shuffle/paired_shuffle decoys have no consistent "
-            f"spatial anchor and their ion images reflect arbitrary m/z space rather than a "
-            f"real decoy identity. Disabling --use-spatial-ranker-features.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return False
-    return use_spatial_ranker_features
-
-
 def _observed_ccs_by_feature_idx(
     candidates: pd.DataFrame,
     maldi_mzs: np.ndarray,
@@ -164,45 +109,13 @@ def _observed_ccs_by_feature_idx(
     are dropped.  Returns ``None`` when no feature has a finite CCS, so downstream
     ``is not None`` guards behave like the no-mobility path.
     """
-    mz_to_ccs = {
-        float(m): float(c)
-        for m, c in zip(np.asarray(maldi_mzs), np.asarray(ccs_arr))
-        if np.isfinite(c)
-    }
+    pairs = candidates[["feature_idx", "feature_mz"]].drop_duplicates()
+    ccs = values_at_mz(ccs_arr, maldi_mzs, pairs["feature_mz"])
+    found = np.isfinite(ccs)
     ccs_map = {
-        int(fi): mz_to_ccs[float(mz)]
-        for fi, mz in candidates[["feature_idx", "feature_mz"]]
-        .drop_duplicates()
-        .itertuples(index=False)
-        if float(mz) in mz_to_ccs
+        int(fi): float(c) for fi, c in zip(pairs["feature_idx"].to_numpy()[found], ccs[found])
     }
     return ccs_map or None
-
-
-def _mob_hist_by_feature_idx(
-    candidates: pd.DataFrame,
-    maldi_mzs: np.ndarray,
-    mob_k0_hist: np.ndarray | None,
-) -> dict | None:
-    """Build a ``mob_k0_hist_by_feature`` dict keyed by candidate ``feature_idx``.
-
-    ``mob_k0_hist`` is a ``(len(maldi_mzs), n_bins)`` array aligned with the queried
-    m/z grid.  Bridged to candidate ``feature_idx`` via ``feature_mz`` exactly like
-    :func:`_observed_ccs_by_feature_idx` (each value is the candidate's 1/K0
-    histogram row).  Returns ``None`` when ``mob_k0_hist`` is absent.
-    """
-    if mob_k0_hist is None:
-        return None
-    maldi_mzs = np.asarray(maldi_mzs)
-    mz_to_row = {float(m): i for i, m in enumerate(maldi_mzs)}
-    hist_map = {
-        int(fi): mob_k0_hist[mz_to_row[float(mz)]]
-        for fi, mz in candidates[["feature_idx", "feature_mz"]]
-        .drop_duplicates()
-        .itertuples(index=False)
-        if float(mz) in mz_to_row
-    }
-    return hist_map or None
 
 
 def _recompute_ppm_from_centroids(
@@ -218,8 +131,8 @@ def _recompute_ppm_from_centroids(
     construction and decoys inherit 0.  Instead, for each candidate row compute the
     mass accuracy of the observed peak in its own extraction window:
     ``(observed_centroid - feature_mz) / feature_mz * 1e6``, where ``feature_mz`` is
-    the candidate's queried anchor (the peptide's [M+H]+ for a target, the shifted
-    m/z for an ``mz_shift`` decoy).  Identical treatment for targets and decoys (no
+    the candidate's queried anchor (the peptide's own [M+H]+ for a target or a
+    substitution decoy).  Identical treatment for targets and decoys (no
     inheritance), bounded by ±extraction_ppm, and non-leaking (it never references
     the peptide mass for a decoy).
 
@@ -227,20 +140,15 @@ def _recompute_ppm_from_centroids(
     ``worst_case_ppm`` is given, such rows are set to that worst-case value (the
     extraction window edge — a real peak's centroid is always within
     ±extraction_ppm of the anchor, so this is the worst in-distribution value) so
-    empty-signal candidates (e.g. ``mz_shift`` decoys shifted into empty m/z space)
+    empty-signal candidates (e.g. decoys whose m/z lands in empty space)
     are penalised on ppm rather than median-imputed to an average value.  When
     ``worst_case_ppm`` is ``None`` those rows are left ``NaN``.
 
     ``centroid_mz`` is aligned with ``maldi_mzs``; the result is aligned with the
     per-row ``feature_mz`` input.
     """
-    mz_to_centroid = {
-        float(m): float(c)
-        for m, c in zip(np.asarray(maldi_mzs), np.asarray(centroid_mz))
-        if np.isfinite(c)
-    }
     fmz = np.asarray(feature_mz, dtype=np.float64)
-    obs = np.array([mz_to_centroid.get(float(m), np.nan) for m in fmz], dtype=np.float64)
+    obs = values_at_mz(centroid_mz, maldi_mzs, fmz)
     with np.errstate(invalid="ignore"):
         ppm = (obs - fmz) / fmz * 1e6
     if worst_case_ppm is not None:
@@ -255,12 +163,7 @@ def _recompute_ppm_from_centroids(
 # zero-evidence candidate. Mirror the ppm worst-case fill in _recompute_ppm_from_centroids:
 # set those NaNs to the worst in-distribution value (the pooled finite minimum) so a
 # no-signal candidate is penalised on coloc rather than imputed up to average.
-_PROTEIN_COLOC_WORST_PREFIXES = (
-    "protein_colocalization",
-    "protein_region_colocalization",
-    "protein_within_region_colocalization",
-    "protein_dominant_region_colocalization",
-)
+_PROTEIN_COLOC_WORST_PREFIXES = ("protein_colocalization",)
 
 
 def _fill_nosignal_coloc_worst_case(features_df: pd.DataFrame) -> pd.DataFrame:
@@ -302,78 +205,6 @@ def _fill_nosignal_coloc_worst_case(features_df: pd.DataFrame) -> pd.DataFrame:
             f"{int(no_signal.sum())} zero-signal candidates (symmetric, is_decoy-blind)."
         )
     return features_df
-
-
-def compute_lcms_prior(
-    candidates_df: pd.DataFrame,
-    present_lcms_features: list[str],
-) -> np.ndarray:
-    """
-    Compute a per-candidate multiplicative weight in (0, 1] based on
-    available LC-MS/MS evidence.
-
-    Each feature is min-max normalized to [0, 1] using the non-NaN range.
-    NaN values (e.g. lcms_ms2_spectral_angle when no MS2 prediction is
-    available) are excluded from that candidate's mean so they don't
-    suppress the prior for candidates that lack MS2 evidence.
-    Features where all non-NaN values are identical are skipped.
-    Returns the nanmean of normalized features, or 1.0 where all features
-    are NaN or no informative features are present.
-    """
-    normed: list[np.ndarray] = []
-
-    for feat in present_lcms_features:
-        if feat not in candidates_df.columns:
-            continue
-        col = candidates_df[feat].values.astype(float)
-        col_min = np.nanmin(col)
-        col_max = np.nanmax(col)
-        if not np.isfinite(col_min) or not np.isfinite(col_max) or col_max - col_min < 1e-12:
-            continue
-        normed.append((col - col_min) / (col_max - col_min))
-
-    if not normed:
-        return np.ones(len(candidates_df))
-
-    stacked = np.stack(normed, axis=0)
-    result = np.nanmean(stacked, axis=0)
-    # candidates where every feature is NaN get a neutral weight
-    return np.where(np.isnan(result), 1.0, result)
-
-
-def compute_spatial_prior(
-    candidates_df: pd.DataFrame,
-    present_spatial_features: list[str],
-) -> np.ndarray:
-    """
-    Compute a per-candidate multiplicative weight in (0, 1] based on
-    spatial quality of the ion image.
-
-    All spatial features are feature-level (identical for all candidates at the
-    same m/z), so they cannot discriminate within a feature. Applied as a
-    post-scoring prior rather than as ranker inputs. Each feature is min-max
-    normalized; ``spatial_gearys_c`` is negated before normalization (lower
-    Geary's C = positive autocorrelation = better). Returns 1.0 if no
-    informative spatial features are present.
-    """
-    normed: list[np.ndarray] = []
-
-    for feat in present_spatial_features:
-        if feat not in candidates_df.columns:
-            continue
-        col = candidates_df[feat].fillna(0.0).values.astype(float)
-        col = np.where(np.isfinite(col), col, 0.0)
-        if feat in _SPATIAL_INVERT_FEATURES:
-            col = -col
-        col_min, col_max = col.min(), col.max()
-        if col_max - col_min < 1e-12:
-            continue
-        normed.append((col - col_min) / (col_max - col_min))
-
-    if not normed:
-        return np.ones(len(candidates_df))
-
-    return np.stack(normed, axis=0).mean(axis=0)
 
 
 def _apply_nan_fill(
@@ -505,54 +336,6 @@ def _encode_labels(is_decoy, positive_mask):
     ).astype(np.int8)
 
 
-def _split_decoys_for_reset(is_decoy: np.ndarray, seed: int = 0) -> np.ndarray | None:
-    """Percolator-RESET-style decoy split (H-fdr-2, Freestone et al. 2025).
-
-    Partitions decoys into a training half (used to fit/seed the discriminant)
-    and a held-out half (used only for the final reported FDR), so the same
-    decoy is never both taught to the model and counted against it — the
-    self-selection bias Freestone et al. measure as a 0.0189 violation of a
-    nominal 1% threshold when the same decoys serve both roles.
-
-    Deterministic (fixed ``seed``) and blind to every feature/score — a pure
-    structural split of row positions. Returns a boolean array aligned to
-    ``is_decoy``, True for decoys assigned to the TRAINING half (meaningless
-    for target rows). Returns ``None`` when there are too few decoys (< 4) to
-    split meaningfully, so the caller can fall back to unsplit behaviour.
-    """
-    is_decoy = np.asarray(is_decoy, dtype=bool)
-    decoy_idx = np.where(is_decoy)[0]
-    if len(decoy_idx) < 4:
-        return None
-    rng = np.random.default_rng(seed)
-    train_idx = rng.choice(decoy_idx, size=len(decoy_idx) // 2, replace=False)
-    mask = np.zeros(len(is_decoy), dtype=bool)
-    mask[train_idx] = True
-    return mask
-
-
-def _tdc_qvalues_masked(
-    scores: np.ndarray,
-    is_decoy: np.ndarray,
-    estimate_mask: np.ndarray | None = None,
-    **kwargs,
-) -> np.ndarray:
-    """``_tdc_qvalues`` restricted to an estimation subset (H-fdr-2 decoy holdout).
-
-    When ``estimate_mask`` is given, only rows inside it (targets + held-out
-    decoys under decoy-split) contribute to and receive a q-value; rows outside
-    it (decoys used for training) get NaN — harmless, since reported ID counts
-    are always gated on ``~is_decoy`` and a training decoy is never counted as
-    an ID regardless of its own q-value. ``estimate_mask=None`` reproduces
-    plain ``_tdc_qvalues`` exactly (unsplit behaviour, the default).
-    """
-    if estimate_mask is None:
-        return _tdc_qvalues(scores, is_decoy, **kwargs)
-    out = np.full(len(scores), np.nan)
-    out[estimate_mask] = _tdc_qvalues(scores[estimate_mask], is_decoy[estimate_mask], **kwargs)
-    return out
-
-
 def _seed_pass_mask(
     scores: np.ndarray,
     is_decoy: np.ndarray,
@@ -612,7 +395,6 @@ def _find_best_feature_labels(
     init_fdr: float = 0.2,
     min_seed_positives: int = 50,
     seed_features: list[str] | None = None,
-    include_mask: np.ndarray | None = None,
     protein: np.ndarray | None = None,
 ) -> tuple[np.ndarray, str, int] | None:
     """
@@ -645,13 +427,6 @@ def _find_best_feature_labels(
     colocalization features are non-discriminative (heterogeneous tissue). ``None``
     or ``[]`` (default) uses every eligible feature, i.e. unchanged behaviour.
 
-    When ``include_mask`` is given (H-fdr-2 decoy-split), every row outside it
-    is invisible to the entire search — excluded from the per-feature/pairwise/
-    tree TDC computations and from the eligible-feature std check — and always
-    gets label 0 in the returned array. This is how a Percolator-RESET-style
-    held-out decoy half is firewalled out of the seed decision: it never
-    influences which feature is picked or what counts as a pseudo-positive.
-
     NaN values in X are filled with the column median before ranking.
 
     ``protein`` (H-fdr-11): when given, every sweep below counts passes via
@@ -662,24 +437,14 @@ def _find_best_feature_labels(
     Returns
     -------
     (labels, best_feature_name, n_passing) or None when n_passing == 0.
-        labels: int8 array aligned to the ORIGINAL (full-length) X rows, even
-            when ``include_mask`` was given.
+        labels: int8 array aligned to the X rows.
             +1  — pseudo-positive: representative row of a protein (or, without
                   ``protein``, a row) at q <= init_fdr under the best score
             -1  — pseudo-negative: decoy
-             0  — excluded: q > init_fdr, a non-representative row of a passing
-                  protein, or outside ``include_mask``
+             0  — excluded: q > init_fdr, or a non-representative row of a
+                  passing protein
     """
     is_decoy = np.asarray(is_decoy, dtype=bool)
-
-    if include_mask is not None:
-        include_mask = np.asarray(include_mask, dtype=bool)
-        _orig_n = len(is_decoy)
-        _orig_idx = np.where(include_mask)[0]
-        X = X[include_mask]
-        is_decoy = is_decoy[include_mask]
-        if protein is not None:
-            protein = np.asarray(protein)[include_mask]
 
     # Optional allowlist: restrict seeding to a chosen feature subset (R2).
     _seed_allow = set(seed_features) if seed_features else None
@@ -699,12 +464,11 @@ def _find_best_feature_labels(
             return False
         return _seed_allow is None or fname in _seed_allow
 
-    X_imp = X.copy()
-    for j in range(X_imp.shape[1]):
-        col = X_imp[:, j]
-        finite_vals = col[np.isfinite(col)]
-        fill = float(np.median(finite_vals)) if len(finite_vals) > 0 else 0.0
-        col[~np.isfinite(col)] = fill
+    X_imp = np.where(np.isfinite(X), X, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN column
+        col_median = np.nanmedian(X_imp, axis=0)
+    X_imp = np.where(np.isnan(X_imp), np.nan_to_num(col_median, nan=0.0), X_imp)
 
     # Sub-ULP random noise to break ties in argsort.  A stable sort on a feature
     # with many tied values preserves the original DataFrame row order, which
@@ -749,9 +513,7 @@ def _find_best_feature_labels(
         col_means = X_imp[:, eligible].mean(axis=0)
         col_stds = X_imp[:, eligible].std(axis=0)
         col_stds[col_stds == 0] = 1.0
-        X_sc = np.empty((X_imp.shape[0], len(eligible)), dtype=np.float64)
-        for k, j in enumerate(eligible):
-            X_sc[:, k] = (X_imp[:, j] - col_means[k]) / col_stds[k]
+        X_sc = (X_imp[:, eligible] - col_means) / col_stds
 
         pair_best_n = best_n
         for ii in range(len(eligible)):
@@ -805,10 +567,6 @@ def _find_best_feature_labels(
 
     if result is None or result[2] == 0:
         return None
-    if include_mask is not None:
-        full_labels = np.zeros(_orig_n, dtype=np.int8)
-        full_labels[_orig_idx] = result[0]
-        result = (full_labels, result[1], result[2])
     return result
 
 
@@ -819,21 +577,18 @@ def _find_best_feature_labels_escalating(
     init_fdr: float,
     min_seed_positives: int = 50,
     seed_features: list[str] | None = None,
-    include_mask: np.ndarray | None = None,
     protein: np.ndarray | None = None,
     escalate: bool = False,
     step: float = 0.005,
     ceiling: float = 0.5,
 ) -> tuple[tuple[np.ndarray, str, int] | None, float]:
-    """``_find_best_feature_labels`` with H-fdr-2's training-FDR escalation.
+    """``_find_best_feature_labels`` with training-FDR escalation (H-fdr-2).
 
     If ``init_fdr`` yields nothing (``None``), retries at increasing thresholds
     (steps of ``step``, capped at ``ceiling``) until a non-empty seed is found
-    or the ceiling is reached — Freestone et al. (2025)'s Percolator-RESET
-    escalates from 0.01 in steps of 0.005; here it escalates from whichever
-    ``init_fdr`` was actually configured, since that is already the analogous
-    "how strict is a seed candidate" threshold in this pipeline. A no-op when
-    ``escalate`` is False or the configured threshold already succeeds.
+    or the ceiling is reached. Freestone et al. (2025) escalate from 0.01 in
+    steps of 0.005; here it escalates from whichever ``init_fdr`` was configured.
+    A no-op when ``escalate`` is False or the configured threshold already succeeds.
 
     Returns ``(bf_result, fdr_used)`` — ``fdr_used`` equals ``init_fdr`` unless
     escalation actually fired.
@@ -842,14 +597,14 @@ def _find_best_feature_labels_escalating(
     result = _find_best_feature_labels(
         X, is_decoy, feature_names, fdr,
         min_seed_positives=min_seed_positives, seed_features=seed_features,
-        include_mask=include_mask, protein=protein,
+        protein=protein,
     )
     while result is None and escalate and fdr < ceiling:
         fdr += step
         result = _find_best_feature_labels(
             X, is_decoy, feature_names, fdr,
             min_seed_positives=min_seed_positives, seed_features=seed_features,
-            include_mask=include_mask, protein=protein,
+            protein=protein,
         )
     return result, fdr
 
@@ -974,9 +729,6 @@ def _rescore_linear_once(
     intrinsic_feature_names: list[str],
     init_ppm_threshold: float,
     seed_mask: np.ndarray | None = None,
-    n_interaction_features: int = 0,
-    r1_importances: np.ndarray | None = None,
-    r1_feature_names: list[str] | None = None,
     init_fdr: float = 0.2,
     train_fdr: float = 0.05,
     max_iter: int = 5,
@@ -988,27 +740,26 @@ def _rescore_linear_once(
     make_clf=None,
     clf_name: str = "lda",
     fitted_out: dict | None = None,
-    decoy_split_mask: np.ndarray | None = None,
     train_fdr_escalate: bool = False,
     pseudo_label_growth_cap: float | None = None,
     perm_importance: bool = True,
 ) -> np.ndarray:
     """
-    Semi-supervised rescoring on MALDI-intrinsic features with a linear,
-    ``decision_function``-based classifier (LDA by default; LinearSVC for
-    ``clf_name="svm"`` — see ``_rescore_lda`` / ``_rescore_svm`` wrappers).
-    ``make_clf`` is a zero-arg factory returning the final pipeline estimator;
-    ``clf_name`` is its pipeline step key and the user-facing log/importance tag.
+    Semi-supervised rescoring on MALDI-intrinsic features with a
+    ``decision_function``-based classifier (LDA by default).
+    ``make_clf`` is a zero-arg factory returning the final pipeline estimator
+    (see ``_estimator_factory``); ``clf_name`` is its pipeline step key and the
+    user-facing log/importance tag.
 
     Pre-processing: ±inf replaced with NaN, then median imputation and
     StandardScaler inside a sklearn Pipeline.
 
-    Round-1 seed (when ``seed_mask`` is None): calls ``_find_best_feature_labels``
+    Seed (when ``seed_mask`` is None): calls ``_find_best_feature_labels``
     to pick the single feature that yields the most targets at q <= ``train_fdr``.
     Falls back to ppm_error_abs < ``init_ppm_threshold`` OR n_candidates == 1
     (with a top-percentile fallback) if no feature yields any targets.
 
-    Round-2 seed (``seed_mask`` provided): the boolean mask is converted to the
+    Explicit seed (``seed_mask`` provided): the boolean mask is converted to the
     same three-valued label scheme (+1 / -1 / 0) for the iteration loop.
 
     Pseudo-label iteration (up to ``max_iter`` rounds): trains on +1 vs -1 rows
@@ -1023,20 +774,6 @@ def _rescore_linear_once(
     in-sample scoring only when there are too few targets/decoys for CV.  The
     returned importances/structure coefficients come from a model fit on all
     pos/neg rows (reporting only — never used for the FDR scores).
-
-    When ``n_interaction_features > 0`` and R1 importances are supplied, the
-    top-k features are expanded with pairwise interaction terms before LDA.
-
-    ``decoy_split_mask`` (H-fdr-2, Percolator-RESET, opt-in): a boolean array
-    aligned to ``features_df`` rows, True for decoys assigned to the training
-    half (see ``_split_decoys_for_reset``). When given, decoys outside it are
-    firewalled out of every internal decision in this function — the R1/seed_mask
-    label assignment, every ``_find_best_feature_labels`` call, and every
-    iteration's pseudo-label update — always receiving label 0 (excluded from
-    training, still scored via CV out-of-fold). The final external FDR estimate
-    (in ``rescore()``, after winner selection) is what actually gets computed
-    against those held-out decoys instead; this function only ever sees/uses the
-    training half.
 
     ``train_fdr_escalate`` (H-fdr-2, opt-in): if the seed search or an iteration
     would otherwise yield zero pseudo-positives at the configured ``init_fdr``/
@@ -1062,15 +799,13 @@ def _rescore_linear_once(
 
     Returns ``(scores, importances, feature_names_used)``.
     """
-    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
     from sklearn.impute import SimpleImputer
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
     _tag = clf_name.upper()
     if make_clf is None:
-        def make_clf():
-            return LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=[0.5, 0.5])
+        make_clf = _estimator_factory("lda")
 
     df = features_df.reset_index(drop=True)
     present = [f for f in intrinsic_feature_names if f in df.columns]
@@ -1082,55 +817,13 @@ def _rescore_linear_once(
     is_target = ~is_decoy
     protein = df["protein"].to_numpy() if "protein" in df.columns else None
 
-    # H-fdr-2 decoy split: rows visible to every internal seed/pseudo-label
-    # decision are targets plus training-half decoys only. Held-out decoys are
-    # excluded (label 0) throughout this function; the caller estimates the
-    # final FDR against them separately. include_mask=None (decoy_split_mask
-    # not given) is all-True, reproducing unsplit behaviour exactly.
-    if decoy_split_mask is not None:
-        include_mask = is_target | (is_decoy & decoy_split_mask)
-        is_decoy_train = is_decoy & decoy_split_mask
-    else:
-        include_mask = None
-        is_decoy_train = is_decoy
-
-    # --- Polynomial interaction setup (R2 only when importances supplied) ---
-    use_poly = (
-        n_interaction_features > 0
-        and r1_importances is not None
-        and r1_feature_names is not None
-        and len(r1_importances) == len(r1_feature_names)
-    )
-    if use_poly:
-        from sklearn.preprocessing import PolynomialFeatures
-        present_set = set(present)
-        r1_order = np.argsort(np.abs(r1_importances))[::-1]
-        top_names = [
-            r1_feature_names[i] for i in r1_order
-            if r1_feature_names[i] in present_set
-        ][:n_interaction_features]
-        top_col_idx = [present.index(n) for n in top_names]
-        X_fit = X[:, top_col_idx]
-        _poly_probe = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
-        _poly_probe.fit(np.zeros((1, len(top_names))))
-        expanded_names = list(_poly_probe.get_feature_names_out(top_names))
-        n_cross = len(expanded_names) - len(top_names)
-        logger.info(
-            f"  {_tag} R2 interactions: top-{len(top_names)} features "
-            f"({', '.join(top_names)}) → {len(expanded_names)} total "
-            f"({len(top_names)} original + {n_cross} cross-terms)"
-        )
-    else:
-        X_fit = X
-        expanded_names = None
-
     # --- Initial label assignment ---
-    n_init_positives: int | None = None  # for post-loop comparison (R1 only)
+    n_init_positives: int | None = None  # for post-loop comparison
 
     if seed_mask is None:
         bf_result, _bf_fdr = _find_best_feature_labels_escalating(
             X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives,
-            seed_features=seed_features, include_mask=include_mask, protein=protein,
+            seed_features=seed_features, protein=protein,
             escalate=train_fdr_escalate,
         )
         if bf_result is not None:
@@ -1156,25 +849,20 @@ def _rescore_linear_once(
                 init_mask = (
                     is_target & (ppm_col < ppm_col[is_target].quantile(r1_seed_percentile))
                 ).values
-            labels = _encode_labels(is_decoy_train, init_mask)
+            labels = _encode_labels(is_decoy, init_mask)
     else:
         seed_arr = seed_mask.values if hasattr(seed_mask, "values") else np.asarray(seed_mask)
-        labels = _encode_labels(is_decoy_train, seed_arr)
+        labels = _encode_labels(is_decoy, seed_arr)
 
     n_seed = int((labels == 1).sum())
     logger.info(f"  {_tag}: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
 
     def _make_pipe():
-        steps = [
+        return Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-        ]
-        if use_poly:
-            steps.append(
-                ("poly", PolynomialFeatures(degree=2, interaction_only=True, include_bias=False))
-            )
-        steps.append((clf_name, make_clf()))
-        return Pipeline(steps)
+            (clf_name, make_clf()),
+        ])
 
     # Out-of-fold cross-validation prevents the semi-supervised LDA from
     # manufacturing target/decoy separation by overfitting (each candidate is
@@ -1196,7 +884,7 @@ def _rescore_linear_once(
 
     for iteration in range(max_iter):
         pos_idx = np.where(labels == 1)[0]
-        neg_idx = np.where(labels == -1)[0]  # training-half decoys only under decoy-split
+        neg_idx = np.where(labels == -1)[0]
 
         if len(pos_idx) == 0:
             logger.warning(f"  {_tag} iter {iteration + 1}: no positives — stopping early")
@@ -1207,33 +895,18 @@ def _rescore_linear_once(
             break
 
         with threadpool_limits(limits=1, user_api="blas"):
-            scores, pipe = _cv_semisup_scores(X_fit, labels, fold_ids, _make_pipe)
+            scores, pipe = _cv_semisup_scores(X, labels, fold_ids, _make_pipe)
 
-        # H-fdr-2 decoy split: q-values (and therefore which targets become
-        # pseudo-positives) are computed over targets + training-decoys only.
-        # Held-out decoys are excluded from this population entirely, never
-        # just relabelled -- keeping them in as fake "not is_decoy" rows would
-        # inflate the apparent target count.
-        if include_mask is not None:
-            q_masked = _tdc_qvalues(scores[include_mask], is_decoy[include_mask])
-        else:
-            q_masked = _tdc_qvalues(scores, is_decoy)
-
-        def _labels_at(fdr, _q=q_masked):
-            if include_mask is not None:
-                nl = np.zeros(len(is_decoy), dtype=np.int8)
-                nl[include_mask] = _encode_labels(is_decoy[include_mask], _q <= fdr)
-            else:
-                nl = _encode_labels(is_decoy, _q <= fdr)
-            return nl, int((nl == 1).sum())
-
-        # H-fdr-2 training-FDR escalation: retry at increasing thresholds
+        q = _tdc_qvalues(scores, is_decoy)
+        # Training-FDR escalation (H-fdr-2): retry at increasing thresholds
         # rather than giving up the moment a strict train_fdr yields nothing.
         _iter_fdr = train_fdr
-        new_labels, n_new = _labels_at(_iter_fdr)
+        new_labels = _encode_labels(is_decoy, q <= _iter_fdr)
+        n_new = int((new_labels == 1).sum())
         while n_new == 0 and train_fdr_escalate and _iter_fdr < 0.5:
             _iter_fdr += 0.005
-            new_labels, n_new = _labels_at(_iter_fdr)
+            new_labels = _encode_labels(is_decoy, q <= _iter_fdr)
+            n_new = int((new_labels == 1).sum())
         _esc_note = f" (escalated to {_iter_fdr:.3g})" if _iter_fdr != train_fdr else ""
 
         logger.info(
@@ -1248,8 +921,8 @@ def _rescore_linear_once(
         # H-fdr-5: cap self-training growth relative to the initial seed size —
         # stop (keeping THIS iteration's scores, from the last trustworthy label
         # set) rather than accept a pseudo-positive set that ran away regardless
-        # of convergence. Independent of decoy-split; guards the same amplify-
-        # whatever-the-seed-hands-it behaviour F-020 found exploiting a leak.
+        # of convergence. Guards the same amplify-whatever-the-seed-hands-it
+        # behaviour F-020 found exploiting a leak.
         if (
             pseudo_label_growth_cap is not None
             and n_seed > 0
@@ -1276,38 +949,23 @@ def _rescore_linear_once(
         )
 
     if pipe is not None:
-        _log_imputation_debug(
-            _tag,
-            X_fit,
-            top_names if use_poly else present,
-            is_target,
-            is_decoy,
-            pipe,
-        )
+        _log_imputation_debug(_tag, X, present, is_target, is_decoy, pipe)
 
     importances = None
     struct_coefs: np.ndarray | None = None
-    struct_names_out: list[str] = top_names if use_poly else present
     feature_names_out = present
     if pipe is not None:
         try:
             est = pipe[clf_name]
             if hasattr(est, "coef_"):
                 importances = est.coef_[0]
-            elif hasattr(est, "feature_importances_"):
-                # Tree ensembles (e.g. the gbt backend) expose impurity-based
-                # feature_importances_ instead of coef_. Same reporting slot; the
-                # FDR scores are always the decision_function values, never these.
-                importances = est.feature_importances_
-            if importances is not None and use_poly:
-                feature_names_out = expanded_names
         except Exception:
             pass
         try:
             # Structure coefficients: correlation of each (imputed+scaled) original
             # feature with the discriminant score.  Unlike raw LDA coefficients,
             # these are unaffected by collinearity between features.
-            X_imp = pipe["imputer"].transform(X_fit)
+            X_imp = pipe["imputer"].transform(X)
             X_sc = pipe["scaler"].transform(X_imp)
             struct_coefs = np.array([
                 float(np.corrcoef(X_sc[:, j], scores)[0, 1])
@@ -1316,28 +974,25 @@ def _rescore_linear_once(
             struct_coefs = np.nan_to_num(struct_coefs, nan=0.0)
         except Exception:
             pass
-        # Kernel models (e.g. the rbf_svm backend) expose neither coef_ nor
-        # feature_importances_ — the decision function lives in kernel space, not
-        # per-feature. Report permutation importance instead, which is a
-        # contribution rather than a correlation (H-model-2, F-041); its columns
-        # are X_fit's, i.e. `struct_names_out`. Falls back to |structure
-        # coefficient| if that fails, so the importance TSV is always populated.
+        # Kernel models (the rbf_svm backend) have no coef_: the decision function
+        # lives in kernel space, not per-feature. Report permutation importance
+        # instead, which is a contribution rather than a correlation (H-model-2,
+        # F-041). Falls back to |structure coefficient| if that fails, so the
+        # importance TSV is always populated.
         if importances is None and perm_importance:
             try:
-                importances = _permutation_importance(pipe, X_fit)
-                if importances is not None:
-                    feature_names_out = struct_names_out
+                importances = _permutation_importance(pipe, X)
             except Exception as exc:
                 logger.warning(f"  {_tag}: permutation importance failed ({exc})")
-        if importances is None and struct_coefs is not None and not use_poly:
+        if importances is None and struct_coefs is not None:
             importances = np.abs(struct_coefs)
     # Expose the fitted pipeline + raw feature matrix for downstream SHAP debug
     # explanations (populated only when the caller passes a mutable dict).
     if fitted_out is not None and pipe is not None:
         fitted_out["pipe"] = pipe
-        fitted_out["X"] = X_fit
-        fitted_out["feature_names"] = top_names if use_poly else present
-    return scores, importances, struct_coefs, struct_names_out, feature_names_out
+        fitted_out["X"] = X
+        fitted_out["feature_names"] = present
+    return scores, importances, struct_coefs, present, feature_names_out
 
 
 def _rescore_linear(*args, model_repeats: int = 1, **kwargs):
@@ -1395,16 +1050,14 @@ def _rescore_linear(*args, model_repeats: int = 1, **kwargs):
         )
         s = np.asarray(out[0], dtype=np.float64)
         scores_acc.append((s - s.mean()) / (s.std() or 1.0))
-        # out[1] is a permutation importance only for an estimator that exposes
-        # neither coef_ nor feature_importances_; anything else is that
-        # estimator's own quantity and is reported from replicate 0 unaveraged.
+        # out[1] is a permutation importance only for an estimator without
+        # coef_; a coef_ is reported from replicate 0 unaveraged.
         est = fitted.get("pipe", [None])[-1]
         if (
             r < _PERM_IMPORTANCE_REPLICATES
             and out[1] is not None
             and est is not None
             and not hasattr(est, "coef_")
-            and not hasattr(est, "feature_importances_")
         ):
             perm_acc.append(np.asarray(out[1], dtype=np.float64))
         if first is None:
@@ -1416,297 +1069,35 @@ def _rescore_linear(*args, model_repeats: int = 1, **kwargs):
     return (np.mean(scores_acc, axis=0), importances) + tuple(first[2:])
 
 
-def _rescore_lda(features_df, intrinsic_feature_names, init_ppm_threshold, **kwargs):
-    """Semi-supervised LDA backend (thin wrapper over ``_rescore_linear``)."""
-    return _rescore_linear(
-        features_df, intrinsic_feature_names, init_ppm_threshold,
-        clf_name="lda", make_clf=None, **kwargs,
-    )
+# Final pipeline step of each scoring backend. All three expose
+# ``decision_function``, so they share ``_rescore_linear``: seed, pseudo-label
+# iteration, out-of-fold CV, winner selection, TDC and PEP. ``lda`` and ``svm``
+# report ``coef_[0]`` as importance; ``rbf_svm`` has no ``coef_`` (its weights
+# live in kernel space), so it reports permutation importance. SVC training is
+# ~O(N^2). On standardized features, ``rbf_svm_gamma`` of 0.01-0.03 with
+# ``rbf_svm_c`` of 5-10 typically outperforms the ``"scale"`` default.
+_ESTIMATOR_MODELS = ("lda", "svm", "rbf_svm")
 
 
-def _rescore_svm(features_df, intrinsic_feature_names, init_ppm_threshold, svm_c: float = 1.0, **kwargs):
-    """Semi-supervised Linear SVM backend.
+def _estimator_factory(model: str, svm_c: float = 1.0, rbf_svm_c: float = 1.0, rbf_svm_gamma="scale"):
+    """Zero-argument factory for the final pipeline estimator of ``model``.
 
-    Uses ``sklearn.svm.LinearSVC`` (penalty="l2", loss="squared_hinge",
-    ``C=svm_c``, dual="auto", max_iter=2000) as the final pipeline step. LinearSVC
-    exposes ``decision_function()`` and ``coef_[0]`` exactly like LDA, so the
-    out-of-fold CV, pseudo-label iteration, and importance reporting are reused
-    unchanged. The median imputer is kept (LinearSVC rejects NaN)."""
-    from sklearn.svm import LinearSVC
-
-    def make_clf():
-        return LinearSVC(penalty="l2", loss="squared_hinge", C=svm_c, dual="auto", max_iter=2000)
-
-    return _rescore_linear(
-        features_df, intrinsic_feature_names, init_ppm_threshold,
-        clf_name="svm", make_clf=make_clf, **kwargs,
-    )
-
-
-def _rescore_gbt(
-    features_df, intrinsic_feature_names, init_ppm_threshold,
-    gbt_n_estimators: int = 200,
-    gbt_max_depth: int = 3,
-    gbt_learning_rate: float = 0.1,
-    gbt_subsample: float = 0.7,
-    **kwargs,
-):
-    """Semi-supervised gradient-boosted-tree backend (nonlinear).
-
-    Uses ``sklearn.ensemble.GradientBoostingClassifier`` as the final pipeline
-    step. It exposes ``decision_function()`` (consumed by the out-of-fold CV
-    scorer) and ``feature_importances_`` (impurity-based, written to the
-    importance TSV), so it slots into the exact same ``_rescore_linear`` machinery
-    as LDA/SVM — seed selection, pseudo-label iteration, per-feature winner
-    selection, TDC, PEP-from-scores, and reweighting are all unchanged; only the
-    final estimator differs. Score columns are tagged ``gbt_score_r1/r2`` and the
-    importance TSV ``17_debug_gbt_importances_r{1,2}.tsv``.
-
-    Unlike the linear backends, gbt can fit nonlinear feature interactions (e.g.
-    colocalization only discriminating where MALDI signal is present), which is
-    where it materially outperforms LDA/SVM on heterogeneous samples.
-    ``subsample<1`` (stochastic gradient boosting) regularises against overfitting
-    the target/decoy null, complementing the out-of-fold CV. The median imputer
-    is kept (GradientBoostingClassifier rejects NaN); the StandardScaler is a
-    harmless no-op for trees (monotone transforms do not change split points)."""
-    from sklearn.ensemble import GradientBoostingClassifier
-
-    def make_clf():
-        return GradientBoostingClassifier(
-            n_estimators=gbt_n_estimators,
-            max_depth=gbt_max_depth,
-            learning_rate=gbt_learning_rate,
-            subsample=gbt_subsample,
-            random_state=0,
-        )
-
-    return _rescore_linear(
-        features_df, intrinsic_feature_names, init_ppm_threshold,
-        clf_name="gbt", make_clf=make_clf, **kwargs,
-    )
-
-
-def _rescore_rbf_svm(
-    features_df, intrinsic_feature_names, init_ppm_threshold,
-    rbf_svm_c: float = 1.0,
-    rbf_svm_gamma="scale",
-    **kwargs,
-):
-    """Semi-supervised RBF-kernel SVM backend (nonlinear, continuous scores).
-
-    Uses ``sklearn.svm.SVC(kernel="rbf")`` as the final pipeline step. Unlike the
-    ``gbt`` (tree) backend, a kernel SVM's ``decision_function`` is a smooth,
-    continuous function of the inputs, so the score distribution stays continuous
-    and bimodal-looking (no discrete leaf-value spikes) even with a small
-    semi-supervised seed set. This is the nonlinear analog of the linear ``svm``
-    backend and reuses the exact same ``_rescore_linear`` machinery — seed,
-    pseudo-label iteration, out-of-fold CV, winner selection, TDC, PEP,
-    reweighting — via ``decision_function``. Score columns are tagged
-    ``rbf_svm_score_r1/r2``.
-
-    A kernel SVM has no ``coef_``/``feature_importances_`` (its weights live in
-    kernel space), so ``_rescore_linear`` reports per-feature importances as
-    ``|structure coefficient|`` (correlation of each feature with the score).
-
-    ``rbf_svm_gamma`` accepts ``"scale"``/``"auto"`` or a float. On standardized
-    features, gamma ≈ 0.01-0.03 with ``rbf_svm_c`` ≈ 5-10 typically outperforms
-    the ``"scale"`` default; tune via ``--rbf-svm-gamma`` / ``--rbf-svm-c``. The
-    median imputer + StandardScaler are kept (SVC rejects NaN and is scale-
-    sensitive). Note SVC training is ~O(N^2); fine at MALDI candidate scale
-    (~5-10 K rows) but slower than the linear backends."""
-    from sklearn.svm import SVC
+    ``rbf_svm_gamma`` accepts ``"scale"``/``"auto"``, a float, or a float as a string.
+    """
+    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+    from sklearn.svm import SVC, LinearSVC
 
     gamma = rbf_svm_gamma
     if isinstance(gamma, str) and gamma not in ("scale", "auto"):
         gamma = float(gamma)
-
-    def make_clf():
-        return SVC(kernel="rbf", C=rbf_svm_c, gamma=gamma)
-
-    return _rescore_linear(
-        features_df, intrinsic_feature_names, init_ppm_threshold,
-        clf_name="rbf_svm", make_clf=make_clf, **kwargs,
-    )
+    return {
+        "lda": lambda: LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=[0.5, 0.5]),
+        "svm": lambda: LinearSVC(penalty="l2", loss="squared_hinge", C=svm_c, dual="auto", max_iter=2000),
+        "rbf_svm": lambda: SVC(kernel="rbf", C=rbf_svm_c, gamma=gamma),
+    }[model]
 
 
-def _rescore_qda(
-    features_df: pd.DataFrame,
-    intrinsic_feature_names: list[str],
-    init_ppm_threshold: float,
-    seed_mask: np.ndarray | None = None,
-    init_fdr: float = 0.2,
-    train_fdr: float = 0.05,
-    max_iter: int = 5,
-    r1_seed_percentile: float = 0.10,
-    min_seed_positives: int = 50,
-    seed_features: list[str] | None = None,
-    cv_folds: int = 3,
-) -> np.ndarray:
-    """
-    Semi-supervised QDA on MALDI-intrinsic features.
-
-    Same seed and iteration logic as _rescore_lda (three-valued labels,
-    best-feature initialization, ppm fallback), but uses
-    QuadraticDiscriminantAnalysis(reg_param=0.5).  Scoring is cross-validated
-    (out-of-fold) like _rescore_lda to avoid overfitting the target/decoy
-    separation.
-
-    Importances are estimated as (mu_pos - mu_neg) / pooled_std in the
-    standardized feature space (a t-statistic proxy).
-
-    Returns ``(scores, pep_proba, importances, feature_names_used)``.
-    """
-    from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
-    from sklearn.impute import SimpleImputer
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    df = features_df.reset_index(drop=True)
-    present = [f for f in intrinsic_feature_names if f in df.columns]
-    X_raw = df[present].values.astype(np.float64)
-    X = np.where(np.isfinite(X_raw), X_raw, np.nan)
-    _apply_nan_fill(X, present, FEATURE_NAN_FILL)
-
-    is_decoy = df["is_decoy"].values.astype(bool)
-    is_target = ~is_decoy
-    protein = df["protein"].to_numpy() if "protein" in df.columns else None
-
-    # --- Initial label assignment ---
-    n_init_positives: int | None = None
-
-    if seed_mask is None:
-        bf_result = _find_best_feature_labels(
-            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives,
-            seed_features=seed_features, protein=protein,
-        )
-        if bf_result is not None:
-            labels, _best_feat, _n_init = bf_result
-            n_init_positives = _n_init
-            logger.info(
-                f"  QDA: best-feature init on '{_best_feat}', "
-                f"{_n_init} targets at q≤{init_fdr:.3g}"
-            )
-        else:
-            logger.warning(
-                f"  QDA: best-feature init yielded 0 targets at q≤{init_fdr:.3g} "
-                "— falling back to ppm-based seeding"
-            )
-            ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
-            n_cand_col = df.get("n_candidates", pd.Series(np.inf, index=df.index))
-            init_mask = (
-                is_target & ((ppm_col < init_ppm_threshold) | (n_cand_col == 1))
-            ).values
-            if not init_mask.any():
-                logger.warning("  QDA: no ppm-based seed positives — falling back to top-ppm init")
-                init_mask = (
-                    is_target & (ppm_col < ppm_col[is_target].quantile(r1_seed_percentile))
-                ).values
-            labels = _encode_labels(is_decoy, init_mask)
-    else:
-        seed_arr = seed_mask.values if hasattr(seed_mask, "values") else np.asarray(seed_mask)
-        labels = _encode_labels(is_decoy, seed_arr)
-
-    n_seed = int((labels == 1).sum())
-    logger.info(f"  QDA: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
-
-    def _make_pipe():
-        return Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("qda", QuadraticDiscriminantAnalysis(reg_param=0.5)),
-        ])
-
-    fold_ids = _make_fold_ids(is_decoy, cv_folds)
-    if fold_ids is None:
-        logger.warning(
-            f"  QDA: too few targets/decoys for {cv_folds}-fold CV — scoring "
-            "in-sample (overfitting risk)"
-        )
-    else:
-        logger.info(
-            f"  QDA: {cv_folds}-fold cross-validated (out-of-fold) scoring"
-        )
-
-    scores = np.zeros(len(df))
-    prev_pos_size = -1
-    pipe = None
-    from threadpoolctl import threadpool_limits
-
-    for iteration in range(max_iter):
-        pos_idx = np.where(labels == 1)[0]
-        neg_idx = np.where(labels == -1)[0]  # all decoys
-
-        if len(pos_idx) == 0:
-            logger.warning(f"  QDA iter {iteration + 1}: no positives — stopping early")
-            break
-
-        if len(neg_idx) == 0:
-            logger.warning(f"  QDA iter {iteration + 1}: no negatives (decoys) — cannot train QDA, stopping early")
-            break
-
-        with threadpool_limits(limits=1, user_api="blas"):
-            scores, pipe = _cv_semisup_scores(X, labels, fold_ids, _make_pipe)
-
-        q_values = _tdc_qvalues(scores, is_decoy)
-        new_labels = _encode_labels(is_decoy, q_values <= train_fdr)
-        n_new = int((new_labels == 1).sum())
-
-        logger.info(
-            f"  QDA iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size})"
-        )
-
-        if n_new == 0:
-            logger.warning(f"  QDA: no pseudo-positives at q≤{train_fdr:.3g} — stopping early")
-            break
-
-        change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
-        if prev_pos_size >= 0 and change < 0.01:
-            logger.info("  QDA: converged")
-            break
-
-        prev_pos_size = n_new
-        labels = new_labels
-
-    if n_init_positives is not None and 0 <= prev_pos_size < n_init_positives:
-        logger.warning(
-            f"  QDA: final iteration positives ({prev_pos_size}) < "
-            f"best-feature init ({n_init_positives}). Using model anyway."
-        )
-
-    if pipe is not None:
-        _log_imputation_debug("QDA", X, present, is_target, is_decoy, pipe)
-
-    pep_proba = np.full(len(df), np.nan)
-    importances = None
-    if pipe is not None:
-        try:
-            classes = list(pipe["qda"].classes_)
-            decoy_col = classes.index(0)
-            pep_proba = np.clip(pipe.predict_proba(X)[:, decoy_col], 0.0, 1.0)
-        except Exception:
-            pass
-        try:
-            X_t = pipe[:-1].transform(X)
-            pos_mask = (labels == 1)
-            neg_mask = is_decoy
-            mu_pos = np.nanmean(X_t[pos_mask], axis=0)
-            mu_neg = np.nanmean(X_t[neg_mask], axis=0)
-            std_pos = np.nanstd(X_t[pos_mask], axis=0)
-            std_neg = np.nanstd(X_t[neg_mask], axis=0)
-            n_pos = int(pos_mask.sum())
-            n_neg = int(neg_mask.sum())
-            pooled = np.sqrt(
-                ((n_pos - 1) * std_pos**2 + (n_neg - 1) * std_neg**2)
-                / max(n_pos + n_neg - 2, 1)
-            )
-            pooled = np.where(pooled > 0, pooled, 1.0)
-            importances = (mu_pos - mu_neg) / pooled
-        except Exception:
-            pass
-    return scores, pep_proba, importances, present
-
-
-def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray, pi0: float = 1.0) -> np.ndarray:
+def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     """
     Compute per-candidate target-decoy q-values (Storey/Käll TDC).
 
@@ -1714,8 +1105,7 @@ def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray, pi0: float = 1.0) -> 
     FDR = (1 + n_decoy) / max(n_target, 1) at each position (the +1
     correction is the standard Storey/Käll adjustment for small-N), then
     take the minimum FDR seen at or below each score (rolling min from
-    the tail).  When ``pi0 < 1``, the raw FDR is multiplied by ``pi0``
-    before the monotone accumulation (Storey 2002 correction).
+    the tail).
     """
     scores = np.asarray(scores)
     is_decoy = np.asarray(is_decoy).astype(bool)
@@ -1740,7 +1130,7 @@ def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray, pi0: float = 1.0) -> 
     n_target_cum = np.cumsum(~is_decoy[order]).astype(float)
     n_decoy_cum = np.cumsum(is_decoy[order]).astype(float)
 
-    fdr = pi0 * (n_decoy_cum + 1.0) / np.maximum(n_target_cum, 1.0)
+    fdr = (n_decoy_cum + 1.0) / np.maximum(n_target_cum, 1.0)
 
     # q-value: minimum FDR at or below this score (monotone from the tail)
     qval_ordered = np.minimum.accumulate(fdr[::-1])[::-1]
@@ -1751,59 +1141,12 @@ def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray, pi0: float = 1.0) -> 
     return np.clip(q_values, 0.0, 1.0)
 
 
-def _estimate_pi0_storey(
-    scores: np.ndarray,
-    is_decoy: np.ndarray,
-    lambda_range: tuple[float, float] = (0.05, 0.95),
-    n_lambda: int = 20,
-) -> float:
-    """
-    Estimate the null fraction pi0 among targets using a Storey-style sweep.
-
-    Under the TDC null model, targets and decoys are drawn from the same
-    score distribution, so their empirical CDFs should be identical when
-    pi0 = 1.  True positives shift target scores upward, causing the target
-    CDF to fall below the decoy CDF at any threshold.  At each score
-    quantile lambda:
-
-        pi0(lambda) = (#{targets <= lambda} / n_targets)
-                    / (#{decoys  <= lambda} / n_decoys)
-
-    The minimum over all lambdas is returned, capped at 1.0.
-    Lambdas are quantiles of the combined target+decoy score distribution
-    spanning ``lambda_range``.
-    """
-    scores = np.asarray(scores)
-    is_decoy = np.asarray(is_decoy).astype(bool)
-    t_scores = scores[~is_decoy]
-    d_scores = scores[is_decoy]
-
-    if len(t_scores) == 0 or len(d_scores) == 0:
-        return 1.0
-
-    combined = np.concatenate([t_scores, d_scores])
-    lambda_vals = np.quantile(combined, np.linspace(lambda_range[0], lambda_range[1], n_lambda))
-
-    pi0_estimates = []
-    for lam in lambda_vals:
-        d_cdf = (d_scores <= lam).mean()
-        if d_cdf <= 0:
-            continue
-        t_cdf = (t_scores <= lam).mean()
-        pi0_estimates.append(t_cdf / d_cdf)
-
-    if not pi0_estimates:
-        return 1.0
-    return float(min(min(pi0_estimates), 1.0))
-
-
 def estimate_pep(
     scores: np.ndarray,
     is_decoy: np.ndarray,
-    method: str = "gaussian",
 ) -> np.ndarray:
     """
-    Estimate posterior error probability (PEP) via a two-component mixture.
+    Estimate posterior error probability (PEP) via a two-component Gaussian mixture.
 
     Model
     -----
@@ -1814,15 +1157,6 @@ def estimate_pep(
     pi0 : n_decoy / n_total.
 
     PEP(s) = pi0 * f0(s) / (pi0 * f0(s) + (1 - pi0) * f1(s)), clipped to [0, 1].
-
-    Parameters
-    ----------
-    method : "gaussian" (default) or "kde".
-        "gaussian" fits parametric Gaussians to f0 and f1 — appropriate when
-        score distributions are approximately normal (LDA, SVM).
-        "kde" uses scipy.stats.gaussian_kde — appropriate when score
-        distributions are skewed or heavy-tailed (QDA).  Falls back to
-        "gaussian" if the KDE covariance is singular.
 
     Returns NaN for all entries when fewer than 2 decoys or fewer than 2 targets
     are present (mixture is unidentifiable).
@@ -1845,24 +1179,13 @@ def estimate_pep(
     if len(high_t) < 2:
         high_t = target_scores
 
-    if method == "kde":
-        from scipy.stats import gaussian_kde
-        try:
-            kde0 = gaussian_kde(decoy_scores)
-            kde1 = gaussian_kde(high_t)
-            f0 = kde0(scores)
-            f1 = kde1(scores)
-        except np.linalg.LinAlgError:
-            method = "gaussian"
-
-    if method == "gaussian":
-        from scipy.stats import norm
-        mu0 = float(np.mean(decoy_scores))
-        sigma0 = max(float(np.std(decoy_scores)), 1e-6)
-        mu1 = float(np.mean(high_t))
-        sigma1 = max(float(np.std(high_t)), 1e-6)
-        f0 = norm.pdf(scores, mu0, sigma0)
-        f1 = norm.pdf(scores, mu1, sigma1)
+    from scipy.stats import norm
+    mu0 = float(np.mean(decoy_scores))
+    sigma0 = max(float(np.std(decoy_scores)), 1e-6)
+    mu1 = float(np.mean(high_t))
+    sigma1 = max(float(np.std(high_t)), 1e-6)
+    f0 = norm.pdf(scores, mu0, sigma0)
+    f1 = norm.pdf(scores, mu1, sigma1)
 
     numer = pi0 * f0
     denom = numer + (1.0 - pi0) * f1
@@ -1900,7 +1223,7 @@ def _select_calibration_peptides(
     percentile: float = 0.10,
 ) -> np.ndarray:
     """
-    Select the best target candidates to finetune/calibrate DeepLC and IM2Deep on.
+    Select the best target candidates to finetune/calibrate IM2Deep on.
 
     Returns a boolean array aligned with ``candidates`` rows: True for the top
     ``percentile`` fraction of TARGET rows ranked by spectral quality (low
@@ -1914,7 +1237,7 @@ def _select_calibration_peptides(
     downstream ranker.  No target/decoy competition or q-value is used here: this
     is a quality filter, not an FDR estimate.  Unlike the previous
     ``n_candidates == 1`` heuristic, the size of this set does not shrink when
-    decoys are paired onto target features (e.g. under ``paired_shuffle``), and it
+    decoys are paired onto target features (e.g. under ``mz_shuffle``), and it
     selects likely-correct peptides rather than merely mass-unambiguous ones.
     """
     n = len(candidates)
@@ -1926,19 +1249,16 @@ def _select_calibration_peptides(
     if not is_target.any():
         return keep
 
-    def _quality_z(values: np.ndarray, higher_is_better: bool) -> np.ndarray:
-        """Standardised quality contribution; NaN/constant columns contribute 0."""
+    from scipy.stats import zscore
+
+    def _quality_z(values: np.ndarray) -> np.ndarray:
+        """Standardised quality contribution; NaN rows and constant columns contribute 0."""
         x = np.asarray(values, dtype=float)
         finite = np.isfinite(x)
-        if finite.sum() < 2:
-            return np.zeros_like(x)
-        mu = float(np.mean(x[finite]))
-        sd = float(np.std(x[finite]))
-        if sd < 1e-12:
-            return np.zeros_like(x)
-        z = (x - mu) / sd
-        z = np.where(np.isfinite(z), z, 0.0)
-        return z if higher_is_better else -z
+        z = np.zeros_like(x)
+        if finite.sum() >= 2 and np.std(x[finite]) >= 1e-12:
+            z[finite] = zscore(x[finite])
+        return z
 
     tgt = candidates.loc[is_target]
     ppm = tgt["ppm_error_abs"].to_numpy(dtype=float) if "ppm_error_abs" in tgt else np.full(len(tgt), np.nan)
@@ -1948,7 +1268,7 @@ def _select_calibration_peptides(
         else np.full(len(tgt), np.nan)
     )
     # Low ppm error is good; high theoretical isotope cosine is good.
-    score = _quality_z(ppm, higher_is_better=False) + _quality_z(iso, higher_is_better=True)
+    score = -_quality_z(ppm) + _quality_z(iso)
 
     thr = float(np.quantile(score, 1.0 - percentile))
     tgt_keep = score >= thr
@@ -1965,10 +1285,10 @@ def _select_feature_winners(
     winner_percentile: float = 0.02,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """
-    For each MALDI feature select the candidate with the highest round-1 score,
-    then drop features whose winner score falls below the 1st quartile of all
-    winner scores.  Filtered features receive ``is_tdc_winner=False`` and NaN
-    round-2 scores in the final result.
+    For each MALDI feature select the candidate with the highest score, then
+    drop features whose winner score falls below the ``winner_percentile``
+    quantile of all winner scores.  Filtered features receive
+    ``is_tdc_winner=False`` and NaN winner scores in the final result.
 
     Returns
     -------
@@ -1988,7 +1308,7 @@ def _select_feature_winners(
     n_dropped = int((~keep).sum())
     if n_dropped:
         logger.info(
-            f"  R1 winner filter: dropped {n_dropped} features with score < Quantile({winner_percentile}) ({q1:.4f})"
+            f"  Winner filter: dropped {n_dropped} features with score < Quantile({winner_percentile}) ({q1:.4f})"
         )
     winner_pos = winner_pos[keep]
     winners_df = winners_df[keep].reset_index(drop=True)
@@ -1999,7 +1319,6 @@ def _peptide_level_qvalues(
     scores: np.ndarray,
     is_decoy: np.ndarray,
     peptides: np.ndarray,
-    estimate_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """TDC q-values at peptide level: best match per peptide, then TDC over those.
 
@@ -2065,8 +1384,7 @@ def _peptide_level_qvalues(
                 ratio, mult_t.mean(), mult_d.mean(),
             )
 
-    sub_mask = None if estimate_mask is None else np.asarray(estimate_mask, dtype=bool)[rep_pos]
-    q_rep = _tdc_qvalues_masked(scores[rep_pos], is_decoy[rep_pos], estimate_mask=sub_mask)
+    q_rep = _tdc_qvalues(scores[rep_pos], is_decoy[rep_pos])
 
     # broadcast each peptide's q back onto all of its rows
     key = pd.MultiIndex.from_arrays([frame["peptide"], frame["decoy"]])
@@ -2140,9 +1458,8 @@ def ccs_threshold_pct(single_ccs, multiplier, fixed_pct):
 
 
 def rescore(
-    fasta_path: str,
+    fasta_path: str | None,
     maldi_mzs: np.ndarray,
-    mzml_paths: list[str],
     spatial_features: pd.DataFrame | None = None,
     ion_images: np.ndarray | None = None,
     ion_image_mzs: np.ndarray | None = None,
@@ -2155,7 +1472,6 @@ def rescore(
     extraction_ppm: float = 25.0,
     mob_quality_mz_window_ppm: float = 25.0,
     mob_quality_k0_tol: float = 0.02,
-    msf_path: str | None = None,
     ppm_tolerance: float = 20.0,
     init_fdr: float = 0.2,
     train_fdr: float = 0.05,
@@ -2164,18 +1480,11 @@ def rescore(
     max_length: int = 30,
     model: str = "lda",
     svm_c: float = 1.0,
-    gbt_n_estimators: int = 200,
-    gbt_max_depth: int = 3,
-    gbt_learning_rate: float = 0.1,
     rbf_svm_c: float = 1.0,
     rbf_svm_gamma: str = "scale",
-    single_round: bool = False,
     init_ppm_threshold: float = 5.0,
-    init_isotope_threshold: float = 0.7,
-    n_interaction_features: int = 5,
-    lda_r2_median_filter: bool = False,
-    storey_pi0: bool = False,
     only_main_features: bool = False,
+    lcms_ids=None,
     lcms_proteins_path: str | None = None,
     lcms_peptides_path: str | None = None,
     lcms_psms_path: str | None = None,
@@ -2195,34 +1504,17 @@ def rescore(
     im2deep_calibration: str = "linear",
     digest: bool = False,
     gt_peptides: list[str] | None = None,
-    maldi_intensities: np.ndarray | None = None,
-    decoy_method: str = "shuffle",
-    entrapment_fasta: str | None = None,
-    mz_shift_delta_min: float = 5.0,
-    mz_shift_delta_max: float = 20.0,
-    mz_shift_snap_tolerance_ppm: float = 50.0,
-    max_shuffle_rounds: int = 50,
-    target_ratio: float = 1.0,
+    decoy_method: str = "substitution",
     features_preset: str = "all",
     features_exclude: list[str] | None = None,
-    pseudo_label_max_iter: int = 5,
-    pseudo_label_fdr: float = 0.10,
     r1_seed_percentile: float = 0.10,
-    r2_seed_percentile: float = 0.20,
     max_iter: int = 5,
     min_seed_positives: int = 50,
     seed_features: list[str] | None = None,
     im2deep_kwargs: dict | None = None,
-    deeplc_finetune_epochs: int = 40,
-    deeplc_finetune_lr: float = 0.001,
-    deeplc_finetune_patience: int = 10,
     calibration_percentile: float = 0.10,
     matching_ppm: float = 20.0,
     winner_percentile: float = 0.02,
-    rt_window_multiplier: float = 2.0,
-    lcms_prior_weight: float = 1.0,
-    spatial_prior_weight: float = 1.0,
-    fragment_tol_da: float = 0.02,
     match_ccs: bool = False,
     ccs_window_multiplier: float = 2.0,
     ccs_window_pct: float | None = None,
@@ -2234,12 +1526,7 @@ def rescore(
     coloc_measured_pixel_mask: "np.ndarray | None" = None,
     coloc_tic_normalize: bool = False,
     coloc_common_mode: bool = False,
-    region_coloc: bool = False,
-    region_coloc_k: int = 20,
-    within_region_coloc: bool = False,
     cosine_coloc: bool = False,
-    decoy_split: bool = False,
-    decoy_split_final_only: bool = False,
     train_fdr_escalate: bool = False,
     pseudo_label_growth_cap: float | None = None,
     model_repeats: int = 1,
@@ -2263,16 +1550,13 @@ def rescore(
     Parameters
     ----------
     fasta_path
-        Path to protein FASTA file (forward sequences only; decoys are generated
-        internally via K/R-preserving protein-level shuffle).
+        Path to protein FASTA file (forward sequences only). Used only with
+        ``digest=True``.
     maldi_mzs
         Array of MALDI feature m/z values.
-    mzml_paths
-        Paths to LC-MS/MS mzML or Bruker .d files. Pass an empty list to skip
-        all LC-MS/MS evidence steps.
     spatial_features
         Pre-computed spatial features DataFrame aligned with ``maldi_mzs``
-        (optional; produced by ``compute_spatial_features`` or loaded from NPZ).
+        (optional; produced by ``compute_spatial_features``).
     ion_images
         MALDI ion images, shape ``(n_features, H, W)`` float32 (optional).
         Required for colocalization and spatial autocorrelation features.
@@ -2283,271 +1567,135 @@ def rescore(
         colocalization without requiring those peaks in the feature list
         (optional). Keys: ``"m1"``, ``"m2"`` (M+1/M+2 isotopologues) and
         ``"na"``, ``"k"``, ``"chca"`` (adducts). Each value is
-        ``(n_features, H, W)`` float32. Populated by the Bruker .d extraction
-        path; ``None`` when loading from imzML or pre-computed NPZ.
+        ``(n_features, H, W)`` float32.
     maldi_envelopes
         MALDI isotope envelopes: ``feature_mz → normalized envelope array``
-        (optional). When provided, MALDI vs LC-MS/MS envelope comparison
-        features are computed (``isotope_envelope_cosine`` etc.).
-    msf_path
-        Path to ProteomeDiscoverer .msf SQLite file for DeepLC fine-tuning
-        (optional). When ``None``, DeepLC is used without fine-tuning unless
-        ``lcms_peptides_path`` is provided with RT information.
+        (optional).
     ppm_tolerance
-        Mass accuracy window for matching in-silico peptides to MALDI features
-        (ppm). Also used as the extraction window for LC-MS/MS MS1 signal.
+        m/z half-window (ppm) for the mobility-colocalization peak extraction.
     train_fdr
-        FDR threshold for: (1) pseudo-label iteration in LDA/QDA (best-feature
-        init and per-iteration label update); (2) mokapot SVM training target.
+        FDR threshold for the per-iteration pseudo-label update.
     max_iter
-        Maximum pseudo-label iterations for LDA/QDA backends.
-    missed_cleavages
-        Maximum missed cleavages for tryptic in-silico digest.
-    min_length
-        Minimum peptide length (residues) after digest filtering.
-    max_length
-        Maximum peptide length (residues) after digest filtering.
+        Maximum pseudo-label iterations.
+    missed_cleavages, min_length, max_length
+        Tryptic in-silico digest settings.
     model
-        Rescoring backend: ``"lda"`` (default, LinearDiscriminantAnalysis),
-        ``"qda"`` (QuadraticDiscriminantAnalysis, reg_param=0.1), ``"svm"``
-        (LinearSVC, C=``svm_c``), ``"gbt"`` (GradientBoostingClassifier,
-        nonlinear; tuned by ``gbt_n_estimators`` / ``gbt_max_depth`` /
-        ``gbt_learning_rate``), or ``"rbf_svm"`` (RBF-kernel SVC, nonlinear with
-        continuous scores; tuned by ``rbf_svm_c`` / ``rbf_svm_gamma``). All train
-        on ``MALDI_INTRINSIC_FEATURES`` only; LC-MS/MS evidence is applied as an
-        additive log-prior after scoring.
+        Rescoring backend, a key of ``_ESTIMATOR_MODELS``: ``"lda"`` (default,
+        LinearDiscriminantAnalysis), ``"svm"`` (LinearSVC, C=``svm_c``), or
+        ``"rbf_svm"`` (RBF-kernel SVC; tuned by ``rbf_svm_c`` / ``rbf_svm_gamma``).
+        All train on the MALDI-intrinsic ranker features only.
     init_ppm_threshold
-        ppm_error_abs threshold for the initial positive seed in the LDA/QDA
-        ppm-fallback path and in the CatBoost backend. Targets below this
-        threshold (or with ``n_candidates == 1``) are used as the initial
-        pseudo-positive set when best-feature initialization yields no passing
-        targets.
-    init_isotope_threshold
-        CatBoost only: ``theo_isotope_cosine`` threshold for the initial seed
-        (used in conjunction with ``init_ppm_threshold``).
-    n_interaction_features
-        Number of top LDA R1 features to expand into pairwise polynomial
-        interactions for R2. Set to 0 to disable interaction features.
-    lda_r2_median_filter
-        If True, apply a per-feature median filter to LDA R2 scores before
-        FDR computation (experimental).
-    storey_pi0
-        If True, estimate the null fraction pi0 via the Storey method and apply
-        it as a correction factor in ``_tdc_qvalues``.
+        ppm_error_abs threshold for the ppm-fallback seed, used only when the
+        best-feature initialization yields no passing targets. Targets below this
+        threshold (or with ``n_candidates == 1``) become the initial pseudo-positives.
     only_main_features
         If True, restrict the feature set to ``MAIN_FEATURES`` (one
-        representative per collinear group, ~19 features) instead of the full
-        ``MALDI_INTRINSIC_FEATURES`` (~46 features).
+        representative per collinear group) instead of the full
+        ``MALDI_INTRINSIC_FEATURES``.
+    lcms_ids
+        Already parsed LC-MS/MS identifications (``parse_lcms_ids`` output). When
+        given, the ``lcms_*_path`` arguments are not read again.
     lcms_peptides_path
-        Path to LC-MS/MS peptide-level identification results. When provided,
-        activates Strategy C: candidates are generated by digesting only
-        identified proteins plus directly identified peptides, instead of the
-        full FASTA (Strategy A). Falls back to Strategy A with a warning if no
-        identified proteins are found in the FASTA.
+        Path to LC-MS/MS peptide-level identification results. When provided (or
+        ``lcms_ids`` is), activates Strategy C: candidates are the identified
+        peptides, plus the digest of the identified proteins with ``digest=True``.
     lcms_proteins_path
         Path to LC-MS/MS protein-level results (optional; proteins are derived
         from the peptide table when omitted).
     lcms_psms_path
-        Path to LC-MS/MS PSM-level file for RT and intensity aggregation
-        (optional; improves DeepLC calibration when available).
+        Path to LC-MS/MS PSM-level file for RT and intensity aggregation (optional).
     lcms_id_format
         Format of the LC-MS/MS ID files: ``"percolator"`` (default),
-        ``"mzidentml"``, ``"psm_utils"``, or ``"msf"``.
+        ``"mzidentml"``, ``"psm_utils"``, ``"msf"`` or ``"ms2rescore"``.
     psm_utils_reader
         Reader hint for ``lcms_id_format="psm_utils"``. A psm_utils filetype
         key (e.g. ``"maxquant"``) or reader class name. When ``None``,
         auto-detection from the filename is attempted.
-    protein_fdr
-        Protein-level FDR threshold for Strategy C protein filtering.
-    peptide_fdr
-        Peptide-level FDR threshold for Strategy C candidate inclusion.
+    protein_fdr, peptide_fdr
+        Strategy C protein- and peptide-level FDR thresholds.
     extra_fasta_path
         Additional FASTA file (e.g. contaminants database). All proteins in
-        this file are always included regardless of LC-MS/MS identification
-        status. Peptides already present in the primary digest are not
-        duplicated; when the same sequence appears in both, the primary entry
-        (with LC-MS/MS evidence) is kept.
+        this file are always included. Peptides already present in the primary
+        digest are not duplicated.
     use_protein_level_features
-        If True, include ``PROTEIN_LEVEL_FEATURES`` (protein consistency and
-        colocalization) in the ranker feature set. Disabled by default because
-        decoys inherit inflated protein-level counts from co-occurring target
-        proteins, breaking TDC null-model symmetry.
+        If True, include ``PROTEIN_LEVEL_FEATURES`` in the ranker feature set.
     use_spatial_ranker_features
         If True, include ``SPATIAL_RANKER_FEATURES`` (feature-level spatial
-        quality and protein colocalization) in the ranker feature set.  Only
-        valid with ``decoy_method`` in {``"entrapment"``, ``"mz_shift"``}; with
-        any shuffle variant it is force-disabled with a warning because those
-        decoys lack a consistent spatial anchor.  Deduplicated against
-        ``PROTEIN_LEVEL_FEATURES`` when ``use_protein_level_features`` is also set.
+        quality and protein colocalization) in the ranker feature set.
+        Deduplicated against ``PROTEIN_LEVEL_FEATURES``.
     verbose
-        If True, write per-step debug files to ``output_dir`` and enable DEBUG
-        logging.
+        If True, write per-step debug files to ``output_dir``.
     output_dir
-        Directory for all output files (TSV results, debug files, config dump).
+        Directory for all output files.
     debug_dir
-        Directory for additional debug figures (optional; set by CLI when
-        ``--verbose`` is active).
-    n_debug
-        Number of MALDI features to include in debug visualizations.
-    debug_seed
-        Random seed for debug feature sampling.
+        Directory for debug figures (optional; set by the CLI with ``--verbose``).
+    n_debug, debug_seed
+        Number of MALDI features in the debug visualizations, and the sampling seed.
     observed_ccs_per_feature
-        Dict mapping ``feature_idx → observed CCS`` value from MALDI ion
-        mobility data (optional). When provided, enables IM2Deep CCS
-        comparison features (B-group).
+        Dict mapping ``feature_idx → observed CCS`` (optional). Enables the
+        IM2Deep CCS features.
     im2deep_calibration
-        IM2Deep CCS calibration mode: ``"linear"``, ``"spline"``, or
-        ``"finetune"`` (transfer-learning fine-tune on single-candidate
-        MALDI observations).
+        IM2Deep CCS calibration mode: ``"linear"``, ``"spline"``, or ``"finetune"``.
     im2deep_kwargs
-        Dict of keyword arguments forwarded to ``im2deep.core.finetune`` when
-        ``im2deep_calibration="finetune"``. Recognized keys:
-        ``finetune_epochs`` (default 10), ``finetune_batch_size`` (default 64),
-        ``finetune_lr`` (default 0.001).
+        Keyword arguments forwarded to ``im2deep.core.finetune`` when
+        ``im2deep_calibration="finetune"``.
     digest
-        If True (and ``lcms_peptides_path`` is set), also digest identified
-        proteins from ``fasta_path`` for additional candidates (Strategy C
-        digest sub-mode). Ignored when ``lcms_peptides_path`` is ``None``.
+        If True, also digest ``fasta_path`` (identified proteins under Strategy C,
+        the whole FASTA otherwise).
     gt_peptides
-        List of ground-truth peptide sequences for diagnostic FDR reporting
-        (optional; not used in scoring).
-    maldi_intensities
-        Raw MALDI intensity array aligned with ``maldi_mzs`` (optional).
-        Used when spatial features are not pre-computed.
+        Ground-truth peptide sequences for diagnostic reporting (not used in scoring).
     decoy_method
-        Decoy generation strategy: ``"shuffle"`` (K/R-preserving protein
-        shuffle), ``"mz_shift"`` (observation-space m/z-shift decoys: each
-        target peptide is shifted by a random delta and snapped to a foreign
-        MALDI feature), ``"mz_shuffle"`` (derangement of the peptide→feature
-        assignment: each real target peptide is relocated onto another peptide's
-        real feature, co-located 1 target + 1 decoy per feature so feature-quality
-        features are identical between them and the ranker must discriminate on the
-        peptide-specific predicted-vs-observed match such as CCS/isotope),
-        ``"balanced_shuffle"`` (iterative shuffle with MALDI-match filtering,
-        length-stratified subsample to ~1:1 target:decoy ratio), or
-        ``"paired_shuffle"`` (same iterative shuffle pool, but decoys are selected
-        to occupy the same MALDI features as targets — feature-paired selection —
-        to maximise per-feature target-decoy competition while preserving the same
-        global ~1:1 ratio).
-    entrapment_fasta
-        Path to a foreign-organism FASTA used as the null when
-        ``decoy_method="entrapment"``.  Required for that method; ignored
-        otherwise.
+        ``"substitution"`` (default): interior residues of each target are
+        substituted. ``"mz_shuffle"``: derangement of the peptide→feature
+        assignment, so each real target peptide is relocated onto another
+        peptide's real feature (co-located 1 target + 1 decoy per feature).
     maldi_query_raw
         When ``True``, ion images are queried directly from the raw ``.d`` data
         at candidate-derived m/z values instead of from a pre-picked feature
-        list.  Inverts the pipeline ordering: candidates are generated first
-        (against the digest m/z grid), then ``query_raw_maldi`` extracts ion
-        images at ``candidates_df["feature_mz"]``.  Requires ``maldi_d_path``.
+        list. Superseded; kept to reproduce older results. Requires ``maldi_d_path``.
     maldi_d_path
-        Path to the raw Bruker ``.d`` directory.  Required when
-        ``maldi_query_raw=True``.
-    raw_query_cache_dir
-        Directory in which to persist the observed-centroid/CCS ``alphatims`` pass
-        (the dominant cost of a raw-query run) as an ``.npz`` keyed by the ``.d``
-        path, the query m/z grid, and the window parameters.  A re-run that changes
-        only scoring settings reuses it and skips the pass.  Unlike ``raw_query_cache``
-        (in-process, whole extraction) this survives across processes.
+        Path to the raw Bruker ``.d`` directory. Required when ``maldi_query_raw=True``.
+    raw_query_cache, raw_query_cache_dir
+        In-process and on-disk caches for raw-query mode (see CLAUDE.md).
     extraction_ppm
         Ion image extraction half-window (ppm) used by raw-query mode.
-    mz_shift_delta_min
-        Minimum absolute mass shift (Da) for ``decoy_method="mz_shift"``.
-    mz_shift_delta_max
-        Maximum absolute mass shift (Da) for ``decoy_method="mz_shift"``.
-    mz_shift_snap_tolerance_ppm
-        Maximum ppm distance between the shifted query and the nearest MALDI
-        feature for the snap to be accepted (``decoy_method="mz_shift"``).
-    max_shuffle_rounds
-        Maximum shuffle rounds for ``decoy_method`` in
-        {``"balanced_shuffle"``, ``"paired_shuffle"``}.
-    target_ratio
-        Target decoy:target ratio for ``decoy_method`` in
-        {``"balanced_shuffle"``, ``"paired_shuffle"``} (default 1.0 = 1:1).
     calibration_percentile
-        Fraction (0–1, default 0.10) of TARGET candidates used to finetune /
-        calibrate DeepLC and IM2Deep. The top fraction is selected by spectral
-        quality (low ``ppm_error_abs`` and high ``theo_isotope_cosine``), blind
-        to ``is_decoy``. Replaces the old ``n_candidates == 1`` heuristic, whose
-        size collapsed when decoys were paired onto target features (e.g. under
-        ``paired_shuffle``).
+        Fraction (0–1) of TARGET candidates used to finetune IM2Deep, selected by
+        low ``ppm_error_abs`` and high ``theo_isotope_cosine``, blind to ``is_decoy``.
     features_preset
-        Feature set preset: ``"all"`` (full ``MALDI_INTRINSIC_FEATURES``) or
-        ``"main"`` (``MAIN_FEATURES``, one representative per collinear group).
+        ``"all"`` (``MALDI_INTRINSIC_FEATURES``) or ``"main"`` (``MAIN_FEATURES``).
     features_exclude
-        List of feature names to remove from the ranker feature set after
-        applying the preset. Applied before optional protein-level feature
-        inclusion.
-    pseudo_label_max_iter
-        Legacy parameter (SVM/CatBoost): maximum pseudo-label iterations.
-        Use ``max_iter`` for LDA/QDA.
-    pseudo_label_fdr
-        Legacy parameter (SVM/CatBoost): FDR threshold for pseudo-label
-        iteration. Use ``train_fdr`` for LDA/QDA.
-    decoy_split
-        H-fdr-2 (Percolator-RESET, Freestone et al. 2025), opt-in. Splits
-        decoys into a training half and a held-out half; the final reported
-        FDR is always estimated against the held-out half only — the same
-        decoy never both teaches the discriminant and gets counted against
-        it. Whether the training half *also* restricts the seed search and
-        pseudo-label iteration is controlled by ``decoy_split_final_only``.
-        Only wired for the {lda, svm, gbt, rbf_svm} backends
-        (``_rescore_linear``); the ``qda`` backend is unaffected.
-    decoy_split_final_only
-        H-fdr-2b, opt-in, only meaningful when ``decoy_split=True``. F-024
-        (E011/E012) found the full split — restricting the seed search and
-        every pseudo-label iteration to the training half too — costs more
-        statistical power than it buys back at kidney/her2's candidate
-        counts, inflating the permutation-null ceiling faster than the true
-        seed grows. When this flag is set, the split is applied ONLY to the
-        final reported FDR (still computed against the held-out half only);
-        the seed search and iteration loop see the FULL, unsplit decoy pool,
-        exactly as without ``decoy_split`` at all. ``False`` (default)
-        reproduces H-fdr-2's original full-split behaviour.
+        Feature names to remove from the ranker feature set.
     train_fdr_escalate
-        H-fdr-2, opt-in. If ``init_fdr``/``train_fdr`` would otherwise yield
-        zero pseudo-positives, retries at increasing thresholds (steps of
-        0.005, capped at 0.5) before giving up. A no-op whenever the
-        configured threshold already succeeds.
+        If ``init_fdr``/``train_fdr`` would otherwise yield zero pseudo-positives,
+        retry at increasing thresholds (steps of 0.005, capped at 0.5).
     pseudo_label_growth_cap
-        H-fdr-5, opt-in. Stops the self-training loop (without accepting that
-        iteration's label update) once the pseudo-positive count exceeds this
-        multiple of the initial seed size, regardless of convergence. ``None``
-        (default) disables it.
+        H-fdr-5, opt-in. Stops the self-training loop once the pseudo-positive
+        count exceeds this multiple of the initial seed size. ``None`` disables it.
     model_repeats
         H-fdr-6, opt-in. Number of independent replicate fits (each with its own
-        CV partition) whose standardised scores are averaged. The semi-supervised
-        loop does not converge, so a single fit's q-value floor is a draw rather
-        than a property of the data -- kidney's spanned 0 to 63 peptides at 5% FDR
-        across twelve partitions (F-030). ``1`` (default) reproduces every result
-        predating this.
+        CV partition) whose standardised scores are averaged (F-030).
     r1_seed_percentile
-        Percentile of target R1 scores used as the seed threshold for R2
-        (LDA/QDA). The top ``(1 - r1_seed_percentile)`` fraction of target
-        winners by R1 score are used as pseudo-positives for R2 training.
-    r2_seed_percentile
-        Fraction of target R1 winners used as seeds for R2 training (LDA/QDA).
-        Seeds are selected as the top ``r2_seed_percentile`` fraction by R1
-        score, i.e. scores >= ``np.percentile(target_scores, 100*(1-r2_seed_percentile))``.
-        Default 0.20 (top 20%).
+        Top-ppm fallback fraction for the seed when the ppm threshold yields no
+        positives.
 
     Returns
     -------
-    tuple of (psm_list, result_df, feature_names)
-        ``psm_list`` is a ``PSMList`` of all candidates with rescoring features
-        populated. ``result_df`` is a DataFrame with per-candidate columns
-        including ``peptide``, ``protein``, ``feature_mz``, ``feature_idx``,
-        ``is_decoy``, backend-specific round-1 and round-2 scores
-        (e.g. ``lda_score_r1``, ``lda_score_r2``), ``q_value``,
-        ``is_tdc_winner``, ``reweighted_score``, and ``reweighted_q_value``.
-        Round-2 scores and q-values are ``NaN`` for non-winners. The reweighted
-        scores and q-values incorporate the LC-MS/MS and spatial log-priors.
-        ``feature_names`` is the list of ranker features used.
+    tuple of (result_df, features_df)
+        ``result_df`` has one row per candidate with ``peptide``, ``protein``,
+        ``feature_mz``, ``feature_idx``, ``is_decoy``, the score of every
+        candidate (``<model>_score_r1``), and for winners only ``score``,
+        ``q_value``, ``pep``, ``pep_q_value``, ``peptide_q_value``
+        (NaN for non-winners), plus ``is_tdc_winner`` and ``is_peptide_winner``.
+        ``features_df`` is the feature matrix the ranker was fitted on, same row
+        order.
     """
     # --- Step 1: Candidate generation ---
     # Default (digest=False): use only LC-MS/MS identified peptides as candidates.
     # With digest=True: also digest the provided FASTA for additional candidates.
-    lcms_ids = None  # set below if lcms_peptides_path is provided
-    if lcms_peptides_path is not None:
+    # The CLI parses the IDs once and passes them in as ``lcms_ids``; other callers
+    # may pass the paths instead.
+    if lcms_ids is None and lcms_peptides_path is not None:
         from msi_picasso.lcms_ids import parse_lcms_ids
 
         logger.info("Step 1: Parsing LC-MS/MS identifications...")
@@ -2560,6 +1708,7 @@ def rescore(
             format=lcms_id_format,
             psm_utils_reader=psm_utils_reader,
         )
+    if lcms_ids is not None:
         if verbose:
             logger.debug("Writing parsed LC-MS/MS IDs to debug_lcms_ids.tsv")
             lcms_ids.peptides.to_csv(
@@ -2686,15 +1835,6 @@ def rescore(
             raise ValueError(
                 "maldi_query_raw=True requires maldi_d_path (the raw Bruker .d directory)"
             )
-        if decoy_method == "mz_shift" and mz_shift_delta_min < 10.0:
-            warnings.warn(
-                "mz_shift with delta_min < 10 Da in raw-query mode may produce "
-                "zero-signal decoy ion images if shifts land in empty m/z space. "
-                "Consider increasing --mz-shift-delta-min or validating decoy signal "
-                "in the mean spectrum.",
-                UserWarning,
-                stacklevel=2,
-            )
         _target_mzs = np.sort(np.unique(
             peptide_db["mh_mz"].dropna().to_numpy(dtype=np.float64)
         ))
@@ -2730,44 +1870,15 @@ def rescore(
         _maldi_intensities_arr = np.array(
             [img[img > 0].mean() if (img > 0).any() else 0.0 for img in ion_images]
         )
-    # SCiLS CSV 'Intensity [Regions]' takes priority over raw-derived mean intensity.
-    if maldi_intensities is not None:
-        _maldi_intensities_arr = np.asarray(maldi_intensities, dtype=np.float32)
-        logger.info("  Using SCiLS per-feature intensities for log_maldi_intensity_p90")
 
-    # --- Step 1c: Candidate generation (own if/elif/else; independent of the
-    # intensity-source selection above) ---
-    if decoy_method == "mz_shift":
-        # Strip any shuffle decoys that may have been added (e.g. from extra_fasta).
-        # generate_mz_shift_candidates() works exclusively with target peptides and
-        # generates its own decoys via shifted m/z queries.
-        target_db = target_rows(peptide_db)
-        logger.info(
-            "Step 1c: Generating m/z-shift observation-space decoys "
-            f"(delta {mz_shift_delta_min}–{mz_shift_delta_max} Da)..."
-        )
-        candidates = generate_mz_shift_candidates(
-            target_db,
-            maldi_mzs,
-            matching_ppm=matching_ppm,
-            delta_min=mz_shift_delta_min,
-            delta_max=mz_shift_delta_max,
-            snap_tolerance_ppm=mz_shift_snap_tolerance_ppm,
-            # Raw-query images any m/z on demand, so place decoys at the exact shifted
-            # m/z (no snap) — distinct feature per decoy, avoiding the clustering that
-            # collapses decoys onto few grid points and skews the winner T:D ratio.
-            snap_to_features=not maldi_query_raw,
-            maldi_intensities=_maldi_intensities_arr,
-            maldi_intensities_p90=maldi_intensities_p90,
-            maldi_intensities_sum=maldi_intensities_sum,
-        )
-    elif decoy_method == "mz_shuffle":
+    # --- Step 1c: Decoy generation ---
+    target_db = target_rows(peptide_db)
+    if decoy_method == "mz_shuffle":
         # Derangement of the peptide->feature assignment: each target peptide is
         # relocated onto another peptide's real feature (co-located 1 target + 1
         # decoy per feature). Feature-quality features are then identical between a
         # feature's target and decoy, so the ranker must discriminate on the
         # peptide-specific predicted-vs-observed match (CCS, isotope).
-        target_db = target_rows(peptide_db)
         logger.info("Step 1c: Generating m/z-assignment-shuffle (derangement) decoys...")
         # In raw-query mode with entrapment the grid is expanded; restrict the
         # shuffle destinations to target mzs so decoys don't land on entrapment
@@ -2785,72 +1896,7 @@ def rescore(
             maldi_intensities_p90=maldi_intensities_p90,
             maldi_intensities_sum=maldi_intensities_sum,
         )
-    elif decoy_method == "entrapment":
-        if entrapment_fasta is None:
-            raise ValueError(
-                "entrapment_fasta is required when decoy_method='entrapment' "
-                "(pass --entrapment-fasta)"
-            )
-        # Targets are matched normally; entrapment decoys come from a foreign FASTA.
-        target_db = target_rows(peptide_db)
-        logger.info(
-            "Step 1c: Generating entrapment decoys from %s ...", entrapment_fasta
-        )
-        target_candidates = match_to_maldi_features(
-            maldi_mzs, target_db, matching_ppm,
-            maldi_intensities=_maldi_intensities_arr,
-            maldi_intensities_p90=maldi_intensities_p90,
-            maldi_intensities_sum=maldi_intensities_sum,
-        )
-        if "source" not in target_candidates.columns:
-            target_candidates["source"] = "target"
-        decoy_df = load_entrapment_candidates(
-            entrapment_fasta,
-            target_candidates,
-            maldi_mzs,
-            matching_ppm=matching_ppm,
-            missed_cleavages=missed_cleavages,
-            min_length=min_length,
-            max_length=max_length,
-            maldi_intensities=_maldi_intensities_arr,
-            maldi_intensities_p90=maldi_intensities_p90,
-            maldi_intensities_sum=maldi_intensities_sum,
-        )
-        candidates = pd.concat([target_candidates, decoy_df], ignore_index=True)
-        candidates["is_decoy"] = candidates["is_decoy"].astype(bool)
-        # Recompute per-feature / per-protein occupancy stats over the combined set.
-        candidates["n_candidates"] = candidates.groupby("feature_mz")["feature_mz"].transform("count")
-        prot_feat_count = candidates.groupby("protein")["feature_mz"].nunique()
-        candidates["protein_n_features"] = (
-            candidates["protein"].map(prot_feat_count).fillna(0).astype(int)
-        )
-    elif decoy_method in ("balanced_shuffle", "paired_shuffle"):
-        # Pass fasta_path only when --digest is active (Strategy A or C with digest).
-        # LC-only mode (digest=False, lcms_ids set): fasta_path=None triggers pseudo-protein.
-        _bshuffle_fasta = fasta_path if digest else None
-        _selection_mode = "feature" if decoy_method == "paired_shuffle" else "length"
-        logger.info(
-            f"Step 1c: Generating {decoy_method} observation-space decoys "
-            f"(max {max_shuffle_rounds} rounds, target_ratio={target_ratio}, "
-            f"selection={_selection_mode})..."
-        )
-        candidates = generate_balanced_shuffle_candidates(
-            fasta_path=_bshuffle_fasta,
-            lcms_ids=lcms_ids,
-            feature_mzs=maldi_mzs,
-            matching_ppm=matching_ppm,
-            max_shuffle_rounds=max_shuffle_rounds,
-            target_ratio=target_ratio,
-            maldi_intensities=_maldi_intensities_arr,
-            maldi_intensities_p90=maldi_intensities_p90,
-            maldi_intensities_sum=maldi_intensities_sum,
-            missed_cleavages=missed_cleavages,
-            min_length=min_length,
-            max_length=max_length,
-            selection_mode=_selection_mode,
-        )
     elif decoy_method == "substitution":
-        target_db = target_rows(peptide_db)
         logger.info(
             "Step 1c: Generating substitution decoys "
             "(n_residues=%d, seed=%d, collision_filter=%s)...",
@@ -2874,18 +1920,12 @@ def rescore(
             maldi_intensities_sum=maldi_intensities_sum,
         )
     else:
-        candidates = match_to_maldi_features(
-            maldi_mzs,
-            peptide_db,
-            matching_ppm,
-            maldi_intensities=_maldi_intensities_arr,
-            maldi_intensities_p90=maldi_intensities_p90,
-            maldi_intensities_sum=maldi_intensities_sum,
+        raise ValueError(
+            f"Unknown decoy_method {decoy_method!r}. Choose 'substitution' or 'mz_shuffle'."
         )
     # --- Entrapment: inject shuffled pseudo-target candidates ---
     if _entrapment_db is not None and len(_entrapment_db) > 0:
-        from msi_picasso.candidates import match_to_maldi_features as _mtf
-        _ent_cands = _mtf(
+        _ent_cands = match_to_maldi_features(
             maldi_mzs, _entrapment_db, matching_ppm,
             maldi_intensities=_maldi_intensities_arr,
             maldi_intensities_p90=maldi_intensities_p90,
@@ -2924,8 +1964,8 @@ def rescore(
     )
 
     # --- Raw-query mode: extract ion images at the candidate-derived m/z ---
-    # candidates["feature_mz"] now holds every queried m/z (for mz_shift decoys
-    # this is the shifted anchor).  Extract directly from the raw .d, then attach
+    # candidates["feature_mz"] now holds every queried m/z (for a substitution decoy
+    # this is its own [M+H]+).  Extract directly from the raw .d, then attach
     # the freshly computed per-feature intensities back onto the candidate rows.
     if maldi_query_raw:
         from msi_picasso.maldi_query import (
@@ -3004,12 +2044,7 @@ def rescore(
         # exactly like the intensity maps above.  Absent for TSF/no-mobility data.
         if _peak_quality is not None:
             for _col, _vals in _peak_quality.items():
-                _qmap = {
-                    float(m): float(v)
-                    for m, v in zip(np.asarray(maldi_mzs), np.asarray(_vals))
-                    if np.isfinite(v)
-                }
-                candidates[_col] = candidates["feature_mz"].map(_qmap)
+                candidates[_col] = values_at_mz(_vals, maldi_mzs, candidates["feature_mz"])
 
         # Recompute ppm_error symmetrically from the observed peak centroid in each
         # candidate's own window. In raw-query, candidates are matched against the
@@ -3018,7 +2053,7 @@ def rescore(
         # (observed_centroid - feature_mz)/feature_mz * 1e6 gives a real, symmetric
         # mass-accuracy feature: targets and decoys are measured identically against
         # their own anchor, with no inheritance and no label leak.  Candidates whose
-        # window has no observed peak (e.g. mz_shift decoys shifted into empty m/z)
+        # window has no observed peak (e.g. decoys whose m/z lands in empty space)
         # get the worst-case ppm (the extraction window edge) rather than NaN, so
         # they are penalised on ppm instead of median-imputed to an average value.
         if np.isfinite(_centroid_arr).any():
@@ -3029,11 +2064,7 @@ def rescore(
             candidates["ppm_error"] = _ppm
             candidates["ppm_error_abs"] = np.abs(_ppm)
             # Count rows whose own window had a real observed peak (vs worst-case fill).
-            _sig_mz = {
-                float(m) for m, c in zip(np.asarray(maldi_mzs), _centroid_arr)
-                if np.isfinite(c)
-            }
-            _n_signal = int(sum(float(m) in _sig_mz for m in _fmz))
+            _n_signal = int(np.isfinite(values_at_mz(_centroid_arr, maldi_mzs, _fmz)).sum())
             logger.info(
                 "Raw-query mode: recomputed ppm_error from observed peak centroids "
                 "for %d/%d candidate rows; %d empty-window rows set to worst-case "
@@ -3059,12 +2090,11 @@ def rescore(
             0 if observed_ccs_per_feature is None else len(observed_ccs_per_feature),
         )
 
-    # --- Select calibration peptides (DeepLC / IM2Deep finetuning anchors) ---
+    # --- Select calibration peptides (IM2Deep finetuning anchors) ---
     # theo_isotope_cosine is needed for the quality ranking and is computed in
     # full at Step 6; compute it here (cheap, lru_cache'd, idempotent — Step 6
-    # overwrites with identical values) so the calibration set is available before
-    # DeepLC finetuning at Step 4.  is_calibration_peptide is carried on the
-    # candidates DataFrame and reused by the DeepLC, IM2Deep CCS, mobility, and CCS
+    # overwrites with identical values). is_calibration_peptide is carried on the
+    # candidates DataFrame and reused by the IM2Deep CCS, mobility, and CCS
     # filter steps instead of the decoy-sensitive n_candidates == 1 heuristic.
     from msi_picasso.maldi_features import compute_theoretical_isotope_features
     candidates = compute_theoretical_isotope_features(candidates, maldi_envelopes=maldi_envelopes)
@@ -3075,145 +2105,6 @@ def rescore(
         f"  Calibration set: {int(candidates['is_calibration_peptide'].sum())} target "
         f"candidates (top {calibration_percentile:.0%} by low ppm + high isotope cosine)"
     )
-
-    # --- Steps 2–5: LC-MS/MS data (skipped when no mzML or prior weight is 0) ---
-    lcms_evidence = {}
-
-    if mzml_paths and lcms_prior_weight > 0:
-        # --- Step 2: Load LC-MS/MS data ---
-        logger.info("Step 2: Loading LC-MS/MS data...")
-        lcms_data = load_lcms_data(mzml_paths)
-        if verbose:
-            logger.debug(f"Writing LC-MS/MS data to {output_dir}/10_debug_lcms_data.pkl")
-            with open(f"{output_dir}/10_debug_lcms_data.pkl", "wb") as f:
-                pickle.dump(lcms_data, f)
-
-        # --- Step 3: MS2PIP predictions ---
-        logger.info("Step 3: Finding MS2 matches and running MS2PIP...")
-        from msi_picasso.lcms_evidence import _find_matching_ms2_scans
-        from msi_picasso.utils import mz_to_mass
-
-        feature_ms2_charges = {}
-        for mz in candidates["feature_mz"].unique():
-            neutral_mass = mz_to_mass(mz, charge=1)
-            scan_idxs = _find_matching_ms2_scans(neutral_mass, lcms_data, ppm_tolerance)
-            if scan_idxs:
-                feature_ms2_charges[mz] = set(
-                    int(lcms_data.ms2_precursor_charge[i]) for i in scan_idxs
-                )
-        logger.info(
-            f"  {len(feature_ms2_charges)}/{candidates['feature_mz'].nunique()} features have MS2 matches"
-        )
-
-        peptide_charge_pairs = set()
-        for mz, charges in feature_ms2_charges.items():
-            peps = candidates[candidates["feature_mz"] == mz]["peptide"].unique()
-            for pep in peps:
-                for c in charges:
-                    peptide_charge_pairs.add((pep, c))
-        logger.info(
-            f"  {len(peptide_charge_pairs)} unique (peptide, charge) pairs for MS2PIP"
-        )
-
-        ms2pip_cache = get_ms2pip_predictions(
-            sorted(peptide_charge_pairs),
-            model="timsTOF2024",
-        )
-
-        # --- Step 4: DeepLC predictions ---
-        logger.info("Step 4: Computing DeepLC predictions...")
-        unique_peptides = candidates["peptide"].unique().tolist()
-        _dlc_kw = dict(
-            epochs=deeplc_finetune_epochs,
-            lr=deeplc_finetune_lr,
-            patience=deeplc_finetune_patience,
-        )
-
-        # Build finetuning calibration set: the high-quality target peptides
-        # (is_calibration_peptide — top calibration_percentile by low ppm + high
-        # isotope cosine) that are also observed in LC-MS/MS with RT.  Selection is
-        # blind to is_decoy and unaffected by paired decoys, unlike the previous
-        # n_candidates == 1 heuristic.
-        _deeplc_cal_df: "pd.DataFrame | None" = None
-        if lcms_ids is not None and "is_calibration_peptide" in candidates.columns:
-            _cal_peps = set(
-                candidates.loc[candidates["is_calibration_peptide"], "peptide"].unique()
-            )
-            _cal = (
-                lcms_ids.peptides
-                .loc[lcms_ids.peptides["sequence"].isin(_cal_peps), ["sequence", "rt_mean"]]
-                .dropna(subset=["rt_mean"])
-                .reset_index(drop=True)
-            )
-            if len(_cal) >= 20:
-                _deeplc_cal_df = _cal
-                logger.info(
-                    f"  DeepLC calibration set: {len(_cal)} high-quality target peptides "
-                    f"with observed RT (of {len(_cal_peps)} calibration candidates)"
-                )
-            else:
-                logger.warning(
-                    f"  Only {len(_cal)} calibration peptides with observed RT "
-                    f"— skipping DeepLC finetuning (using default model)"
-                )
-
-        deeplc_model = None
-        if _deeplc_cal_df is not None:
-            deeplc_model = finetune_deeplc_from_df(_deeplc_cal_df, **_dlc_kw)
-        elif msf_path:
-            # lcms_ids unavailable: fall back to reading the MSF directly
-            deeplc_model = finetune_deeplc(msf_path, **_dlc_kw)
-        deeplc_cache = get_deeplc_predictions(unique_peptides, model=deeplc_model)
-
-        # Estimate RT window from calibration error on the same set used for finetuning.
-        # Window = rt_window_multiplier × p95(|pred_RT − obs_RT|).
-        rt_window_min = 0.0
-        _cal_for_window = _deeplc_cal_df
-        if deeplc_cache and _cal_for_window is not None and len(_cal_for_window) > 10:
-            pred_rts_cal = np.array(
-                [deeplc_cache.get(seq, np.nan) for seq in _cal_for_window["sequence"]]
-            )
-            obs_rts_cal = _cal_for_window["rt_mean"].values.astype(float)
-            valid = ~np.isnan(pred_rts_cal) & ~np.isnan(obs_rts_cal)
-            if valid.sum() > 10:
-                p95_mae = float(
-                    np.percentile(np.abs(pred_rts_cal[valid] - obs_rts_cal[valid]), 95)
-                )
-                rt_window_min = rt_window_multiplier * p95_mae
-                logger.info(
-                    f"  DeepLC RT window: {rt_window_multiplier} × p95 MAE "
-                    f"= {rt_window_min:.3f} min "
-                    f"({valid.sum()} calibration peptides, p95={p95_mae:.3f} min)"
-                )
-
-        # --- Step 5: Compute LC-MS/MS evidence ---
-        # MS1 features are anchored by DeepLC predicted RT (fully symmetric:
-        # targets and decoys receive identical treatment).
-        logger.info("Step 5: Computing LC-MS/MS evidence features...")
-        lcms_evidence = compute_all_lcms_evidence(
-            candidates,
-            lcms_data,
-            ms2pip_cache,
-            deeplc_cache,
-            maldi_envelopes=maldi_envelopes,
-            ppm_tolerance=ppm_tolerance,
-            fragment_tol_da=fragment_tol_da,
-            rt_window_min=rt_window_min,
-        )
-
-        if verbose:
-            logger.debug(
-                f"Writing LC-MS/MS evidence to {output_dir}/11_debug_lcms_evidence.tsv"
-            )
-            pd.DataFrame(lcms_evidence).T.to_csv(
-                f"{output_dir}/11_debug_lcms_evidence.tsv", sep="\t", index=True
-            )
-
-    else:
-        if not mzml_paths:
-            logger.info("Steps 2–5: No mzML files provided — skipping LC-MS/MS evidence.")
-        else:
-            logger.info("Steps 2–5: lcms_prior_weight=0 — skipping DeepLC / MS2PIP / LC-MS/MS evidence.")
 
     # --- Override protein_tryptic_count with the true full-digest count ---
     # Replaces the candidate-pool count (= observed peptides, which makes
@@ -3236,12 +2127,8 @@ def rescore(
 
     # --- Step 6: Compute all features ---
     logger.info("Step 6: Computing all features...")
-    # When region colocalization is on and debug figures are requested, collect the
-    # segmentation map + region fingerprints so save_debug_figures can visualize them.
-    region_coloc_debug = {} if (region_coloc and debug_dir is not None) else None
     features_df = compute_all_features(
         candidates,
-        lcms_evidence=lcms_evidence,
         spatial_features=spatial_features,
         ion_images=ion_images,
         ion_image_mzs=ion_image_mzs,
@@ -3254,10 +2141,6 @@ def rescore(
         coloc_measured_pixel_mask=coloc_measured_pixel_mask,
         coloc_tic_normalize=coloc_tic_normalize,
         coloc_common_mode=coloc_common_mode,
-        region_coloc=region_coloc,
-        region_coloc_k=region_coloc_k,
-        region_coloc_debug=region_coloc_debug,
-        within_region_coloc=within_region_coloc,
         cosine_coloc=cosine_coloc,
         tic_image=tic_image,
         tic_n_features=tic_n_features,
@@ -3482,14 +2365,6 @@ def rescore(
         _debug_cols = [c for c in features_df.columns if c not in _exclude_set]
         features_df[_debug_cols].to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
-    feature_names = get_feature_names(
-        has_spatial=spatial_features is not None,
-        has_ion_images=ion_images is not None,
-        has_ccs=observed_ccs_per_feature is not None,
-        has_mob_coloc=_has_mob_coloc,
-    )
-    logger.debug(f"Selected feature names: {feature_names}")
-
     # Intrinsic features that are actually present in the DataFrame.
     # Protein-level features are excluded by default (TDC correctness); opt-in
     # only when use_protein_level_features=True (--use-protein-level-feats).
@@ -3501,13 +2376,6 @@ def rescore(
             f"  Features preset 'main': using {len(MAIN_FEATURES)} representative features "
             f"(vs {len(MALDI_INTRINSIC_FEATURES)} in the full set)"
         )
-
-    # --- Spatial ranker features (opt-in) — gated on decoy method ---
-    # Decoys must land on real MALDI features for spatial features to form a
-    # symmetric null.  entrapment and mz_shift decoys do; shuffle variants do not.
-    use_spatial_ranker_features = _resolve_spatial_ranker_features(
-        use_spatial_ranker_features, decoy_method
-    )
 
     # _exclude_set (features_exclude + the mz_shuffle CCS/mobility leak features) was
     # resolved above, after mob_coloc and after 13_debug_features.tsv was written, so
@@ -3526,17 +2394,6 @@ def rescore(
             f"  Spatial ranker features enabled ({len(SPATIAL_RANKER_FEATURES)} features) "
             f"with decoy_method='{decoy_method}'"
         )
-    if region_coloc:
-        _pool += REGION_COLOCALIZATION_FEATURES
-        logger.info(
-            f"  Region colocalization features enabled ({len(REGION_COLOCALIZATION_FEATURES)} features)"
-        )
-    if within_region_coloc:
-        _pool += WITHIN_REGION_COLOCALIZATION_FEATURES
-        logger.info(
-            f"  Within-region colocalization features enabled "
-            f"({len(WITHIN_REGION_COLOCALIZATION_FEATURES)} features, experimental — O3)"
-        )
     if cosine_coloc:
         _pool += COSINE_COLOCALIZATION_FEATURES
         logger.info(
@@ -3551,13 +2408,15 @@ def rescore(
             f"  Protein-size residualized features enabled ({len(_size_resid_added)}): "
             f"{_size_resid_added}. Their raw counterparts are excluded (PROGRESS.md F-045)."
         )
-    # Intrinsic 2D peak-quality features: default-on for the decoy methods where they
-    # are valid/safe (see _MOB_QUALITY_DEFAULT_DECOYS).  Only present when extracted
-    # (raw-query + ion mobility); the intrinsic_present intersection below drops them
-    # otherwise.  Drop explicitly via features_exclude if unwanted.
-    if decoy_method in _MOB_QUALITY_DEFAULT_DECOYS and any(
-        f in features_df.columns for f in MOB_QUALITY_FEATURES
-    ):
+    # Intrinsic 2D peak-quality features: default-on. For substitution the decoy sits at
+    # a distinct (often empty or noisy) m/z, so feature-level peak quality discriminates.
+    # For mz_shuffle the co-located target and decoy share the feature, so these columns
+    # are exactly symmetric (AUC ~= 0.5), which is harmless. They use only the observed
+    # peak and no prediction, so unlike the im2deep_* CCS scalars they do not leak the
+    # m/z baseline under mz_shuffle. Only present when extracted (raw-query + ion
+    # mobility); the intrinsic_present intersection below drops them otherwise. Drop
+    # explicitly via features_exclude if unwanted.
+    if any(f in features_df.columns for f in MOB_QUALITY_FEATURES):
         _pool += MOB_QUALITY_FEATURES
         logger.info(
             f"  2D peak-quality features enabled ({len(MOB_QUALITY_FEATURES)} features) "
@@ -3583,8 +2442,6 @@ def rescore(
         if f not in _exclude_set and not (f in _seen or _seen.add(f))
     ]
     intrinsic_present = [f for f in _intrinsic_pool if f in features_df.columns]
-    lcms_present = [f for f in LCMS_PRIOR_FEATURES if f in features_df.columns]
-    spatial_present = [f for f in SPATIAL_PRIOR_FEATURES if f in features_df.columns]
 
     # Drop constant / near-constant features from the ranker input.  A column
     # with one unique value contributes zero variance and only consumes a slot
@@ -3595,595 +2452,144 @@ def rescore(
         logger.info(f"  Dropping {len(_constant)} constant features from ranker: {_constant}")
         intrinsic_present = [f for f in intrinsic_present if f not in _constant]
 
-    # --- Step 7: Build PSMList ---
-    logger.info("Step 8: Building PSMList...")
-    psm_list = candidates_to_psm_list(features_df)
+    logger.info(f"  {len(intrinsic_present)} ranker features")
+
+    # --- Step 8: Rescoring ---
+    logger.info(f"Step 8: Running rescoring (model='{model}')...")
+    if model not in _ESTIMATOR_MODELS:
+        raise ValueError(f"Unknown model '{model}'. Choose one of {sorted(_ESTIMATOR_MODELS)}.")
+    feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
+
+    # Fitted-pipeline capture for SHAP debug explanations (see debug_pfm_explanations).
+    fitted: dict = {}
+    scores_all, importances, struct_coefs, struct_names, imp_names = _rescore_linear(
+        features_df,
+        intrinsic_present,
+        init_ppm_threshold=init_ppm_threshold,
+        init_fdr=init_fdr,
+        train_fdr=train_fdr,
+        max_iter=max_iter,
+        r1_seed_percentile=r1_seed_percentile,
+        min_seed_positives=min_seed_positives,
+        seed_features=seed_features,
+        clf_name=model,
+        make_clf=_estimator_factory(
+            model, svm_c=svm_c, rbf_svm_c=rbf_svm_c, rbf_svm_gamma=rbf_svm_gamma
+        ),
+        fitted_out=fitted,
+        train_fdr_escalate=train_fdr_escalate,
+        pseudo_label_growth_cap=pseudo_label_growth_cap,
+        model_repeats=model_repeats,
+    )
     if verbose:
-        logger.debug(
-            f"Writing PSM list to {output_dir}/14_debug_psm_list.pkl for scorer input"
+        with open(f"{output_dir}/17_debug_{model}_scores_r1.pkl", "wb") as f:
+            pickle.dump(scores_all, f)
+        _imp_df = pd.DataFrame({"feature": imp_names, "importance": importances})
+        if struct_coefs is not None and struct_names:
+            _imp_df = _imp_df.merge(
+                pd.DataFrame({"feature": struct_names, "structure_coef": struct_coefs}),
+                on="feature", how="left",
+            )
+        _imp_df.sort_values("importance", ascending=False).to_csv(
+            f"{output_dir}/17_debug_{model}_importances_r1.tsv", sep="\t", index=False
         )
-        psm_list_df = psm_list.to_dataframe()
-        psm_list_df.to_csv(f"{output_dir}/14_debug_psm_list.tsv", sep="\t", index=False)
 
-    populate_psm_features(psm_list, features_df, feature_names)
-
+    # --- Per-feature winner selection, then TDC over the winners ---
+    # Winner selection is the target-vs-decoy competition that defines the TDC
+    # population; the winners keep the score they were selected on.
+    winner_pos, winners_df = _select_feature_winners(features_df, scores_all, feature_col, winner_percentile)
     logger.info(
-        f"  {len(feature_names)} features ({len(intrinsic_present)} intrinsic, {len(lcms_present)} LC-MS/MS prior)"
+        f"  Winner selection: {len(winners_df)} candidates retained "
+        f"({int(winners_df['is_decoy'].sum())} decoys)"
+    )
+    scores_w = scores_all[winner_pos]
+    is_decoy_w = winners_df["is_decoy"].values.astype(bool)
+    q_w = _tdc_qvalues(scores_w, is_decoy_w)
+    pep_w = estimate_pep(scores_w, is_decoy_w)
+    peptide_q_w, is_pep_rep_w = _peptide_level_qvalues(
+        scores_w, is_decoy_w, winners_df["peptide"].to_numpy()
     )
 
-    # --- Step 9: Rescoring ---
-    logger.info(f"Step 8: Running rescoring (model='{model}')...")
+    def _scatter(values, fill=np.nan):
+        """Place per-winner ``values`` onto every candidate row; ``fill`` elsewhere."""
+        out = np.full(len(features_df), fill)
+        out[winner_pos] = values
+        return out
 
-    if model in ("lda", "svm", "gbt", "rbf_svm"):
-        # LDA, SVM, GBT, and RBF-SVM all score via decision_function and share the
-        # entire dispatch (seed, pseudo-label iteration, winner selection, TDC, PEP,
-        # reweighting). LDA/SVM are linear; GBT is a nonlinear gradient-boosted-tree
-        # backend; RBF-SVM is a nonlinear kernel backend with continuous scores.
-        # Select the routine and tag the score columns / importance files by name.
-        _linear = {"svm": _rescore_svm, "gbt": _rescore_gbt,
-                   "rbf_svm": _rescore_rbf_svm}.get(model, _rescore_lda)
-        if model == "svm":
-            _svm_kwargs = {"svm_c": svm_c}
-        elif model == "gbt":
-            _svm_kwargs = {
-                "gbt_n_estimators": gbt_n_estimators,
-                "gbt_max_depth": gbt_max_depth,
-                "gbt_learning_rate": gbt_learning_rate,
-            }
-        elif model == "rbf_svm":
-            _svm_kwargs = {"rbf_svm_c": rbf_svm_c, "rbf_svm_gamma": rbf_svm_gamma}
-        else:
-            _svm_kwargs = {}
-        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
+    is_decoy = features_df["is_decoy"].values.astype(bool)
+    is_winner_full = _scatter(True, fill=False)
+    q_full = _scatter(q_w)
+    peptide_q_full = _scatter(peptide_q_w)
+    is_pep_winner_full = _scatter(is_pep_rep_w, fill=False)
+    result_df = pd.DataFrame(
+        {
+            "peptide": features_df["peptide"].values,
+            "protein": features_df["protein"].values if "protein" in features_df.columns else "",
+            "feature_mz": features_df["feature_mz"].values if "feature_mz" in features_df.columns else np.nan,
+            "feature_idx": features_df.get(
+                "feature_idx", pd.Series(range(len(features_df)))
+            ).values,
+            "is_decoy": is_decoy,
+            f"{model}_score_r1": scores_all,
+            "score": _scatter(scores_w),
+            "q_value": q_full,
+            "pep": _scatter(pep_w),
+            "pep_q_value": _scatter(_pep_qvalues(pep_w)),
+            "is_tdc_winner": is_winner_full,
+            # Peptide-level FDR: one hypothesis per peptide, not per
+            # (peptide, feature) match. `peptide_q_value` is broadcast to
+            # every match of a peptide; `is_peptide_winner` marks the single
+            # best-scoring match that represents it. Count IDs as
+            # `is_peptide_winner & ~is_decoy & peptide_q_value <= alpha`.
+            "peptide_q_value": peptide_q_full,
+            "is_peptide_winner": is_pep_winner_full,
+        }
+    )
+    _ccs_map = observed_ccs_per_feature or {}
+    result_df["feature_ccs"] = [
+        _ccs_map.get(int(i), np.nan) for i in result_df["feature_idx"]
+    ]
 
-        # Fitted-pipeline capture for SHAP debug explanations (see debug_pfm_explanations).
-        _r1_fitted: dict = {}
-        _r2_fitted: dict = {}
-
-        # H-fdr-2 decoy split (Percolator-RESET): computed once, aligned to
-        # features_df's row order. R2's/the final report's view of it is
-        # re-indexed through winner_pos below, since _select_feature_winners
-        # subsets and reorders rows.
-        decoy_split_mask_r1 = None
-        if decoy_split:
-            decoy_split_mask_r1 = _split_decoys_for_reset(features_df["is_decoy"].values)
-            if decoy_split_mask_r1 is None:
-                logger.warning(
-                    "  decoy_split requested but too few decoys (<4) to split — proceeding unsplit"
-                )
-            else:
-                logger.info(
-                    f"  decoy_split: {int(decoy_split_mask_r1.sum())} training decoys, "
-                    f"{int((features_df['is_decoy'].values & ~decoy_split_mask_r1).sum())} held-out for FDR estimation"
-                )
-        # H-fdr-2b (F-024 follow-up): decoy_split_final_only restricts the split's
-        # effect to the final reported FDR (below) — the seed search and iteration
-        # loop keep the FULL, unsplit decoy pool, avoiding the power loss F-024
-        # measured from halving it throughout training.
-        _train_split_mask_r1 = None if decoy_split_final_only else decoy_split_mask_r1
-
-        # --- Round 1: score all candidates ---
-        scores1, _imp_r1_lda, _struct_coefs_r1_lda, _struct_names_r1_lda, _imp_names_lda = _linear(
-            features_df,
-            intrinsic_present,
-            init_ppm_threshold=init_ppm_threshold,
-            init_fdr=init_fdr,
-            train_fdr=train_fdr,
-            max_iter=max_iter,
-            r1_seed_percentile=r1_seed_percentile,
-            min_seed_positives=min_seed_positives,
-            seed_features=seed_features,
-            fitted_out=_r1_fitted,
-            decoy_split_mask=_train_split_mask_r1,
-            train_fdr_escalate=train_fdr_escalate,
-            pseudo_label_growth_cap=pseudo_label_growth_cap,
-            model_repeats=model_repeats,
-            **_svm_kwargs,
-        )
-        # Output importances
-        if verbose:
-            with open(f"{output_dir}/17_debug_{model}_scores_r1.pkl", "wb") as f:
-                pickle.dump(scores1, f)
-            _imp_df_r1 = pd.DataFrame({
-                "feature": _imp_names_lda,
-                "importance": _imp_r1_lda,
-            })
-            if _struct_coefs_r1_lda is not None and _struct_names_r1_lda:
-                _imp_df_r1 = _imp_df_r1.merge(
-                    pd.DataFrame({"feature": _struct_names_r1_lda, "structure_coef": _struct_coefs_r1_lda}),
-                    on="feature", how="left",
-                )
-            _imp_df_r1.sort_values("importance", ascending=False).to_csv(
-                f"{output_dir}/17_debug_{model}_importances_r1.tsv", sep="\t", index=False
-            )
-
-        # --- Per-feature winner selection ---
-        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col, winner_percentile)
+    for fdr_threshold in [0.01, 0.05, 0.10]:
+        n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
+        n_pep = (is_pep_winner_full & ~is_decoy & (peptide_q_full <= fdr_threshold)).sum()
+        # The first line counts (peptide, feature) matches. In feature-list
+        # extraction one peptide matches several features, so that is not a
+        # count of identified peptides -- the second line is.
+        logger.info(f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (feature-level FDR)")
         logger.info(
-            f"  Round-1 winner selection: {len(winners_df)} candidates retained "
-            f"({int(winners_df['is_decoy'].sum())} decoys)"
+            f"  At {fdr_threshold*100:.0f}% FDR: {n_pep} target PEPTIDES "
+            f"(peptide-level FDR)"
         )
-        # Re-index the decoy split onto the winner subset's row order for R2
-        # training and for the final held-out FDR estimate below.
-        decoy_split_mask_w = (
-            decoy_split_mask_r1[winner_pos] if decoy_split_mask_r1 is not None else None
+
+    if debug_dir is not None:
+        from msi_picasso.debug_viz import debug_pfm_explanations, save_debug_figures
+
+        save_debug_figures(
+            features_df, result_df,
+            ion_images=ion_images, ion_image_mzs=ion_image_mzs,
+            maldi_envelopes=maldi_envelopes,
+            feature_names=intrinsic_present, model_name=model,
+            importances=importances,
+            importance_names=imp_names,
+            structure_coefs=struct_coefs,
+            structure_names=struct_names,
+            debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
+            gt_peptides=gt_peptides, ccs_tol_pct=_ccs_tol_pct,
         )
-        # See _train_split_mask_r1 above: H-fdr-2b keeps R2 training on the full
-        # decoy pool too, only the final block (below) uses decoy_split_mask_w.
-        _train_split_mask_w = None if decoy_split_final_only else decoy_split_mask_w
 
-        # --- Round 2: retrain on winner subset (skipped when single_round) ---
-        if single_round:
-            # Single-round mode: use the R1 winner scores directly for TDC. The
-            # per-feature winner selection above (the target-vs-decoy competition)
-            # and thus the TDC FDR are unchanged — only the final discriminant
-            # refit is skipped. Motivated by raw-query, where R1 already trains on
-            # a clean ~1:1 target:decoy set, so R2 typically adds little. R2
-            # importance/struct outputs reuse the R1 model (reporting only).
-            scores2 = scores1[winner_pos]
-            lda_imp_r2 = _imp_r1_lda
-            _struct_coefs_r2_lda = _struct_coefs_r1_lda
-            _struct_names_r2_lda = _struct_names_r1_lda
-            lda_imp_names_r2 = _imp_names_lda
-            logger.info("  Single-round mode: skipping R2 retrain; TDC on R1 winner scores")
-        else:
-            # Seed R2 from the top-r2_seed_percentile of target winners by R1 score.
-            # After winner selection the remaining targets may have ppm > init_ppm_threshold
-            # (R1 lifted them on other features), so re-seeding from ppm alone would
-            # leave only a handful of seeds, causing the LDA to degenerate.  Using
-            # q-values from R1 has the same problem when R1 itself identified very few
-            # pseudo-positives.  A percentile cut on raw R1 scores is guaranteed to
-            # produce a reasonably sized seed regardless of how well R1 converged.
-            is_decoy_w = winners_df["is_decoy"].values.astype(bool)
-            target_scores_w = scores1[winner_pos][~is_decoy_w]
-            score_threshold = np.percentile(target_scores_w, 100.0 * (1.0 - r2_seed_percentile))
-            r2_seed_mask = (~is_decoy_w) & (scores1[winner_pos] >= score_threshold)
-            logger.info(
-                f"  {model.upper()} R2: seeding from top-{r2_seed_percentile*100:.0f}% R1 target scores "
-                f"(score ≥ {score_threshold:.3f}) → {r2_seed_mask.sum()} positives"
-            )
-
-            # --- Feature selection for R2: drop below-median importance from R1 ---
-            if lda_r2_median_filter and _imp_r1_lda is not None and _imp_names_lda:
-                imp_abs = np.abs(_imp_r1_lda)
-                imp_median = np.median(imp_abs)
-                lda_r2_features = [f for f, a in zip(_imp_names_lda, imp_abs) if a >= imp_median]
-                logger.info(
-                    f"  {model.upper()} R2: using {len(lda_r2_features)}/{len(_imp_names_lda)} features "
-                    f"with |importance| ≥ median ({imp_median:.4f})"
+        # Per-PFM SHAP explanations on the fitted model, restricted to winner rows.
+        if verbose and fitted.get("pipe") is not None:
+            try:
+                debug_pfm_explanations(
+                    result_df.iloc[winner_pos].reset_index(drop=True),
+                    fitted["X"][winner_pos], fitted["pipe"], fitted["feature_names"],
+                    ion_images=ion_images, feature_mzs=ion_image_mzs,
+                    output_dir=debug_dir,
                 )
-            else:
-                lda_r2_features = intrinsic_present
+            except Exception as _pfm_exc:
+                logger.warning("debug_pfm_explanations failed: %s", _pfm_exc)
 
-            scores2, lda_imp_r2, _struct_coefs_r2_lda, _struct_names_r2_lda, lda_imp_names_r2 = _linear(
-                winners_df,
-                lda_r2_features,
-                init_ppm_threshold=init_ppm_threshold,
-                seed_mask=r2_seed_mask,
-                n_interaction_features=n_interaction_features,
-                r1_importances=_imp_r1_lda,
-                r1_feature_names=_imp_names_lda,
-                init_fdr=init_fdr,
-                train_fdr=train_fdr,
-                max_iter=max_iter,
-                r1_seed_percentile=r1_seed_percentile,
-                min_seed_positives=min_seed_positives,
-                fitted_out=_r2_fitted,
-                decoy_split_mask=_train_split_mask_w,
-                train_fdr_escalate=train_fdr_escalate,
-                pseudo_label_growth_cap=pseudo_label_growth_cap,
-                model_repeats=model_repeats,
-                **_svm_kwargs,
-            )
-            # Output importances
-            if verbose:
-                with open(f"{output_dir}/17_debug_{model}_scores_r2.pkl", "wb") as f:
-                    pickle.dump(scores2, f)
-                _imp_df_r2 = pd.DataFrame({
-                    "feature": lda_imp_names_r2 or _imp_names_lda,
-                    "importance": lda_imp_r2,
-                })
-                if _struct_coefs_r2_lda is not None and _struct_names_r2_lda:
-                    _imp_df_r2 = _imp_df_r2.merge(
-                        pd.DataFrame({"feature": _struct_names_r2_lda, "structure_coef": _struct_coefs_r2_lda}),
-                        on="feature", how="left",
-                    )
-                _imp_df_r2.sort_values("importance", ascending=False).to_csv(
-                    f"{output_dir}/17_debug_{model}_importances_r2.tsv", sep="\t", index=False
-                )
-
-        # --- Standard TDC FDR on winners ---
-        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
-        # H-fdr-2: the reported q-value is the actual RESET firewall — computed
-        # against targets + held-out decoys only, never the training-half decoys
-        # that taught the discriminant. A training-decoy winner row gets NaN
-        # here (harmless: reported ID counts are always gated on ~is_decoy, and
-        # a decoy is never counted as an ID regardless of its own q-value).
-        # Storey pi0 and PEP are NOT masked (scope: H-fdr-2's deliverable is the
-        # primary q-value/discovery-set count; both remain computed against the
-        # full decoy population when decoy_split is enabled).
-        _estimate_mask_w = (
-            (~is_decoy_w) | (is_decoy_w & ~decoy_split_mask_w)
-            if decoy_split_mask_w is not None else None
-        )
-        q2 = _tdc_qvalues_masked(scores2, is_decoy_w, estimate_mask=_estimate_mask_w)
-        pep_w = estimate_pep(scores2, is_decoy_w)
-        pep_q_w = _pep_qvalues(pep_w)
-        lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
-        spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
-        # Additive log-prior: rank-correct for arbitrary-sign scores.
-        # Multiplying a negative score by a prior in [0,1] would invert
-        # the ranking (a bad candidate with low prior becomes less negative,
-        # i.e. higher-ranked).  Adding log(prior) penalises low-prior
-        # candidates uniformly regardless of score sign.
-        _LOG_EPS = 1e-12
-        reweighted2 = (
-            scores2
-            + lcms_prior_weight * np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
-            + spatial_prior_weight * np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
-        )
-        rw_q2 = _tdc_qvalues_masked(reweighted2, is_decoy_w, estimate_mask=_estimate_mask_w)
-        peptide_q2, is_pep_rep2 = _peptide_level_qvalues(
-            reweighted2, is_decoy_w, winners_df["peptide"].to_numpy(),
-            estimate_mask=_estimate_mask_w,
-        )
-
-        # --- Optional Storey pi0 correction ---
-        if storey_pi0:
-            _pi0 = _estimate_pi0_storey(scores2, is_decoy_w)
-            logger.info(f"  Storey pi0 estimate: {_pi0:.4f}")
-            storey_q2 = _tdc_qvalues(scores2, is_decoy_w, pi0=_pi0)
-            storey_rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w, pi0=_pi0)
-        else:
-            _pi0 = None
-
-        # --- Map back to full candidate table ---
-        is_winner_full = np.zeros(len(features_df), dtype=bool)
-        is_winner_full[winner_pos] = True
-        scores2_full = np.full(len(features_df), np.nan)
-        scores2_full[winner_pos] = scores2
-        q_full = np.full(len(features_df), np.nan)
-        q_full[winner_pos] = q2
-        pep_full = np.full(len(features_df), np.nan)
-        pep_full[winner_pos] = pep_w
-        pep_q_full = np.full(len(features_df), np.nan)
-        pep_q_full[winner_pos] = pep_q_w
-        rw_full = np.full(len(features_df), np.nan)
-        rw_full[winner_pos] = reweighted2
-        rw_q_full = np.full(len(features_df), np.nan)
-        rw_q_full[winner_pos] = rw_q2
-        peptide_q_full = np.full(len(features_df), np.nan)
-        peptide_q_full[winner_pos] = peptide_q2
-        is_pep_winner_full = np.zeros(len(features_df), dtype=bool)
-        is_pep_winner_full[winner_pos] = is_pep_rep2
-
-        is_decoy = features_df["is_decoy"].values.astype(bool)
-        result_df = pd.DataFrame(
-            {
-                "peptide": features_df["peptide"].values,
-                "protein": features_df["protein"].values if "protein" in features_df.columns else "",
-                "feature_mz": features_df["feature_mz"].values if "feature_mz" in features_df.columns else np.nan,
-                "feature_idx": features_df.get(
-                    "feature_idx", pd.Series(range(len(features_df)))
-                ).values,
-                "is_decoy": is_decoy,
-                f"{model}_score_r1": scores1,
-                f"{model}_score_r2": scores2_full,
-                "q_value": q_full,
-                "pep": pep_full,
-                "pep_q_value": pep_q_full,
-                "is_tdc_winner": is_winner_full,
-                "reweighted_score": rw_full,
-                "reweighted_q_value": rw_q_full,
-                # Peptide-level FDR: one hypothesis per peptide, not per
-                # (peptide, feature) match. `peptide_q_value` is broadcast to
-                # every match of a peptide; `is_peptide_winner` marks the single
-                # best-scoring match that represents it. Count IDs as
-                # `is_peptide_winner & ~is_decoy & peptide_q_value <= alpha`.
-                "peptide_q_value": peptide_q_full,
-                "is_peptide_winner": is_pep_winner_full,
-            }
-        )
-        _ccs_map = observed_ccs_per_feature or {}
-        result_df["feature_ccs"] = [
-            _ccs_map.get(int(i), np.nan) for i in result_df["feature_idx"]
-        ]
-        if storey_pi0 and _pi0 is not None:
-            storey_q_full = np.full(len(features_df), np.nan)
-            storey_q_full[winner_pos] = storey_q2
-            storey_rw_q_full = np.full(len(features_df), np.nan)
-            storey_rw_q_full[winner_pos] = storey_rw_q2
-            result_df["storey_q_value"] = storey_q_full
-            result_df["storey_reweighted_q_value"] = storey_rw_q_full
-
-        for fdr_threshold in [0.01, 0.05, 0.10]:
-            n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
-            n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
-            extra = ""
-            if storey_pi0 and _pi0 is not None:
-                n_st = (is_winner_full & ~is_decoy & (storey_q_full <= fdr_threshold)).sum()
-                extra = f", {n_st} (Storey π₀={_pi0:.3f})"
-            n_pep = (
-                is_pep_winner_full & ~is_decoy & (peptide_q_full <= fdr_threshold)
-            ).sum()
-            logger.info(
-                f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
-                f"{n_rw} target features (reweighted){extra}"
-            )
-            # The line above counts (peptide, feature) matches. In feature-list
-            # extraction one peptide matches several features, so that is not a
-            # count of identified peptides -- this is.
-            logger.info(
-                f"  At {fdr_threshold*100:.0f}% FDR: {n_pep} target PEPTIDES "
-                f"(peptide-level FDR)"
-            )
-
-        if debug_dir is not None:
-            from msi_picasso.debug_viz import save_debug_figures
-            save_debug_figures(
-                features_df, result_df,
-                ion_images=ion_images, ion_image_mzs=ion_image_mzs,
-                maldi_envelopes=maldi_envelopes,
-                feature_names=intrinsic_present, model_name=model,
-                importances_r1=_imp_r1_lda,
-                importances_r2=None if single_round else lda_imp_r2,
-                importance_names=_imp_names_lda,
-                importance_names_r2=lda_imp_names_r2 or _imp_names_lda,
-                structure_coefs_r1=_struct_coefs_r1_lda,
-                structure_names_r1=_struct_names_r1_lda,
-                structure_coefs_r2=None if single_round else _struct_coefs_r2_lda,
-                structure_names_r2=_struct_names_r2_lda,
-                debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
-                gt_peptides=gt_peptides, storey_pi0_val=_pi0,
-                ccs_tol_pct=_ccs_tol_pct, single_round=single_round,
-                region_debug=region_coloc_debug,
-            )
-
-            # Per-PFM SHAP explanations on the fitted linear model. Use the R2
-            # fitted pipeline + winner feature matrix; for single_round (no R2
-            # retrain) fall back to the R1 model restricted to winner rows.
-            if verbose:
-                try:
-                    from msi_picasso.debug_viz import debug_pfm_explanations
-
-                    if not single_round and _r2_fitted.get("pipe") is not None:
-                        _pfm_pipe = _r2_fitted["pipe"]
-                        _pfm_X = _r2_fitted["X"]
-                        _pfm_names = _r2_fitted["feature_names"]
-                    elif _r1_fitted.get("pipe") is not None:
-                        _pfm_pipe = _r1_fitted["pipe"]
-                        _pfm_X = _r1_fitted["X"][winner_pos]
-                        _pfm_names = _r1_fitted["feature_names"]
-                    else:
-                        _pfm_pipe = None
-                    if _pfm_pipe is not None:
-                        debug_pfm_explanations(
-                            result_df.iloc[winner_pos].reset_index(drop=True),
-                            _pfm_X, _pfm_pipe, _pfm_names,
-                            ion_images=ion_images, feature_mzs=ion_image_mzs,
-                            spatial_df=spatial_features, output_dir=debug_dir,
-                        )
-                except Exception as _pfm_exc:
-                    logger.warning("debug_pfm_explanations failed: %s", _pfm_exc)
-
-        if entrapment:
-            _report_entrapment(result_df, features_df, output_dir)
-        return psm_list, result_df, feature_names, features_df
-
-    elif model == "qda":
-        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
-
-        # --- Round 1: score all candidates ---
-        scores1, pep_proba1, _imp_r1_qda, _imp_names_qda = _rescore_qda(
-            features_df,
-            intrinsic_present,
-            init_ppm_threshold=init_ppm_threshold,
-            init_fdr=init_fdr,
-            train_fdr=train_fdr,
-            max_iter=max_iter,
-            r1_seed_percentile=r1_seed_percentile,
-            min_seed_positives=min_seed_positives,
-            seed_features=seed_features,
-        )
-        if verbose:
-            with open(f"{output_dir}/17_debug_qda_scores_r1.pkl", "wb") as f:
-                pickle.dump(scores1, f)
-            qda_importances_df = pd.DataFrame({
-                "feature": _imp_names_qda,
-                "importance": _imp_r1_qda if _imp_r1_qda is not None else np.zeros(len(_imp_names_qda)),
-            }).sort_values("importance", key=np.abs, ascending=False)
-            qda_importances_df.to_csv(
-                f"{output_dir}/17_debug_qda_importances_r1.tsv", sep="\t", index=False
-            )
-
-        # --- Per-feature winner selection ---
-        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col, winner_percentile)
-        logger.info(
-            f"  Round-1 winner selection: {len(winners_df)} candidates retained "
-            f"({int(winners_df['is_decoy'].sum())} decoys)"
-        )
-
-        # --- Round 2: retrain on winner subset (skipped when single_round) ---
-        if single_round:
-            # Single-round: TDC on R1 winner scores; reuse R1 posteriors for PEP.
-            scores2 = scores1[winner_pos]
-            pep_proba2 = pep_proba1[winner_pos]
-            qda_imp_r2, qda_imp_names_r2 = _imp_r1_qda, _imp_names_qda
-            logger.info("  Single-round mode: skipping R2 retrain; TDC on R1 winner scores")
-        else:
-            is_decoy_w = winners_df["is_decoy"].values.astype(bool)
-            target_scores_w = scores1[winner_pos][~is_decoy_w]
-            score_threshold = np.percentile(target_scores_w, 100.0 * (1.0 - r2_seed_percentile))
-            r2_seed_mask = (~is_decoy_w) & (scores1[winner_pos] >= score_threshold)
-            logger.info(
-                f"  QDA R2: seeding from top-{r2_seed_percentile*100:.0f}% R1 target scores "
-                f"(score ≥ {score_threshold:.3f}) → {r2_seed_mask.sum()} positives"
-            )
-
-            if _imp_r1_qda is not None and _imp_names_qda:
-                imp_abs = np.abs(_imp_r1_qda)
-                imp_median = np.median(imp_abs)
-                r2_features = [f for f, a in zip(_imp_names_qda, imp_abs) if a >= imp_median]
-                logger.info(
-                    f"  QDA R2: using {len(r2_features)}/{len(_imp_names_qda)} features "
-                    f"with |importance| ≥ median ({imp_median:.4f})"
-                )
-            else:
-                r2_features = intrinsic_present
-
-            scores2, pep_proba2, qda_imp_r2, qda_imp_names_r2 = _rescore_qda(
-                winners_df,
-                r2_features,
-                init_ppm_threshold=init_ppm_threshold,
-                seed_mask=r2_seed_mask,
-                init_fdr=init_fdr,
-                train_fdr=train_fdr,
-                max_iter=max_iter,
-                r1_seed_percentile=r1_seed_percentile,
-                min_seed_positives=min_seed_positives,
-            )
-            if verbose:
-                with open(f"{output_dir}/17_debug_qda_scores_r2.pkl", "wb") as f:
-                    pickle.dump(scores2, f)
-                qda_importances_df = pd.DataFrame({
-                    "feature": qda_imp_names_r2 or _imp_names_qda,
-                    "importance": qda_imp_r2 if qda_imp_r2 is not None else np.zeros(len(qda_imp_names_r2 or _imp_names_qda)),
-                }).sort_values("importance", key=np.abs, ascending=False)
-                qda_importances_df.to_csv(
-                    f"{output_dir}/17_debug_qda_importances_r2.tsv", sep="\t", index=False
-                )
-
-        # --- Standard TDC FDR on winners ---
-        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
-        q2 = _tdc_qvalues(scores2, is_decoy_w)
-        # Use QDA's own posterior probabilities: predict_proba(X)[:, decoy_class]
-        # is exactly P(false | features) — no separate mixture model needed.
-        pep_w = pep_proba2
-        pep_q_w = _pep_qvalues(pep_w)
-        lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
-        spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
-        _LOG_EPS = 1e-12
-        reweighted2 = (
-            scores2
-            + lcms_prior_weight * np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
-            + spatial_prior_weight * np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
-        )
-        rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
-        peptide_q2, is_pep_rep2 = _peptide_level_qvalues(
-            reweighted2, is_decoy_w, winners_df["peptide"].to_numpy()
-        )
-
-        # --- Optional Storey pi0 correction ---
-        if storey_pi0:
-            _pi0 = _estimate_pi0_storey(scores2, is_decoy_w)
-            logger.info(f"  Storey pi0 estimate: {_pi0:.4f}")
-            storey_q2 = _tdc_qvalues(scores2, is_decoy_w, pi0=_pi0)
-            storey_rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w, pi0=_pi0)
-        else:
-            _pi0 = None
-
-        # --- Map back to full candidate table ---
-        is_winner_full = np.zeros(len(features_df), dtype=bool)
-        is_winner_full[winner_pos] = True
-        scores2_full = np.full(len(features_df), np.nan)
-        scores2_full[winner_pos] = scores2
-        q_full = np.full(len(features_df), np.nan)
-        q_full[winner_pos] = q2
-        pep_full = np.full(len(features_df), np.nan)
-        pep_full[winner_pos] = pep_w
-        pep_q_full = np.full(len(features_df), np.nan)
-        pep_q_full[winner_pos] = pep_q_w
-        rw_full = np.full(len(features_df), np.nan)
-        rw_full[winner_pos] = reweighted2
-        rw_q_full = np.full(len(features_df), np.nan)
-        rw_q_full[winner_pos] = rw_q2
-        peptide_q_full = np.full(len(features_df), np.nan)
-        peptide_q_full[winner_pos] = peptide_q2
-        is_pep_winner_full = np.zeros(len(features_df), dtype=bool)
-        is_pep_winner_full[winner_pos] = is_pep_rep2
-
-        is_decoy = features_df["is_decoy"].values.astype(bool)
-        result_df = pd.DataFrame(
-            {
-                "peptide": features_df["peptide"].values,
-                "protein": features_df["protein"].values if "protein" in features_df.columns else "",
-                "feature_mz": features_df["feature_mz"].values if "feature_mz" in features_df.columns else np.nan,
-                "feature_idx": features_df.get(
-                    "feature_idx", pd.Series(range(len(features_df)))
-                ).values,
-                "is_decoy": is_decoy,
-                "qda_score_r1": scores1,
-                "qda_score_r2": scores2_full,
-                "q_value": q_full,
-                "pep": pep_full,
-                "pep_q_value": pep_q_full,
-                "is_tdc_winner": is_winner_full,
-                "reweighted_score": rw_full,
-                "reweighted_q_value": rw_q_full,
-                # Peptide-level FDR: one hypothesis per peptide, not per
-                # (peptide, feature) match. `peptide_q_value` is broadcast to
-                # every match of a peptide; `is_peptide_winner` marks the single
-                # best-scoring match that represents it. Count IDs as
-                # `is_peptide_winner & ~is_decoy & peptide_q_value <= alpha`.
-                "peptide_q_value": peptide_q_full,
-                "is_peptide_winner": is_pep_winner_full,
-            }
-        )
-        _ccs_map = observed_ccs_per_feature or {}
-        result_df["feature_ccs"] = [
-            _ccs_map.get(int(i), np.nan) for i in result_df["feature_idx"]
-        ]
-        if storey_pi0 and _pi0 is not None:
-            storey_q_full = np.full(len(features_df), np.nan)
-            storey_q_full[winner_pos] = storey_q2
-            storey_rw_q_full = np.full(len(features_df), np.nan)
-            storey_rw_q_full[winner_pos] = storey_rw_q2
-            result_df["storey_q_value"] = storey_q_full
-            result_df["storey_reweighted_q_value"] = storey_rw_q_full
-
-        for fdr_threshold in [0.01, 0.05, 0.10]:
-            n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
-            n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
-            extra = ""
-            if storey_pi0 and _pi0 is not None:
-                n_st = (is_winner_full & ~is_decoy & (storey_q_full <= fdr_threshold)).sum()
-                extra = f", {n_st} (Storey π₀={_pi0:.3f})"
-            n_pep = (
-                is_pep_winner_full & ~is_decoy & (peptide_q_full <= fdr_threshold)
-            ).sum()
-            logger.info(
-                f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
-                f"{n_rw} target features (reweighted){extra}"
-            )
-            # The line above counts (peptide, feature) matches. In feature-list
-            # extraction one peptide matches several features, so that is not a
-            # count of identified peptides -- this is.
-            logger.info(
-                f"  At {fdr_threshold*100:.0f}% FDR: {n_pep} target PEPTIDES "
-                f"(peptide-level FDR)"
-            )
-
-        if debug_dir is not None:
-            from msi_picasso.debug_viz import save_debug_figures
-            save_debug_figures(
-                features_df, result_df,
-                ion_images=ion_images, ion_image_mzs=ion_image_mzs,
-                maldi_envelopes=maldi_envelopes,
-                feature_names=intrinsic_present, model_name="qda",
-                pep_method="kde",
-                importances_r1=_imp_r1_qda,
-                importances_r2=None if single_round else qda_imp_r2,
-                importance_names=_imp_names_qda,
-                importance_names_r2=qda_imp_names_r2 or _imp_names_qda,
-                debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
-                gt_peptides=gt_peptides, storey_pi0_val=_pi0,
-                ccs_tol_pct=_ccs_tol_pct, single_round=single_round,
-                region_debug=region_coloc_debug,
-            )
-
-        if entrapment:
-            _report_entrapment(result_df, features_df, output_dir)
-        return psm_list, result_df, feature_names, features_df
-
-    else:
-        raise ValueError(f"Unknown model '{model}'. Choose 'lda', 'qda', 'svm', 'gbt', or 'rbf_svm'.")
+    if entrapment:
+        _report_entrapment(result_df, features_df, output_dir)
+    return result_df, features_df

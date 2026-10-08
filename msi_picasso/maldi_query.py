@@ -80,6 +80,31 @@ def _save_obs_stats_cache(path: str, ccs, centroid_mz, peak_quality: dict | None
         logger.warning("Could not write raw-query stats cache to %s (%s).", path, exc)
 
 
+def _expand_windows(
+    peak_mzs: np.ndarray, query_mzs: np.ndarray, ppm: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Every (peak, query window) pair where the peak lies in ``[q*(1-ppm), q*(1+ppm)]``.
+
+    ``query_mzs`` must be sorted. Returns ``(peak_rep, qidx)``: the peak index and the
+    query index of each pair, or ``None`` when no peak falls in any window. A peak in
+    several overlapping windows appears once per window.
+    """
+    ppm_f = ppm * 1e-6
+    # peak mz is in window of query q  <=>  q in [mz/(1+ppm), mz/(1-ppm)]
+    lo = np.searchsorted(query_mzs, peak_mzs / (1.0 + ppm_f), side="left")
+    hi = np.searchsorted(query_mzs, peak_mzs / (1.0 - ppm_f), side="right")
+    counts = np.clip(hi - lo, 0, None).astype(np.int64)
+    total = int(counts.sum())
+    if total == 0:
+        return None
+    # Expand (peak, window) pairs without a Python loop.
+    peak_rep = np.repeat(np.arange(len(peak_mzs)), counts)
+    starts = np.cumsum(counts) - counts
+    within = np.arange(total) - np.repeat(starts, counts)
+    qidx = np.repeat(lo, counts) + within
+    return peak_rep, qidx
+
+
 def _weighted_mean_in_windows(
     peak_mzs: np.ndarray,
     peak_ints: np.ndarray,
@@ -110,21 +135,11 @@ def _weighted_mean_in_windows(
     peak_mzs = np.asarray(peak_mzs, dtype=np.float64)
     peak_ints = np.asarray(peak_ints, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
-    ppm_f = ppm * 1e-6
 
-    # peak mz is in window of query q  <=>  q in [mz/(1+ppm), mz/(1-ppm)]
-    lo = np.searchsorted(query_mzs, peak_mzs / (1.0 + ppm_f), side="left")
-    hi = np.searchsorted(query_mzs, peak_mzs / (1.0 - ppm_f), side="right")
-    counts = np.clip(hi - lo, 0, None).astype(np.int64)
-    total = int(counts.sum())
-    if total == 0:
+    pairs = _expand_windows(peak_mzs, query_mzs, ppm)
+    if pairs is None:
         return np.full(n, np.nan)
-
-    # Expand (peak, window) pairs without a Python loop.
-    peak_rep = np.repeat(np.arange(len(peak_mzs)), counts)
-    starts = np.cumsum(counts) - counts
-    within = np.arange(total) - np.repeat(starts, counts)
-    qidx = np.repeat(lo, counts) + within
+    peak_rep, qidx = pairs
 
     np.add.at(wsum, qidx, peak_ints[peak_rep] * values[peak_rep])
     np.add.at(isum, qidx, peak_ints[peak_rep])
@@ -132,11 +147,6 @@ def _weighted_mean_in_windows(
     nz = isum > 0
     out[nz] = wsum[nz] / isum[nz]
     return out
-
-
-# Backwards-compatible alias: mean 1/K0 is just a weighted mean with values = mobility.
-def _weighted_mean_inv_k0(peak_mzs, peak_ints, peak_mob, query_mzs, ppm):
-    return _weighted_mean_in_windows(peak_mzs, peak_ints, peak_mob, query_mzs, ppm)
 
 
 _MOB_QUALITY_COLS = (
@@ -187,20 +197,11 @@ def _peak_quality_in_windows(
     peak_mzs = np.asarray(peak_mzs, dtype=np.float64)
     peak_ints = np.asarray(peak_ints, dtype=np.float64)
     peak_mob = np.asarray(peak_mob, dtype=np.float64)
-    ppm_f = window_ppm * 1e-6
 
-    # Same peak→window expansion as _weighted_mean_in_windows.
-    lo = np.searchsorted(query_mzs, peak_mzs / (1.0 + ppm_f), side="left")
-    hi = np.searchsorted(query_mzs, peak_mzs / (1.0 - ppm_f), side="right")
-    counts = np.clip(hi - lo, 0, None).astype(np.int64)
-    total = int(counts.sum())
-    if total == 0:
+    pairs = _expand_windows(peak_mzs, query_mzs, window_ppm)
+    if pairs is None:
         return out
-
-    peak_rep = np.repeat(np.arange(len(peak_mzs)), counts)
-    starts = np.cumsum(counts) - counts
-    within = np.arange(total) - np.repeat(starts, counts)
-    qidx = np.repeat(lo, counts) + within
+    peak_rep, qidx = pairs
 
     w = peak_ints[peak_rep]
     mz = peak_mzs[peak_rep]
@@ -244,6 +245,51 @@ def _peak_quality_in_windows(
     off = isum - band
     out["mob_peak_snr"][nz] = np.log10((band[nz] + _eps) / (off[nz] + _eps))
     return out
+
+
+def _relevant_tof_mask(mz_per_tof: np.ndarray, query_mzs, ppm: float, n_bins: int) -> np.ndarray:
+    """Boolean mask over TOF bins: True for every bin inside a ``query_mzs`` window.
+
+    The window of ``q`` is ``[q*(1-ppm), q*(1+ppm)]``. ``mz_per_tof`` is the m/z of
+    each TOF bin (alphatims ``mz_values``); its dtype is kept for the bin lookup.
+    Typically 1-3% of bins are marked, which is what makes the peak filter cheap.
+    """
+    ppm_f = ppm * 1e-6
+    relevant = np.zeros(n_bins, dtype=np.bool_)
+    for qmz in query_mzs:
+        lo = int(np.searchsorted(mz_per_tof, float(qmz * (1.0 - ppm_f)), "left"))
+        hi = int(np.searchsorted(mz_per_tof, float(qmz * (1.0 + ppm_f)), "right"))
+        if lo < hi:
+            relevant[lo:hi] = True
+    return relevant
+
+
+def _filter_window_peaks(
+    raw: np.ndarray,
+    tof: np.ndarray,
+    relevant_tof: np.ndarray,
+    mz_per_tof: np.ndarray,
+    intensities: np.ndarray,
+    push_indptr: np.ndarray,
+    scan_max: int | None,
+):
+    """Keep the raw peaks whose TOF bin is in ``relevant_tof``.
+
+    ``raw`` holds global alphatims peak indices and ``tof`` their TOF bins. Returns
+    ``None`` when no peak is kept, otherwise ``(mask, mz, intensity, scan)`` for the
+    kept peaks, with ``mask`` over ``raw``. ``scan`` is the scan index within the
+    frame, or ``None`` when ``scan_max`` is ``None``. Output dtypes follow
+    ``mz_per_tof`` and ``intensities``.
+    """
+    mask = relevant_tof[tof]
+    if not mask.any():
+        return None
+    raw_f = raw[mask]
+    scans = None
+    if scan_max is not None:
+        push = np.searchsorted(push_indptr, raw_f, side="right") - 1
+        scans = push % scan_max
+    return mask, mz_per_tof[tof[mask]], intensities[raw_f], scans
 
 
 def extract_observed_feature_stats_raw(
@@ -331,14 +377,7 @@ def extract_observed_feature_stats_raw(
     mz_arr_np = np.asarray(tims.mz_values, dtype=np.float64)  # per-TOF-bin m/z
     tof_max_idx = int(tims.tof_max_index)
 
-    # Mark every TOF bin inside any query window (typically 1-3% of bins).
-    ppm_f = extraction_ppm * 1e-6
-    relevant_tof = np.zeros(tof_max_idx, dtype=np.bool_)
-    for qmz in query_mzs:
-        lo = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 - ppm_f)), "left"))
-        hi = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 + ppm_f)), "right"))
-        if lo < hi:
-            relevant_tof[lo:hi] = True
+    relevant_tof = _relevant_tof_mask(mz_arr_np, query_mzs, extraction_ppm, tof_max_idx)
 
     n_peaks = len(tof_idx_np)
     coll_mz: list[np.ndarray] = []
@@ -349,16 +388,17 @@ def extract_observed_feature_stats_raw(
     _CHUNK = 50_000_000
     for c0 in range(0, n_peaks, _CHUNK):
         c1 = min(c0 + _CHUNK, n_peaks)
-        tof_c = tof_idx_np[c0:c1]
-        mask = relevant_tof[tof_c]
-        if not mask.any():
+        kept = _filter_window_peaks(
+            np.arange(c0, c1, dtype=np.int64), tof_idx_np[c0:c1], relevant_tof,
+            mz_arr_np, intensity_np, push_indptr, scan_max if has_mobility else None,
+        )
+        if kept is None:
             continue
-        raw_c = np.arange(c0, c1, dtype=np.int64)[mask]
-        coll_mz.append(mz_arr_np[tof_c[mask]])
-        coll_int.append(intensity_np[raw_c])
+        _, mz_c, int_c, scan_c = kept
+        coll_mz.append(mz_c)
+        coll_int.append(int_c)
         if has_mobility:
-            push = np.searchsorted(push_indptr, raw_c, side="right") - 1
-            coll_scan.append((push % scan_max).astype(np.int64))
+            coll_scan.append(scan_c.astype(np.int64))
 
     if not coll_mz:
         logger.warning(
@@ -409,7 +449,6 @@ def query_raw_maldi(
     d_path: str,
     query_mzs: np.ndarray,
     extraction_ppm: float = 25.0,
-    compute_spatial: bool = True,
     extra_images: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, dict | None, pd.DataFrame, dict]:
     """
@@ -421,14 +460,11 @@ def query_raw_maldi(
         Path to the raw Bruker ``.d`` directory.
     query_mzs
         Sorted, unique, NaN-free [M+H]+ m/z values to query.  Derived from
-        ``candidates_df["feature_mz"].dropna().unique()`` (sorted).  For
-        ``mz_shift`` decoys this is the *shifted* m/z (the off-target anchor),
-        which is exactly the m/z whose ion image the decoy should receive.
+        ``candidates_df["feature_mz"].dropna().unique()`` (sorted).  For a
+        substitution decoy this is its own [M+H]+, which is exactly the m/z whose
+        ion image the decoy should receive.
     extraction_ppm
         m/z half-window for ion image assembly (default 25.0 ppm).
-    compute_spatial
-        Compute per-feature spatial statistics (always required downstream;
-        kept for API symmetry with the plan).
     extra_images
         Extract M+1/M+2 and Na/K/CHCA adduct ion images for colocalization
         features.  Set ``False`` to skip (returns ``extra_ion_images=None``).

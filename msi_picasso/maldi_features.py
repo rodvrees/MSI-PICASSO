@@ -13,9 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 
-from msi_picasso.utils import (
+from msi_picasso.utils import (  # noqa: F401  AVERAGINE_* re-exported for scripts/envelope_qc.py
     AVERAGINE_C, AVERAGINE_H, AVERAGINE_N, AVERAGINE_O,
-    NEUTRON, PROTON, theoretical_isotope_distribution,
+    NEUTRON, PROTON, averagine_composition, theoretical_isotope_distribution,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,12 +120,9 @@ def compute_protein_consistency_features(df: pd.DataFrame) -> pd.DataFrame:
 def compute_peptide_properties(df: pd.DataFrame) -> pd.DataFrame:
     """Compute peptide_length and n_missed_cleavages."""
     df["peptide_length"] = df["peptide"].str.len()
-    try:
-        from ms1rescore_rs import count_missed_cleavages_batch
-        df["n_missed_cleavages"] = count_missed_cleavages_batch(df["peptide"].tolist())
-    except ImportError:
-        # K/R not followed by P, excluding the C-terminal cleavage site.
-        df["n_missed_cleavages"] = df["peptide"].str[:-1].str.count(r"[KR](?!P)")
+    # K/R followed by a residue other than P. Requiring a following residue
+    # excludes the C-terminal cleavage site.
+    df["n_missed_cleavages"] = df["peptide"].str.count(r"[KR](?=[^P])")
     return df
 
 
@@ -172,29 +169,27 @@ def compute_maldi_ionization_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute MALDI-specific ionization features from peptide sequence.
 
-    Uses the Rust extension (rayon parallel) when available; falls back to
-    pd.factorize + np.add.reduceat otherwise.
+    Per unique sequence: residue counts via ``_residue_counts_batch`` and the
+    mean Kyte-Doolittle hydropathy (GRAVY).
     """
     codes, uniques = pd.factorize(df["peptide"])
-    uniques_list = uniques.tolist()
 
-    try:
-        from ms1rescore_rs import compute_ionization_features
-        n_R, n_K, n_H, n_F, n_W, n_Y, gravy_u, _ = compute_ionization_features(uniques_list)
-        n_R = np.asarray(n_R); n_K = np.asarray(n_K); n_H = np.asarray(n_H)
-        n_F = np.asarray(n_F); n_W = np.asarray(n_W); n_Y = np.asarray(n_Y)
-        gravy_u = np.asarray(gravy_u)
-    except ImportError:
-        cnt = _residue_counts_batch(uniques, "RKHFWY")
-        n_R = cnt["R"]; n_K = cnt["K"]; n_H = cnt["H"]
-        n_F = cnt["F"]; n_W = cnt["W"]; n_Y = cnt["Y"]
-        kd_arr = np.zeros(256, dtype=np.float64)
-        for aa, val in _KD_SCALE.items():
-            kd_arr[ord(aa)] = val
-        seq_lens = np.array([len(s) for s in uniques], dtype=np.int64)
-        concat_bytes = np.frombuffer("".join(uniques).encode("ascii"), dtype=np.uint8)
-        split_pts = np.concatenate([[0], np.cumsum(seq_lens[:-1])]).astype(np.intp)
-        gravy_u = np.add.reduceat(kd_arr[concat_bytes], split_pts) / np.maximum(seq_lens, 1)
+    cnt = _residue_counts_batch(uniques, "RKHFWY")
+    n_R = cnt["R"]; n_K = cnt["K"]; n_H = cnt["H"]
+    n_F = cnt["F"]; n_W = cnt["W"]; n_Y = cnt["Y"]
+    kd_arr = np.zeros(256, dtype=np.float64)
+    for aa, val in _KD_SCALE.items():
+        kd_arr[ord(aa)] = val
+    seq_lens = np.array([len(s) for s in uniques], dtype=np.int64)
+    concat_bytes = np.frombuffer("".join(uniques).encode("ascii"), dtype=np.uint8)
+    starts = np.concatenate([[0], np.cumsum(seq_lens[:-1])]).astype(np.intp)
+    # Sum left to right, one residue position at a time, so the float rounding
+    # matches a plain per-sequence loop (np.add.reduceat sums pairwise).
+    kd_sum = np.zeros(len(uniques), dtype=np.float64)
+    for j in range(int(seq_lens.max()) if len(seq_lens) else 0):
+        has = seq_lens > j
+        kd_sum[has] += kd_arr[concat_bytes[starts[has] + j]]
+    gravy_u = kd_sum / np.maximum(seq_lens, 1)
 
     n_basic_u = n_R.astype(np.float64) + n_K + n_H
     acidic_cnt = _residue_counts_batch(uniques, "DE")
@@ -463,29 +458,6 @@ def _median_thresholded_cosine_matrix(
     return cos_matrix, valid_mz_arr, mz_to_idx
 
 
-def _find_partner_indices(
-    source_mzs: np.ndarray,
-    targets: np.ndarray,
-    ppm_tol: float,
-) -> np.ndarray:
-    """
-    Vectorized nearest-neighbour lookup on a sorted m/z array.
-
-    Returns an integer array of the same length as *targets*.  Each entry is
-    the index into *source_mzs* of the closest value within *ppm_tol* ppm,
-    or -1 if no such value exists.
-    """
-    idx = np.searchsorted(source_mzs, targets)
-    n = len(source_mzs)
-    idx_lo = np.clip(idx - 1, 0, n - 1)
-    idx_hi = np.clip(idx,     0, n - 1)
-    ppm_lo = np.abs(source_mzs[idx_lo] - targets) / targets * 1e6
-    ppm_hi = np.abs(source_mzs[idx_hi] - targets) / targets * 1e6
-    best_idx = np.where(ppm_lo <= ppm_hi, idx_lo, idx_hi)
-    within = np.minimum(ppm_lo, ppm_hi) <= ppm_tol
-    return np.where(within, best_idx, -1).astype(np.intp)
-
-
 _COLOC_FEATURE_COLS = [
     "protein_colocalization",
     "protein_colocalization_max",
@@ -523,30 +495,9 @@ def compute_colocalization_features(
         corr_matrix, valid_mz_arr, mz_to_idx = _pearson_r_matrix(ion_images, ion_image_mzs)
     valid_mzs = set(mz_to_idx.keys())
 
-    # Unique (feature_mz, protein) pairs that have a valid ion image
-    base = (
-        df[["feature_mz", "protein"]]
-        .drop_duplicates()
-        .assign(corr_idx=lambda d: d["feature_mz"].map(lambda m: mz_to_idx.get(float(m))))
-    )
-    base = base[base["corr_idx"].notna()].copy()
-    base["corr_idx"] = base["corr_idx"].astype(int)
-
-    # Self-join on protein to get all within-protein feature-feature pairs
-    pairs = base.merge(
-        base.rename(columns={"feature_mz": "partner_mz", "corr_idx": "partner_idx"}),
-        on="protein",
-    )
-    pairs = pairs[pairs["feature_mz"] != pairs["partner_mz"]]
+    pairs = _protein_pairs(df, corr_matrix, mz_to_idx)
 
     if len(pairs) > 0:
-        # Vectorized correlation lookup
-        pairs = pairs.copy()
-        pairs["r"] = corr_matrix[
-            pairs["corr_idx"].to_numpy(dtype=int),
-            pairs["partner_idx"].to_numpy(dtype=int),
-        ]
-
         # Per-pair intensity weight w = sqrt(I_a * I_b), using the LINEAR p90
         # intensity (not the log) of each feature. Higher-abundance partner pairs
         # carry more weight. Falls back to feature_intensity, then to uniform
@@ -623,46 +574,13 @@ def compute_colocalization_features(
     return df
 
 
-_REGION_COLOC_COLS = [
-    "protein_region_colocalization",
-    "protein_region_colocalization_max",
-    "protein_region_colocalization_median",
-]
+def _protein_pairs(df: pd.DataFrame, corr_matrix: np.ndarray, mz_to_idx: dict) -> pd.DataFrame:
+    """All within-protein (feature, partner feature) pairs with their matrix value ``r``.
 
-# O3 : within-region and dominant-region Pearson-r
-# colocalization column families — see compute_within_region_colocalization_features.
-_WITHIN_REGION_COLOC_COLS = [
-    "protein_within_region_colocalization",
-    "protein_within_region_colocalization_max",
-    "protein_within_region_colocalization_median",
-]
-_DOMINANT_REGION_COLOC_COLS = [
-    "protein_dominant_region_colocalization",
-    "protein_dominant_region_colocalization_max",
-    "protein_dominant_region_colocalization_median",
-]
-
-
-def _aggregate_protein_pairwise_corr(
-    df: pd.DataFrame,
-    corr_matrix: np.ndarray,
-    valid_mz_arr: np.ndarray,
-    mz_to_idx: dict,
-    col_prefix: str,
-    fill_value: float = 0.0,
-) -> pd.DataFrame:
-    """Within-protein self-join + mean/max/median aggregation of a precomputed
-    pairwise correlation matrix.
-
-    Shared by ``compute_region_colocalization_features`` and the within-region /
-    dominant-region variants (``compute_within_region_colocalization_features``)
-    — only the correlation matrix and the resulting column names differ.
-    Produces ``col_prefix``, ``{col_prefix}_max``, ``{col_prefix}_median``,
-    filled with ``fill_value`` where undefined (no same-protein partner with a
-    valid image, or no pair cleared whatever floor produced ``corr_matrix``).
-    Blind to ``is_decoy``.
+    Self-join of the unique ``(feature_mz, protein)`` rows that have a valid image
+    (an entry in ``mz_to_idx``), self-pairs removed. Returns an empty frame when
+    no protein has two valid features.
     """
-    cols = [col_prefix, f"{col_prefix}_max", f"{col_prefix}_median"]
     base = (
         df[["feature_mz", "protein"]]
         .drop_duplicates()
@@ -676,15 +594,35 @@ def _aggregate_protein_pairwise_corr(
         on="protein",
     )
     pairs = pairs[pairs["feature_mz"] != pairs["partner_mz"]]
-
     if len(pairs) > 0:
         pairs = pairs.copy()
-        pairs["c"] = corr_matrix[
+        pairs["r"] = corr_matrix[
             pairs["corr_idx"].to_numpy(dtype=int),
             pairs["partner_idx"].to_numpy(dtype=int),
         ]
+    return pairs
+
+
+def _aggregate_protein_pairwise_corr(
+    df: pd.DataFrame,
+    corr_matrix: np.ndarray,
+    valid_mz_arr: np.ndarray,
+    mz_to_idx: dict,
+    col_prefix: str,
+    fill_value: float = 0.0,
+) -> pd.DataFrame:
+    """Within-protein mean/max/median aggregation of a precomputed pairwise matrix.
+
+    Produces ``col_prefix``, ``{col_prefix}_max``, ``{col_prefix}_median``,
+    filled with ``fill_value`` where undefined (no same-protein partner with a
+    valid image). Blind to ``is_decoy``.
+    """
+    cols = [col_prefix, f"{col_prefix}_max", f"{col_prefix}_median"]
+    pairs = _protein_pairs(df, corr_matrix, mz_to_idx)
+
+    if len(pairs) > 0:
         agg = (
-            pairs.groupby(["feature_mz", "protein"])["c"]
+            pairs.groupby(["feature_mz", "protein"])["r"]
             .agg(["mean", "max", "median"])
             .rename(columns={"mean": cols[0], "max": cols[1], "median": cols[2]})
             .reset_index()
@@ -697,13 +635,6 @@ def _aggregate_protein_pairwise_corr(
     for col in cols:
         df[col] = df[col].fillna(fill_value)
     return df
-
-
-_COSINE_COLOC_COLS = [
-    "protein_colocalization_cosine",
-    "protein_colocalization_cosine_max",
-    "protein_colocalization_cosine_median",
-]
 
 
 def compute_cosine_colocalization_features(
@@ -739,332 +670,6 @@ def compute_cosine_colocalization_features(
     )
 
 
-def _region_profile_corr_matrix(
-    ion_images: np.ndarray,
-    ion_image_mzs: np.ndarray,
-    pixel_mask: np.ndarray | None = None,
-    n_regions: int = 20,
-    random_state: int = 42,
-) -> tuple[np.ndarray, np.ndarray, dict, np.ndarray, np.ndarray]:
-    """
-    Segment the tissue into ``n_regions`` regions and return the full Pearson
-    correlation matrix of the per-image per-region composition profiles.
-
-    Rationale: a raw Pearson r over all on-tissue pixels is dominated by the
-    shared tissue/ionization envelope every image carries, so it measures "is
-    this on tissue" rather than protein-specific co-distribution.  This instead
-    asks "do two peptides light up the *same regions*?":
-
-      1. Per-pixel TIC-normalise the on-tissue pixels (divide out the shared
-         abundance envelope), ``log1p``, and segment the pixels with
-         MiniBatchKMeans into ``n_regions`` regions (pixels = samples, images =
-         features).
-      2. Reduce each image to its per-region mean of the *per-image*
-         TIC-normalised image — an ``n_regions``-vector "region fingerprint".
-      3. Correlate the fingerprints with signed Pearson r (centre + L2-normalise
-         + gemm).  Unlike a cosine of non-negative loadings, this can go negative
-         when two peptides occupy *different* regions, which is exactly the
-         discriminative signal a decoy at a foreign m/z should produce.
-
-    Returns ``(corr_matrix, valid_mz_arr, mz_to_idx, region_labels, profiles)``.
-    The first three match ``_pearson_r_matrix``'s contract so the within-protein
-    aggregation is shared.  ``region_labels`` is an ``(H*W,)`` int32 array of the
-    per-pixel region id (off-mask pixels = -1) and ``profiles`` is the
-    ``(n_valid, n_regions)`` fingerprint matrix; both are returned only for the
-    debug visualization.  Only images with any on-tissue signal are valid.
-    """
-    from sklearn.cluster import MiniBatchKMeans
-
-    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
-    n_feat = len(mz_arr)
-    H, W = ion_images.shape[1], ion_images.shape[2]
-    flat = ion_images.reshape(n_feat, H * W)
-    mask = (
-        np.asarray(pixel_mask, dtype=bool) if pixel_mask is not None
-        else np.ones(H * W, dtype=bool)
-    )
-    on = flat[:, mask].astype(np.float32, copy=True)  # (n_feat, n_on)
-    n_on = on.shape[1]
-
-    # Segmentation feature matrix: per-pixel TIC-normalised composition, log1p.
-    col_tic = on.sum(axis=0, keepdims=True)
-    comp = np.divide(on, col_tic, out=np.zeros_like(on), where=col_tic > 0)
-    seg_feat = np.log1p(comp).T  # (n_on, n_feat) — pixels are samples
-
-    if n_on < 2:
-        logger.warning("Region colocalization: %d on-tissue pixels — skipping (need ≥ 2).", n_on)
-        empty_mz = np.empty(0, dtype=np.float64)
-        region_labels = np.full(H * W, -1, dtype=np.int32)
-        return (
-            np.empty((0, 0), dtype=np.float32),
-            empty_mz,
-            {},
-            region_labels,
-            np.empty((0, 0), dtype=np.float32),
-        )
-
-    k = int(min(n_regions, max(2, n_on - 1)))
-    km = MiniBatchKMeans(n_clusters=k, random_state=random_state, n_init=3)
-    labels = km.fit_predict(seg_feat)  # (n_on,)
-
-    # Per-image, per-region mean of the per-IMAGE TIC-normalised image.
-    img_sum = on.sum(axis=1, keepdims=True)
-    img_norm = np.divide(on, img_sum, out=np.zeros_like(on), where=img_sum > 0)
-    onehot = np.zeros((n_on, k), dtype=np.float32)
-    onehot[np.arange(n_on), labels] = 1.0
-    counts = onehot.sum(axis=0) + 1e-9
-    profiles = (img_norm @ onehot) / counts  # (n_feat, k) region fingerprints
-
-    # Valid = images with any on-tissue signal.
-    valid_mask = img_sum.ravel() > 0
-    valid_mz_arr = mz_arr[valid_mask]
-    P = profiles[valid_mask]  # (n_valid, k)
-
-    # Signed Pearson r between region fingerprints.
-    Pc = P - P.mean(axis=1, keepdims=True)
-    norms = np.sqrt((Pc * Pc).sum(axis=1, keepdims=True))
-    Pn = Pc / np.where(norms > 1e-12, norms, 1.0)
-    corr_matrix = (Pn @ Pn.T).astype(np.float32)
-
-    mz_to_idx = {float(mz): i for i, mz in enumerate(valid_mz_arr)}
-    region_labels = np.full(H * W, -1, dtype=np.int32)
-    region_labels[mask] = labels
-    logger.info(
-        f"Region colocalization: K={k}, {len(valid_mz_arr)}/{n_feat} images with "
-        f"on-tissue signal, {n_on} on-tissue pixels"
-    )
-    return corr_matrix, valid_mz_arr, mz_to_idx, region_labels, P
-
-
-def compute_region_colocalization_features(
-    df: pd.DataFrame,
-    ion_images: np.ndarray,
-    ion_image_mzs: np.ndarray,
-    pixel_mask: np.ndarray | None = None,
-    n_regions: int = 20,
-    random_state: int = 42,
-    debug: dict | None = None,
-) -> pd.DataFrame:
-    """Within-protein region-profile colocalization features (opt-in, ``--region-coloc``).
-
-    Mirrors ``compute_colocalization_features`` but the pairwise quantity is the
-    Pearson r of the per-region composition fingerprints (see
-    ``_region_profile_corr_matrix``) instead of the raw pixel Pearson r.  This
-    asks whether same-protein peptides occupy the *same tissue regions*, a sharper
-    question than global ion-image correlation (which is dominated by overall
-    tissue morphology).  Decoys occupy a separate protein namespace (every decoy
-    method gives them a ``DECOY_`` / ``ENTRAPMENT_`` label), so the within-protein
-    aggregation never pools a decoy with its source target — the feature stays
-    symmetric (blind to ``is_decoy``).
-
-    Features added: ``protein_region_colocalization`` (mean), ``_max``, ``_median``
-    — the within-protein mean/max/median pairwise region-profile r.
-
-    When ``debug`` is a dict it is populated with ``region_labels`` (per-pixel
-    region map), ``region_profiles`` ((n_valid, n_regions) fingerprints) and
-    ``region_profile_mzs`` for the debug visualization.
-    """
-    corr_matrix, valid_mz_arr, mz_to_idx, region_labels, profiles = _region_profile_corr_matrix(
-        ion_images, ion_image_mzs, pixel_mask=pixel_mask,
-        n_regions=n_regions, random_state=random_state,
-    )
-    if debug is not None:
-        debug["region_labels"] = region_labels
-        debug["region_profiles"] = profiles
-        debug["region_profile_mzs"] = valid_mz_arr
-
-    return _aggregate_protein_pairwise_corr(
-        df, corr_matrix, valid_mz_arr, mz_to_idx, "protein_region_colocalization",
-    )
-
-
-def _within_region_corr_matrices(
-    ion_images: np.ndarray,
-    ion_image_mzs: np.ndarray,
-    pixel_mask: np.ndarray | None = None,
-    n_regions: int = 20,
-    random_state: int = 42,
-    min_region_pixels: int = 30,
-    tic_normalize: bool = False,
-    common_mode_removal: bool = False,
-    _global_corr_cache: tuple | None = None,
-    debug: dict | None = None,
-) -> dict:
-    """
-    Segment on-tissue pixels into ``n_regions`` regions using the identical
-    recipe as ``_region_profile_corr_matrix`` (per-pixel TIC-normalised log1p
-    composition, MiniBatchKMeans), then compute the RAW pixel Pearson r (via
-    ``_pearson_r_matrix``, restricted to each region's own pixels) instead of
-    the per-region MEAN fingerprint that ``_region_profile_corr_matrix`` uses.
-
-    This asks whether same-protein peptides co-vary pixel-to-pixel *inside* a
-    shared tissue region — a question the fingerprint metric cannot answer,
-    since it only compares per-region averages and is blind to within-region
-    pixel covariance (experimental).
-
-    Returns a dict with two ``(corr_matrix, valid_mz_arr, mz_to_idx)`` triples
-    — the same contract as ``_pearson_r_matrix`` — so both plug directly into
-    ``_aggregate_protein_pairwise_corr``:
-
-    - ``"weighted"``: pixel-count-weighted mean of each region's own Pearson r,
-      over regions with >= ``min_region_pixels`` on-tissue pixels, expressed in
-      the canonical (full on-tissue) valid-image index space. Any image that
-      is non-constant within some region subset is necessarily non-constant
-      over the full on-tissue mask too, so every region's valid image set is
-      guaranteed to be a subset of the canonical one.
-    - ``"dominant"``: the single largest region's own Pearson r, verbatim (its
-      own, possibly smaller, index space) — not subject to ``min_region_pixels``.
-
-    ``tic_normalize``/``common_mode_removal`` are forwarded to every
-    ``_pearson_r_matrix`` call (region-level and canonical) so this uses the
-    same preprocessing recipe as the best-performing global colocalization
-    metric  rather than raw pixels.
-
-    When ``debug`` is a dict it is populated with ``region_labels`` (per-pixel
-    region id, ``(H*W,)`` int32, -1 off-mask), ``region_pixel_counts``, and
-    ``dominant_region_id``.
-    """
-    from sklearn.cluster import MiniBatchKMeans
-
-    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
-    n_feat = len(mz_arr)
-    H, W = ion_images.shape[1], ion_images.shape[2]
-    mask = (
-        np.asarray(pixel_mask, dtype=bool) if pixel_mask is not None
-        else np.ones(H * W, dtype=bool)
-    )
-    flat = ion_images.reshape(n_feat, H * W)
-    on = flat[:, mask].astype(np.float32, copy=True)  # (n_feat, n_on)
-    n_on = on.shape[1]
-
-    empty = (np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float64), {})
-    if n_on < 2:
-        logger.warning("Within-region colocalization: %d on-tissue pixels — skipping (need >= 2).", n_on)
-        if debug is not None:
-            debug["region_labels"] = np.full(H * W, -1, dtype=np.int32)
-            debug["region_pixel_counts"] = np.empty(0, dtype=np.int64)
-            debug["dominant_region_id"] = -1
-        return {"weighted": empty, "dominant": empty}
-
-    # Segmentation feature matrix — identical recipe to _region_profile_corr_matrix.
-    # Duplicated rather than shared: this is an experimental, likely-to-be-reverted
-    # feature (see O3), so the tested/shipping function is
-    # left untouched.
-    col_tic = on.sum(axis=0, keepdims=True)
-    comp = np.divide(on, col_tic, out=np.zeros_like(on), where=col_tic > 0)
-    seg_feat = np.log1p(comp).T  # (n_on, n_feat) — pixels are samples
-
-    k = int(min(n_regions, max(2, n_on - 1)))
-    km = MiniBatchKMeans(n_clusters=k, random_state=random_state, n_init=3)
-    labels = km.fit_predict(seg_feat)  # (n_on,)
-
-    region_labels_full = np.full(H * W, -1, dtype=np.int32)
-    region_labels_full[mask] = labels
-    region_pixel_counts = np.bincount(labels, minlength=k)
-    dominant_region_id = int(np.argmax(region_pixel_counts))
-
-    if debug is not None:
-        debug["region_labels"] = region_labels_full
-        debug["region_pixel_counts"] = region_pixel_counts
-        debug["dominant_region_id"] = dominant_region_id
-
-    if _global_corr_cache is not None:
-        _canon_corr, canon_mz, canon_idx = _global_corr_cache
-    else:
-        _canon_corr, canon_mz, canon_idx = _pearson_r_matrix(
-            ion_images, ion_image_mzs, pixel_mask=mask,
-            tic_normalize=tic_normalize, common_mode_removal=common_mode_removal,
-        )
-    n_canon = len(canon_mz)
-    sum_wr = np.zeros((n_canon, n_canon), dtype=np.float64)
-    sum_w = np.zeros((n_canon, n_canon), dtype=np.float64)
-    dominant_triple = empty
-
-    for r in range(k):
-        n_r = int(region_pixel_counts[r])
-        if n_r < 2:
-            continue
-        region_mask_r = region_labels_full == r
-        corr_r, mz_r, idx_r = _pearson_r_matrix(
-            ion_images, ion_image_mzs, pixel_mask=region_mask_r,
-            tic_normalize=tic_normalize, common_mode_removal=common_mode_removal,
-        )
-        if r == dominant_region_id:
-            dominant_triple = (corr_r, mz_r, idx_r)
-        if n_r >= min_region_pixels and n_canon > 0 and len(mz_r) > 0:
-            pos = np.fromiter((canon_idx[float(mz)] for mz in mz_r), dtype=int, count=len(mz_r))
-            ix = np.ix_(pos, pos)
-            sum_wr[ix] += n_r * corr_r
-            sum_w[ix] += n_r
-
-    weighted_matrix = np.divide(
-        sum_wr, sum_w, out=np.full((n_canon, n_canon), np.nan), where=sum_w > 0
-    ).astype(np.float32)
-
-    logger.info(
-        f"Within-region colocalization: K={k}, dominant region has "
-        f"{region_pixel_counts[dominant_region_id]}/{n_on} on-tissue pixels, "
-        f"{int((region_pixel_counts >= min_region_pixels).sum())}/{k} regions "
-        f"clear min_region_pixels={min_region_pixels}"
-    )
-    return {
-        "weighted": (weighted_matrix, canon_mz, canon_idx),
-        "dominant": dominant_triple,
-    }
-
-
-def compute_within_region_colocalization_features(
-    df: pd.DataFrame,
-    ion_images: np.ndarray,
-    ion_image_mzs: np.ndarray,
-    pixel_mask: np.ndarray | None = None,
-    n_regions: int = 20,
-    random_state: int = 42,
-    min_region_pixels: int = 30,
-    tic_normalize: bool = False,
-    common_mode_removal: bool = False,
-    _global_corr_cache: tuple | None = None,
-    debug: dict | None = None,
-) -> pd.DataFrame:
-    """O3 : within-region and dominant-region
-    Pearson-r colocalization (opt-in, ``--within-region-coloc``; experimental /
-    unvalidated — see PROGRESS.md for the validation protocol before trusting this in
-    the ranker).
-
-    Segments on-tissue pixels the same way as
-    ``compute_region_colocalization_features`` but correlates RAW pixel
-    intensities restricted to each region (not the per-region mean
-    fingerprint), asking whether same-protein peptides co-vary pixel-to-pixel
-    *inside* a shared tissue region rather than merely sharing a region
-    average — a question ``compute_region_colocalization_features`` is blind
-    to. Adds:
-
-    - ``protein_within_region_colocalization`` (+ ``_max``, ``_median``): the
-      pixel-count-weighted mean of each region's own within-protein Pearson r
-      across regions with >= ``min_region_pixels`` on-tissue pixels.
-    - ``protein_dominant_region_colocalization`` (+ ``_max``, ``_median``):
-      within-protein Pearson r restricted to just the single largest region.
-
-    Both blind to ``is_decoy``; decoys occupy a separate protein namespace
-    exactly as for ``compute_region_colocalization_features``.
-    """
-    mats = _within_region_corr_matrices(
-        ion_images, ion_image_mzs, pixel_mask=pixel_mask, n_regions=n_regions,
-        random_state=random_state, min_region_pixels=min_region_pixels,
-        tic_normalize=tic_normalize, common_mode_removal=common_mode_removal,
-        _global_corr_cache=_global_corr_cache, debug=debug,
-    )
-    corr_w, mz_w, idx_w = mats["weighted"]
-    corr_d, mz_d, idx_d = mats["dominant"]
-    df = _aggregate_protein_pairwise_corr(
-        df, corr_w, mz_w, idx_w, "protein_within_region_colocalization",
-    )
-    df = _aggregate_protein_pairwise_corr(
-        df, corr_d, mz_d, idx_d, "protein_dominant_region_colocalization",
-    )
-    return df
-
-
 # Columns set in the "MALDI envelope comparison" block below: candidate's OWN theoretical
 # isotope pattern (from its OWN mass) compared against the OBSERVED envelope at feature_mz.
 # Under mz_shuffle, feature_mz is the co-located TARGET's feature, not the decoy's own mass
@@ -1094,6 +699,51 @@ MZ_SHUFFLE_OWN_MASS_ENVELOPE_FEATURES = frozenset([
 ])
 
 
+def _isotope_dists(nc, nh, nn, no, ns) -> np.ndarray:
+    """(n, 3) sum-to-1 theoretical [M0, M1, M2] per composition row (brainpy, cached)."""
+    comps = list(zip(*(np.asarray(a).tolist() for a in (nc, nh, nn, no, ns))))
+    cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in set(comps)}
+    return np.array([cache[k] for k in comps], dtype=np.float64).reshape(-1, 3)
+
+
+def _envelope_compare(obs: np.ndarray, ref: np.ndarray, ref_norm: np.ndarray | None = None) -> dict:
+    """Row-wise comparison of observed envelopes ``obs`` (n, 3) with references ``ref`` (n, 3).
+
+    Returns ``cosine``, ``chi2``, ``kl`` (0 where undefined) and ``m1``/``m2``, the
+    absolute M+1/M0 and M+2/M0 ratio differences (NaN where obs M0 or ref M0 is not
+    positive). ``kl`` compares ``obs`` normalised to sum 1 against ``ref``, both
+    clipped at 1e-10. ``ref_norm`` is the L2 norm of ``ref`` if already known.
+    Element-wise arithmetic in the same order as the former per-row loop, so the
+    values are bit-identical to it.
+    """
+    o0, o1, o2 = obs[:, 0], obs[:, 1], obs[:, 2]
+    r0, r1, r2 = ref[:, 0], ref[:, 1], ref[:, 2]
+    if ref_norm is None:
+        ref_norm = np.sqrt(r0**2 + r1**2 + r2**2)
+    # Row-wise dot products through matmul, which reproduces np.dot bit for bit
+    # (an explicit o0*r0 + o1*r1 + o2*r2 rounds differently).
+    obs_norm = np.sqrt((obs[:, None, :] @ obs[:, :, None])[:, 0, 0])
+    dot = (obs[:, None, :] @ ref[:, :, None])[:, 0, 0]
+    obs_s = o0 + o1 + o2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ok_cos = (obs_norm > 0) & (ref_norm > 0)
+        cosine = np.where(ok_cos, dot / (obs_norm * ref_norm), 0.0)
+
+        expected = ref * obs_s[:, None]
+        terms = np.where(expected > 0, (obs - expected) ** 2 / expected, 0.0)
+        chi2 = terms[:, 0] + terms[:, 1] + terms[:, 2]
+
+        obs_safe = np.clip(obs / obs_s[:, None], 1e-10, None)
+        ref_safe = np.clip(ref, 1e-10, None)
+        kl_terms = obs_safe * np.log(obs_safe / ref_safe)
+        kl = np.where(obs_s > 0, kl_terms[:, 0] + kl_terms[:, 1] + kl_terms[:, 2], 0.0)
+
+        ok_ratio = (o0 > 0) & (r0 > 0)
+        m1 = np.where(ok_ratio, np.abs(o1 / o0 - r1 / r0), np.nan)
+        m2 = np.where(ok_ratio, np.abs(o2 / o0 - r2 / r0), np.nan)
+    return {"cosine": cosine, "chi2": chi2, "kl": kl, "m1": m1, "m2": m2, "obs_s": obs_s}
+
+
 def compute_theoretical_isotope_features(
     df: pd.DataFrame,
     maldi_envelopes: dict | None = None,
@@ -1114,9 +764,7 @@ def compute_theoretical_isotope_features(
     # --- sequence-specific theoretical isotope distribution (brainpy, cached) ---
     comp_cols = ["n_C", "n_H", "n_N", "n_O", "n_S"]
     comp_arr = df[comp_cols].astype(int).values
-    unique_comps = {tuple(row) for row in comp_arr}
-    iso_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in unique_comps}
-    dist = np.array([iso_cache[tuple(row)] for row in comp_arr])  # (n, 3)
+    dist = _isotope_dists(*comp_arr.T)  # (n, 3)
     theo_m0, theo_m1, theo_m2 = dist[:, 0], dist[:, 1], dist[:, 2]
 
     df["theo_has_sulfur"] = (comp_arr[:, 4] > 0).astype(float)
@@ -1127,17 +775,8 @@ def compute_theoretical_isotope_features(
 
     # --- averagine theoretical (brainpy, cached; S=0 consistent with prior behaviour) ---
     pep_mass = df["mass"].values.astype(float)
-    nc_avg = np.round(pep_mass * AVERAGINE_C).astype(int)
-    nh_avg = np.round(pep_mass * AVERAGINE_H).astype(int)
-    nn_avg = np.round(pep_mass * AVERAGINE_N).astype(int)
-    no_avg = np.round(pep_mass * AVERAGINE_O).astype(int)
-    avg_comps = list(zip(
-        nc_avg.tolist(), nh_avg.tolist(), nn_avg.tolist(), no_avg.tolist(),
-        [0] * n,
-    ))
-    unique_avg = set(avg_comps)
-    avg_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in unique_avg}
-    avg_dist = np.array([avg_cache[k] for k in avg_comps])  # (n, 3)
+    avg = averagine_composition(pep_mass)
+    avg_dist = _isotope_dists(avg["C"], avg["H"], avg["N"], avg["O"], np.zeros(n, dtype=int))
     avg_m0, avg_m1, avg_m2 = avg_dist[:, 0], avg_dist[:, 1], avg_dist[:, 2]
 
     # Averagine deviation (vectorized)
@@ -1155,42 +794,25 @@ def compute_theoretical_isotope_features(
         theo_m2 / safe_theo_m0 - avg_m2 / safe_avg_m0
     )
 
-    # --- MALDI envelope comparison (requires per-feature lookup, but isotope math is done) ---
-    theo_cosine = np.zeros(n)
-    theo_chi2 = np.zeros(n)
-    theo_kl = np.zeros(n)
-    theo_m1_diff = np.full(n, np.nan)
-    theo_m2_diff = np.full(n, np.nan)
-
+    # --- MALDI envelope comparison: observed envelope at feature_mz, per row ---
+    feature_mzs = df["feature_mz"].values.astype(float)
+    obs = np.zeros((n, 3), dtype=np.float64)
+    has_env = np.zeros(n, dtype=bool)
     if maldi_envelopes:
-        feature_mzs = df["feature_mz"].values
-        for i in range(n):
-            t = np.array([theo_m0[i], theo_m1[i], theo_m2[i]])
-            nt = norm_t[i]
-
-            maldi_env = maldi_envelopes.get(feature_mzs[i])
+        for i, mz in enumerate(feature_mzs):
+            maldi_env = maldi_envelopes.get(mz)
             if maldi_env is not None and len(maldi_env) >= 3:
-                obs = np.array(maldi_env[:3], dtype=np.float64)
-                no_val = np.linalg.norm(obs)
-                if no_val > 0 and nt > 0:
-                    theo_cosine[i] = np.dot(obs, t) / (no_val * nt)
-                expected = t * obs.sum()
-                mask = expected > 0
-                if mask.any():
-                    theo_chi2[i] = np.sum((obs[mask] - expected[mask]) ** 2 / expected[mask])
-                obs_s = obs.sum()
-                if obs_s > 0:
-                    obs_norm = obs / obs_s
-                    theo_safe = np.clip(t, 1e-10, None)
-                    obs_safe = np.clip(obs_norm, 1e-10, None)
-                    theo_kl[i] = np.sum(obs_safe * np.log(obs_safe / theo_safe))
-                if obs[0] > 0 and t[0] > 0:
-                    theo_m1_diff[i] = abs(obs[1] / obs[0] - t[1] / t[0])
-                    theo_m2_diff[i] = abs(obs[2] / obs[0] - t[2] / t[0])
+                obs[i] = np.array(maldi_env[:3], dtype=np.float64)
+                has_env[i] = True
 
+    def _masked(values, fill):
+        return np.where(has_env, values, fill)
+
+    theo = _envelope_compare(obs, dist, ref_norm=norm_t)
+    theo_cosine = _masked(theo["cosine"], 0.0)
     df["theo_isotope_cosine"] = theo_cosine
-    df["theo_isotope_chi2"] = theo_chi2
-    df["theo_isotope_kl"] = theo_kl
+    df["theo_isotope_chi2"] = _masked(theo["chi2"], 0.0)
+    df["theo_isotope_kl"] = _masked(theo["kl"], 0.0)
 
     # --- H-decoy-13: the same envelope comparison, referenced to averagine -------------
     # The three columns above predict the isotope pattern from the CANDIDATE's own
@@ -1214,44 +836,23 @@ def compute_theoretical_isotope_features(
     # same peak, only rank one peak against another. Averagine also assumes zero sulfur,
     # so genuinely sulfur-bearing targets are penalised -- a real cost, borne by both
     # classes in proportion to their sulfur.
-    avg_env_kl = np.zeros(n)
-    avg_env_m1_diff = np.full(n, np.nan)
-    avg_env_m2_diff = np.full(n, np.nan)
-
+    #
+    # Averagine composition from the peak, not from the candidate. Charge 1, standard
+    # for MALDI singly-protonated ions, matching `implied_mass` below.
+    implied_mass = feature_mzs - PROTON
     if maldi_envelopes:
-        feature_mzs = df["feature_mz"].values.astype(float)
-        # Averagine composition from the peak, not from the candidate. Charge 1, standard
-        # for MALDI singly-protonated ions, matching `implied_mass` elsewhere in this file.
-        feat_mass = feature_mzs - PROTON
-        fa_comps = list(zip(
-            np.round(feat_mass * AVERAGINE_C).astype(int).tolist(),
-            np.round(feat_mass * AVERAGINE_H).astype(int).tolist(),
-            np.round(feat_mass * AVERAGINE_N).astype(int).tolist(),
-            np.round(feat_mass * AVERAGINE_O).astype(int).tolist(),
-            [0] * n,
-        ))
-        fa_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in set(fa_comps)}
-        for i in range(n):
-            maldi_env = maldi_envelopes.get(feature_mzs[i])
-            if maldi_env is None or len(maldi_env) < 3:
-                continue
-            obs = np.array(maldi_env[:3], dtype=np.float64)
-            a = np.asarray(fa_cache[fa_comps[i]], dtype=np.float64)
-            obs_s = obs.sum()
-            if obs_s > 0:
-                obs_norm = obs / obs_s
-                a_safe = np.clip(a, 1e-10, None)
-                obs_safe = np.clip(obs_norm, 1e-10, None)
-                avg_env_kl[i] = np.sum(obs_safe * np.log(obs_safe / a_safe))
-            if obs[0] > 0 and a[0] > 0:
-                avg_env_m1_diff[i] = abs(obs[1] / obs[0] - a[1] / a[0])
-                avg_env_m2_diff[i] = abs(obs[2] / obs[0] - a[2] / a[0])
-
-    df["averagine_envelope_kl"] = avg_env_kl
-    df["averagine_envelope_m1_ratio_diff"] = avg_env_m1_diff
-    df["averagine_envelope_m2_ratio_diff"] = avg_env_m2_diff
-    df["theo_m1_ratio_diff"] = theo_m1_diff
-    df["theo_m2_ratio_diff"] = theo_m2_diff
+        fa = averagine_composition(implied_mass)
+        fa_dist = _isotope_dists(fa["C"], fa["H"], fa["N"], fa["O"], np.zeros(n, dtype=int))
+        avg_env = _envelope_compare(obs, fa_dist)
+        df["averagine_envelope_kl"] = _masked(avg_env["kl"], 0.0)
+        df["averagine_envelope_m1_ratio_diff"] = _masked(avg_env["m1"], np.nan)
+        df["averagine_envelope_m2_ratio_diff"] = _masked(avg_env["m2"], np.nan)
+    else:
+        df["averagine_envelope_kl"] = np.zeros(n)
+        df["averagine_envelope_m1_ratio_diff"] = np.full(n, np.nan)
+        df["averagine_envelope_m2_ratio_diff"] = np.full(n, np.nan)
+    df["theo_m1_ratio_diff"] = _masked(theo["m1"], np.nan)
+    df["theo_m2_ratio_diff"] = _masked(theo["m2"], np.nan)
     df["monoisotopic_confidence"] = mono_conf
 
     # --- Mass-normalized variant, for mz_shuffle only (PROGRESS.md H-decoy-7a) ---
@@ -1272,52 +873,21 @@ def compute_theoretical_isotope_features(
     # is a genuinely new, more experimental feature, not a drop-in fix: it may turn out to be
     # symmetric-but-uninformative (AUC ~0.5, like the intrinsic mob_* family) rather than
     # informative. Measure before trusting; see PROGRESS.md H-decoy-7 for the readout.
-    theo_kl_mn = np.zeros(n)
-    theo_m1_diff_mn = np.full(n, np.nan)
-    theo_m2_diff_mn = np.full(n, np.nan)
-
     if maldi_envelopes:
-        implied_mass = feature_mzs - PROTON  # charge 1, standard for MALDI singly-protonated ions
-        own_mass = pep_mass
-        safe_own_mass = np.where(own_mass > 0, own_mass, 1.0)
+        safe_own_mass = np.where(pep_mass > 0, pep_mass, 1.0)
         scale = np.clip(implied_mass / safe_own_mass, 0.05, 20.0)  # guard against divide-by-~0
-
-        nc_mn = np.round(comp_arr[:, 0] * scale).astype(int)
-        nh_mn = np.round(comp_arr[:, 1] * scale).astype(int)
-        nn_mn = np.round(comp_arr[:, 2] * scale).astype(int)
-        no_mn = np.round(comp_arr[:, 3] * scale).astype(int)
-        ns_mn = np.round(comp_arr[:, 4] * scale).astype(int)
-        mn_comps = list(zip(
-            np.clip(nc_mn, 0, None).tolist(), np.clip(nh_mn, 0, None).tolist(),
-            np.clip(nn_mn, 0, None).tolist(), np.clip(no_mn, 0, None).tolist(),
-            np.clip(ns_mn, 0, None).tolist(),
+        mn_dist = _isotope_dists(*(
+            np.clip(np.round(comp_arr[:, k] * scale).astype(int), 0, None) for k in range(5)
         ))
-        unique_mn = set(mn_comps)
-        mn_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in unique_mn}
-        mn_dist = np.array([mn_cache[k] for k in mn_comps])  # (n, 3)
-        mn_m0, mn_m1, mn_m2 = mn_dist[:, 0], mn_dist[:, 1], mn_dist[:, 2]
-        norm_mn = np.sqrt(mn_m0**2 + mn_m1**2 + mn_m2**2)
-
-        for i in range(n):
-            maldi_env = maldi_envelopes.get(feature_mzs[i])
-            if maldi_env is None or len(maldi_env) < 3:
-                continue
-            obs = np.array(maldi_env[:3], dtype=np.float64)
-            obs_s = obs.sum()
-            if obs_s <= 0:
-                continue
-            obs_norm = obs / obs_s
-            t = np.array([mn_m0[i], mn_m1[i], mn_m2[i]])
-            theo_safe = np.clip(t, 1e-10, None)
-            obs_safe = np.clip(obs_norm, 1e-10, None)
-            theo_kl_mn[i] = np.sum(obs_safe * np.log(obs_safe / theo_safe))
-            if obs[0] > 0 and t[0] > 0:
-                theo_m1_diff_mn[i] = abs(obs[1] / obs[0] - t[1] / t[0])
-                theo_m2_diff_mn[i] = abs(obs[2] / obs[0] - t[2] / t[0])
-
-    df["theo_isotope_kl_massnorm"] = theo_kl_mn
-    df["theo_m1_ratio_diff_massnorm"] = theo_m1_diff_mn
-    df["theo_m2_ratio_diff_massnorm"] = theo_m2_diff_mn
+        mn = _envelope_compare(obs, mn_dist)
+        has_mn = has_env & (mn["obs_s"] > 0)
+        df["theo_isotope_kl_massnorm"] = np.where(has_mn, mn["kl"], 0.0)
+        df["theo_m1_ratio_diff_massnorm"] = np.where(has_mn, mn["m1"], np.nan)
+        df["theo_m2_ratio_diff_massnorm"] = np.where(has_mn, mn["m2"], np.nan)
+    else:
+        df["theo_isotope_kl_massnorm"] = np.zeros(n)
+        df["theo_m1_ratio_diff_massnorm"] = np.full(n, np.nan)
+        df["theo_m2_ratio_diff_massnorm"] = np.full(n, np.nan)
 
     logger.info(f"Theoretical isotope features: {(theo_cosine > 0).sum()}/{n} scored")
     return df
@@ -1343,15 +913,12 @@ def compute_mass_defect_features(df: pd.DataFrame) -> pd.DataFrame:
     peptide_md = mass - np.floor(mass)
 
     # Averagine monoisotopic mass (same atom counts as compute_theoretical_isotope_features)
-    nc_avg = np.round(mass * AVERAGINE_C)
-    nh_avg = np.round(mass * AVERAGINE_H)
-    nn_avg = np.round(mass * AVERAGINE_N)
-    no_avg = np.round(mass * AVERAGINE_O)
+    avg = averagine_composition(mass)
     avg_mono_mass = (
-        nc_avg * 12.0
-        + nh_avg * 1.00782503207
-        + nn_avg * 14.00307400480
-        + no_avg * 15.99491461956
+        avg["C"] * 12.0
+        + avg["H"] * 1.00782503207
+        + avg["N"] * 14.00307400480
+        + avg["O"] * 15.99491461956
     )
     avg_md = avg_mono_mass - np.floor(avg_mono_mass)
 
@@ -1374,79 +941,6 @@ def compute_chca_cluster_features(df: pd.DataFrame) -> pd.DataFrame:
     refs = CHCA_CLUSTER_MZS[None, :]                 # (1, k)
     dists_ppm = np.abs(mzs - refs) / refs * 1e6
     df["chca_cluster_distance_ppm"] = dists_ppm.min(axis=1)
-    return df
-
-
-# ---------------------------------------------------------------------------
-# A3 — LOWESS-calibrated mass-error z-score
-# ---------------------------------------------------------------------------
-
-def compute_calibrated_ppm_features(
-    df: pd.DataFrame,
-    maldi_mzs: np.ndarray | None = None,
-    pixel_coords: np.ndarray | None = None,
-) -> pd.DataFrame:
-    """
-    LOWESS-calibrated ppm error z-score (A3).
-
-    Fits a LOWESS curve of (per-feature median) ppm error vs pixel scan-order
-    position to model the instrument's local mass offset as a function of
-    spatial position. The z-score of each feature's residual is stored as
-    ``ppm_error_calibrated_z`` and broadcast to all candidates at that feature.
-
-    Requires statsmodels. Silently skips if not installed or pixel_coords is None.
-    """
-    if pixel_coords is None or maldi_mzs is None:
-        return df
-
-    pixel_coords = np.asarray(pixel_coords)
-    maldi_mzs = np.asarray(maldi_mzs)
-
-    # Convert 2-D (row, col) coordinates to 1-D scan index
-    if pixel_coords.ndim == 2:
-        ncols = int(pixel_coords[:, 1].max()) + 1
-        coords_1d = (pixel_coords[:, 0] * ncols + pixel_coords[:, 1]).astype(float)
-    else:
-        coords_1d = pixel_coords.astype(float)
-
-    feat_idx_to_coord = {i: float(coords_1d[i]) for i in range(len(coords_1d))}
-
-    # Per-feature representative ppm: median across all candidates
-    feat_ppm = (
-        df.groupby("feature_idx")["ppm_error"]
-        .median()
-        .reset_index()
-    )
-    feat_ppm["pixel_coord"] = feat_ppm["feature_idx"].map(feat_idx_to_coord)
-    feat_ppm = feat_ppm.dropna(subset=["pixel_coord"]).sort_values("pixel_coord")
-
-    if len(feat_ppm) < 5:
-        return df
-
-    x = feat_ppm["pixel_coord"].values.astype(float)
-    y = feat_ppm["ppm_error"].values.astype(float)
-
-    # Cubic smoothing spline: O(n) vs statsmodels LOWESS O(n² × frac).
-    # Equivalent smoothness for this application; ~100× faster on 1400 features.
-    logger.debug(f"Running smoothing-spline ppm calibration (A3) on {len(feat_ppm)} features")
-    try:
-        from scipy.interpolate import make_smoothing_spline
-        smoothed = make_smoothing_spline(x, y)(x)
-    except ImportError:
-        # scipy < 1.10 fallback: UnivariateSpline with automatic knot selection
-        from scipy.interpolate import UnivariateSpline
-        smoothed = UnivariateSpline(x, y, s=len(x))(x)
-    residuals = y - smoothed
-
-    mean_r, std_r = float(residuals.mean()), float(residuals.std())
-    if std_r < 1e-10:
-        return df
-
-    feat_ppm["ppm_error_calibrated_z"] = (residuals - mean_r) / std_r
-    idx_to_z = dict(zip(feat_ppm["feature_idx"], feat_ppm["ppm_error_calibrated_z"]))
-    df["ppm_error_calibrated_z"] = df["feature_idx"].map(idx_to_z).fillna(0.0)
-
-    logger.info("LOWESS ppm calibration (A3): computed ppm_error_calibrated_z")
     return df
 
 
@@ -1827,54 +1321,6 @@ def compute_im2deep_features(
     return df
 
 
-def compute_lcms_ccs_features(
-    df: pd.DataFrame,
-    observed_ccs_per_feature: dict | None = None,
-) -> pd.DataFrame:
-    """
-    Compare MALDI-observed CCS to LC-MS/MS-observed CCS per candidate.
-
-    Requires ``lcms_ccs`` column in *df* (populated from LC-MS/MS ion mobility
-    data via ``lcms_ids._parse_psm_utils``) and ``observed_ccs_per_feature``
-    (MALDI CCS from the SCiLS Lab CSV).  Skips silently if either is absent.
-
-    Note: MALDI CCS is measured at charge 1 ([M+H]+); LC-MS/MS CCS is measured
-    at the search charge (typically 2–4) and converted via the Mason-Schamp
-    equation.  The delta is therefore not zero for the correct identification,
-    but it is consistent across correct assignments and inconsistent for
-    misassignments.
-
-    Features added
-    --------------
-    lcms_ccs_delta      MALDI CCS − LC-MS/MS CCS  (Å²)
-    lcms_ccs_abs_pct    |delta| / LC-MS/MS CCS × 100  (%)
-    """
-    if not observed_ccs_per_feature:
-        return df
-    if "lcms_ccs" not in df.columns or df["lcms_ccs"].isna().all():
-        return df
-
-    maldi_ccs = df["feature_idx"].map(observed_ccs_per_feature).values.astype(float)
-    lcms_ccs = df["lcms_ccs"].values.astype(float)
-
-    delta = maldi_ccs - lcms_ccs
-    abs_pct = np.abs(delta) / np.where(np.abs(lcms_ccs) > 1e-6, np.abs(lcms_ccs), 1.0) * 100.0
-
-    df["lcms_ccs_delta"] = delta
-    df["lcms_ccs_abs_pct"] = abs_pct
-
-    for col in ["lcms_ccs_delta", "lcms_ccs_abs_pct"]:
-        valid = df[col].dropna()
-        fill = float(valid.median()) if len(valid) > 0 else 0.0
-        df[col] = df[col].fillna(fill)
-
-    n_valid = int(np.isfinite(delta).sum())
-    logger.info(
-        f"MALDI vs LC-MS/MS CCS features: {n_valid}/{len(df)} candidates with both CCS values"
-    )
-    return df
-
-
 # ---------------------------------------------------------------------------
 # C — Additional peptide property features
 # ---------------------------------------------------------------------------
@@ -1891,20 +1337,11 @@ def compute_peptide_property_features(df: pd.DataFrame) -> pd.DataFrame:
     acidic_residue_density   (count(D)+count(E)) / length
     """
     codes, uniques = pd.factorize(df["peptide"])
-    uniques_list = uniques.tolist()
 
-    try:
-        from ms1rescore_rs import compute_property_features
-        n_D, n_E, n_C, n_P, n_M, _, _, seq_lens_u, _, _ = \
-            compute_property_features(uniques_list)
-        n_D = np.asarray(n_D); n_E = np.asarray(n_E); n_C = np.asarray(n_C)
-        n_P = np.asarray(n_P); n_M = np.asarray(n_M)
-        seq_lens_u = np.asarray(seq_lens_u)
-    except ImportError:
-        cnt = _residue_counts_batch(uniques, "DECPM")
-        n_D = cnt["D"]; n_E = cnt["E"]; n_C = cnt["C"]
-        n_P = cnt["P"]; n_M = cnt["M"]
-        seq_lens_u = np.array([len(s) for s in uniques], dtype=np.int32)
+    cnt = _residue_counts_batch(uniques, "DECPM")
+    n_D = cnt["D"]; n_E = cnt["E"]; n_C = cnt["C"]
+    n_P = cnt["P"]; n_M = cnt["M"]
+    seq_lens_u = np.array([len(s) for s in uniques], dtype=np.int32)
 
     df["has_oxidized_met"]       = (n_M > 0)[codes].astype(float)
     df["has_cys"]                = (n_C > 0)[codes].astype(float)
@@ -1966,7 +1403,6 @@ def compute_isotopologue_colocalization(
     df: pd.DataFrame,
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
-    ppm_tolerance: float = 10.0,
     _corr_cache: tuple | None = None,
     extra_ion_images: dict | None = None,
     pixel_mask: np.ndarray | None = None,
@@ -1979,8 +1415,8 @@ def compute_isotopologue_colocalization(
     list.  This is the normal path: MALDI feature lists contain only monoisotopic
     M0 peaks, so M+1/M+2 images are pre-extracted at ``feature_mzs + NEUTRON``.
 
-    Without pre-extracted images the function falls back to searching for M+1/M+2
-    partners inside the feature list (works only when both M0 and M+1 are listed).
+    Without pre-extracted images every value is undefined, and the columns get the
+    shared colocalization fill (0.0).
 
     Features added
     --------------
@@ -2008,16 +1444,9 @@ def compute_isotopologue_colocalization(
             f"{n_m1_found}/{n_valid} features with finite r(M0, M+1)"
         )
     else:
-        # Fallback: partner lookup inside the feature list.
-        self_idx = np.arange(n_valid, dtype=np.intp)
-        m1_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + NEUTRON, ppm_tolerance)
-        m2_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + 2.0 * NEUTRON, ppm_tolerance)
-        r_m1_arr = np.where(m1_idx >= 0, corr_matrix[self_idx, np.clip(m1_idx, 0, n_valid - 1)], np.nan)
-        r_m2_arr = np.where(m2_idx >= 0, corr_matrix[self_idx, np.clip(m2_idx, 0, n_valid - 1)], np.nan)
-        n_m1_found = int((m1_idx >= 0).sum())
-        logger.info(
-            f"Isotopologue colocalization (E1): {n_m1_found}/{n_valid} features with M+1 in feature list"
-        )
+        r_m1_arr = np.full(n_valid, np.nan)
+        r_m2_arr = np.full(n_valid, np.nan)
+        logger.warning("Isotopologue colocalization (E1): no M+1/M+2 images; columns left undefined")
 
     import warnings
     with warnings.catch_warnings():
@@ -2046,7 +1475,6 @@ def compute_adduct_colocalization(
     df: pd.DataFrame,
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
-    ppm_tolerance: float = 10.0,
     _corr_cache: tuple | None = None,
     extra_ion_images: dict | None = None,
     pixel_mask: np.ndarray | None = None,
@@ -2059,8 +1487,8 @@ def compute_adduct_colocalization(
     list.  This is the normal path: adduct peaks are typically absent from
     monoisotopic-only feature lists.
 
-    Without pre-extracted images the function falls back to searching for adduct
-    partners inside the feature list.
+    Without pre-extracted images every value is undefined, and the columns get the
+    shared colocalization fill (0.0).
 
     Features added
     --------------
@@ -2091,24 +1519,9 @@ def compute_adduct_colocalization(
             f"{[k for k in _ADDUCT_DELTAS if extra_ion_images.get(k) is not None]}"
         )
     else:
-        # Fallback: partner lookup inside the feature list.
-        self_idx = np.arange(n_valid, dtype=np.intp)
-        for adduct_name, delta in _ADDUCT_DELTAS.items():
-            partner_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + delta, ppm_tolerance)
-            r_arr = np.where(
-                partner_idx >= 0,
-                corr_matrix[self_idx, np.clip(partner_idx, 0, n_valid - 1)],
-                np.nan,
-            )
-            mapping = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_arr)}
-            _assign_coloc_column(df, f"adduct_colocalization_{adduct_name}", mapping)
-        n_found = sum(
-            int((_find_partner_indices(valid_mz_arr, valid_mz_arr + d, ppm_tolerance) >= 0).sum())
-            for d in _ADDUCT_DELTAS.values()
-        )
-        logger.info(
-            f"Adduct colocalization (E2): {n_found} total adduct partners found in feature list"
-        )
+        for adduct_name in _ADDUCT_DELTAS:
+            _assign_coloc_column(df, f"adduct_colocalization_{adduct_name}", {})
+        logger.warning("Adduct colocalization (E2): no adduct images; columns left undefined")
 
     return df
 
@@ -2131,17 +1544,30 @@ def _neighbor_sum_batch(imgs: np.ndarray) -> np.ndarray:
     """
     _, H, W = imgs.shape
     pad = np.pad(imgs, ((0, 0), (1, 1), (1, 1)), mode="constant", constant_values=0.0)
-    result = (
-        pad[:, 0:H,   0:W  ]
-        + pad[:, 0:H,   1:W+1]
-        + pad[:, 0:H,   2:W+2]
-        + pad[:, 1:H+1, 0:W  ]
-        + pad[:, 1:H+1, 2:W+2]
-        + pad[:, 2:H+2, 0:W  ]
-        + pad[:, 2:H+2, 1:W+1]
-        + pad[:, 2:H+2, 2:W+2]
-    )
+    # Accumulate in place, left to right: same rounding as a+b+...+h, one fewer
+    # full-size temporary. (scipy.ndimage.correlate sums in float64 and so does
+    # not reproduce float32 input bit for bit.)
+    result = pad[:, 0:H, 0:W].copy()
+    for dy, dx in ((0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1), (2, 2)):
+        result += pad[:, dy:dy + H, dx:dx + W]
     return result
+
+
+def _queen_weights(H: int, W: int) -> tuple[np.ndarray, float]:
+    """Per-pixel queen-contiguity degree map (H, W) float32 and its total weight."""
+    neighbor_counts = _neighbor_sum_batch(np.ones((1, H, W), dtype=np.float32))[0]
+    return neighbor_counts, float(neighbor_counts.sum(dtype=np.float64))
+
+
+def _morans_i_batch(z: np.ndarray, z_sq: np.ndarray, N: int, W_sum: float) -> np.ndarray:
+    """Moran's I per image from mean-centred images ``z`` (c, H, W).
+
+    ``z_sq`` is the per-image sum of squared deviations (float64). Images with
+    ``z_sq <= 1e-12`` (constant) get 0.
+    """
+    ok = z_sq > 1e-12
+    numerators = (z * _neighbor_sum_batch(z)).sum(axis=(1, 2), dtype=np.float64)
+    return np.where(ok, (N / W_sum) * numerators / np.where(ok, z_sq, 1.0), 0.0)
 
 
 def _morans_gearys_chunk(
@@ -2181,9 +1607,7 @@ def _morans_gearys_chunk(
     if not ok.any():
         return morans, gearys
 
-    Wz = _neighbor_sum_batch(z)
-    numerators_m = (z * Wz).sum(axis=(1, 2), dtype=np.float64)
-    morans = np.where(ok, (N / W_sum) * numerators_m / np.where(ok, z_sq, 1.0), 0.0)
+    morans = _morans_i_batch(z, z_sq, N, W_sum)
 
     Wx = _neighbor_sum_batch(imgs)
     xTDx = (imgs * imgs * neighbor_counts).sum(axis=(1, 2), dtype=np.float64)
@@ -2194,18 +1618,6 @@ def _morans_gearys_chunk(
         1.0,
     )
     return morans, gearys
-
-
-def _pearson_r_images(a: np.ndarray, b: np.ndarray) -> float:
-    """Pearson r between two same-shape images. Returns nan for constant images."""
-    af = a.ravel().astype(np.float32)
-    bf = b.ravel().astype(np.float32)
-    af -= af.mean()
-    bf -= bf.mean()
-    denom = np.sqrt((af * af).sum()) * np.sqrt((bf * bf).sum())
-    if denom < 1e-10:
-        return np.nan
-    return float((af * bf).sum() / denom)
 
 
 def _log_progress(prefix: str, n_done: int, n_total: int, t_start: float, every: int) -> None:
@@ -2303,10 +1715,9 @@ def compute_mobility_colocalization_features(
       fraction_detected_mob, intensity_cv_mob,
       log_mean_intensity_mob, spatial_morans_i_mob.
 
-    When ms1rescore_rs is available, builds a flat CSR once (one alphatims call
-    per pixel) and dispatches to a rayon-parallel Rust kernel that processes all
-    feature groups simultaneously.  Falls back to the per-feature Python loop
-    if the Rust extension is unavailable.
+    Builds a flat CSR of the peaks inside any extraction window once and
+    dispatches to the rayon-parallel Rust kernel (``ms1rescore_rs``), which
+    processes all feature groups simultaneously.
     """
     import sqlite3
     from pathlib import Path
@@ -2416,457 +1827,338 @@ def compute_mobility_colocalization_features(
     feat_col = "feature_idx" if "feature_idx" in df.columns else "feature_mz"
     groups = list(df.groupby(feat_col))
 
-    try:
-        from ms1rescore_rs import mob_coloc_features as _rs_mob_coloc
-        _use_rust = True
-    except ImportError:
-        _use_rust = False
+    from ms1rescore_rs import mob_coloc_features as _rs_mob_coloc
+
+    from msi_picasso.maldi_query import _filter_window_peaks, _relevant_tof_mask
+
     logger.info(
-        f"Mobility colocalization: {len(groups)} feature groups, "
-        f"{len(df)} candidates; backend={'Rust' if _use_rust else 'pure-Python fallback (slow)'}"
+        f"Mobility colocalization: {len(groups)} feature groups, {len(df)} candidates"
     )
 
-    # Per-candidate M0 images collected by whichever path runs; used below for
-    # protein-level pairwise r.
+    # Per-candidate M0 images, used below for protein-level pairwise r.
     _cand_m0_images: dict = {}
 
-    if _use_rust:
-        # ------------------------------------------------------------------ #
-        # Rust path: direct push_indptr access + m/z pre-filtering.         #
-        #                                                                    #
-        # The old approach (one alphatims batch read) collected ALL peaks    #
-        # for all pixels into a ~1-5B element array, then lexsorted it —    #
-        # typically 5-40 GB of intermediate data and 25+ minutes.           #
-        #                                                                    #
-        # This approach:                                                     #
-        #  1. Reads peak ranges directly from push_indptr (no filter call)  #
-        #  2. Builds a TOF-bin boolean mask for the feature windows (~1-3%) #
-        #  3. Loads and filters peaks in pixel batches (5 000 pixels each)  #
-        #  4. Keeps only the ~1-3% of peaks that fall in a window           #
-        #  5. Sorts only the filtered peaks (50-100× fewer)                 #
-        # ------------------------------------------------------------------ #
-        scan_max     = int(tims.scan_max_index)
-        frame_offset = int(tims.zeroth_frame)   # 1 if zeroth frame exists (default), else 0
-        push_indptr  = np.asarray(tims.push_indptr, dtype=np.int64)
-        tof_max_idx  = int(tims.tof_max_index)
-        tof_idx_np   = np.asarray(tims.tof_indices, dtype=np.int32)
-        intensity_np = np.asarray(tims.intensity_values, dtype=np.float32)
-        mz_arr_np    = np.asarray(tims.mz_values, dtype=np.float32)  # per-TOF-bin
-        mob_arr      = tims.mobility_values                           # per-scan 1/K0
+    # ------------------------------------------------------------------ #
+    # Direct push_indptr access + m/z pre-filtering.                     #
+    #                                                                    #
+    # The old approach (one alphatims batch read) collected ALL peaks    #
+    # for all pixels into a ~1-5B element array, then lexsorted it —    #
+    # typically 5-40 GB of intermediate data and 25+ minutes.           #
+    #                                                                    #
+    # This approach:                                                     #
+    #  1. Reads peak ranges directly from push_indptr (no filter call)  #
+    #  2. Builds a TOF-bin boolean mask for the feature windows (~1-3%) #
+    #  3. Loads and filters peaks in pixel batches (5 000 pixels each)  #
+    #  4. Keeps only the ~1-3% of peaks that fall in a window           #
+    #  5. Sorts only the filtered peaks (50-100× fewer)                 #
+    # ------------------------------------------------------------------ #
+    scan_max     = int(tims.scan_max_index)
+    frame_offset = int(tims.zeroth_frame)   # 1 if zeroth frame exists (default), else 0
+    push_indptr  = np.asarray(tims.push_indptr, dtype=np.int64)
+    tof_max_idx  = int(tims.tof_max_index)
+    tof_idx_np   = np.asarray(tims.tof_indices, dtype=np.int32)
+    intensity_np = np.asarray(tims.intensity_values, dtype=np.float32)
+    mz_arr_np    = np.asarray(tims.mz_values, dtype=np.float32)  # per-TOF-bin
+    mob_arr      = tims.mobility_values                           # per-scan 1/K0
 
-        sorted_fids = sorted(coord_map.keys())
-        n_pixels    = len(sorted_fids)
+    sorted_fids = sorted(coord_map.keys())
+    n_pixels    = len(sorted_fids)
 
-        # Peak range per pixel: derived from push_indptr, no alphatims call
-        frame_positions = np.array(sorted_fids, dtype=np.int64) - 1 + frame_offset
-        push_starts_pp  = frame_positions * scan_max
-        push_ends_pp    = (frame_positions + 1) * scan_max
-        peak_starts_pp  = push_indptr[push_starts_pp]
-        peak_ends_pp    = push_indptr[push_ends_pp]
-        peak_counts_pp  = peak_ends_pp - peak_starts_pp
+    # Peak range per pixel: derived from push_indptr, no alphatims call
+    frame_positions = np.array(sorted_fids, dtype=np.int64) - 1 + frame_offset
+    push_starts_pp  = frame_positions * scan_max
+    push_ends_pp    = (frame_positions + 1) * scan_max
+    peak_starts_pp  = push_indptr[push_starts_pp]
+    peak_ends_pp    = push_indptr[push_ends_pp]
+    peak_counts_pp  = peak_ends_pp - peak_starts_pp
 
-        # Build TOF-bin filter mask: mark every bin that falls inside at least
-        # one of the 6 extraction windows for any feature.
-        _t0 = time.perf_counter()
-        ppm_factor   = extraction_ppm * 1e-6
-        relevant_tof = np.zeros(tof_max_idx, dtype=np.bool_)
-        for _, grp in groups:
-            feat_mz = float(grp["feature_mz"].iloc[0])
-            for offset in _MZ_OFFSET_VALUES:
-                qmz = feat_mz + offset
-                lo = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 - ppm_factor)), "left"))
-                hi = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 + ppm_factor)), "right"))
-                if lo < hi:
-                    relevant_tof[lo:hi] = True
+    # Build TOF-bin filter mask: mark every bin that falls inside at least
+    # one of the 6 extraction windows for any feature.
+    _t0 = time.perf_counter()
+    ppm_factor   = extraction_ppm * 1e-6
+    relevant_tof = _relevant_tof_mask(
+        mz_arr_np,
+        (float(grp["feature_mz"].iloc[0]) + offset
+         for _, grp in groups for offset in _MZ_OFFSET_VALUES),
+        extraction_ppm, tof_max_idx,
+    )
 
-        n_rel = int(relevant_tof.sum())
-        logger.debug(
-            f"Mobility colocalization: TOF-bin mask built in "
-            f"{time.perf_counter() - _t0:.0f}s — {n_pixels} pixels, "
-            f"{n_rel}/{tof_max_idx} TOF bins in extraction windows "
-            f"({100.0 * n_rel / max(tof_max_idx, 1):.1f}%); loading filtered peaks…"
+    n_rel = int(relevant_tof.sum())
+    logger.debug(
+        f"Mobility colocalization: TOF-bin mask built in "
+        f"{time.perf_counter() - _t0:.0f}s — {n_pixels} pixels, "
+        f"{n_rel}/{tof_max_idx} TOF bins in extraction windows "
+        f"({100.0 * n_rel / max(tof_max_idx, 1):.1f}%); loading filtered peaks…"
+    )
+
+    # Process pixels in batches of _BATCH to bound peak memory per iteration
+    _t0 = time.perf_counter()
+    _BATCH = 5000
+    _n_batches = (n_pixels + _BATCH - 1) // _BATCH
+    all_pix:   list[np.ndarray] = []
+    all_mzs_l: list[np.ndarray] = []
+    all_scn_l: list[np.ndarray] = []
+    all_int_l: list[np.ndarray] = []
+
+    for _bi, b0 in enumerate(range(0, n_pixels, _BATCH), start=1):
+        _log_progress("Mobility colocalization: loading filtered peaks", _bi, _n_batches, _t0, every=max(1, _n_batches // 20))
+        b1        = min(b0 + _BATCH, n_pixels)
+        b_starts  = peak_starts_pp[b0:b1]
+        b_counts  = peak_counts_pp[b0:b1]
+        b_total   = int(b_counts.sum())
+        if b_total == 0:
+            continue
+
+        # Vectorised global raw peak indices for this batch
+        b_out_starts = np.concatenate([[np.int64(0)], np.cumsum(b_counts[:-1])])
+        b_base       = np.repeat(b_starts - b_out_starts, b_counts)
+        b_raw        = np.arange(b_total, dtype=np.int64) + b_base
+
+        # Filter to relevant m/z windows via TOF-bin index
+        kept = _filter_window_peaks(
+            b_raw, tof_idx_np[b_raw], relevant_tof, mz_arr_np, intensity_np,
+            push_indptr, scan_max,
         )
+        if kept is None:
+            continue
+        b_mask, b_mzs, b_ints, b_scns = kept
 
-        # Process pixels in batches of _BATCH to bound peak memory per iteration
-        _t0 = time.perf_counter()
-        _BATCH = 5000
-        _n_batches = (n_pixels + _BATCH - 1) // _BATCH
-        all_pix:   list[np.ndarray] = []
-        all_mzs_l: list[np.ndarray] = []
-        all_scn_l: list[np.ndarray] = []
-        all_int_l: list[np.ndarray] = []
+        all_pix.append(np.repeat(np.arange(b0, b1, dtype=np.int32), b_counts)[b_mask])
+        all_mzs_l.append(b_mzs)
+        all_scn_l.append(b_scns.astype(np.uint32))
+        all_int_l.append(b_ints)
 
-        for _bi, b0 in enumerate(range(0, n_pixels, _BATCH), start=1):
-            _log_progress("Mobility colocalization: loading filtered peaks", _bi, _n_batches, _t0, every=max(1, _n_batches // 20))
-            b1        = min(b0 + _BATCH, n_pixels)
-            b_starts  = peak_starts_pp[b0:b1]
-            b_counts  = peak_counts_pp[b0:b1]
-            b_total   = int(b_counts.sum())
-            if b_total == 0:
-                continue
-
-            # Vectorised global raw peak indices for this batch
-            b_out_starts = np.concatenate([[np.int64(0)], np.cumsum(b_counts[:-1])])
-            b_base       = np.repeat(b_starts - b_out_starts, b_counts)
-            b_raw        = np.arange(b_total, dtype=np.int64) + b_base
-
-            # Filter to relevant m/z windows via TOF-bin index
-            b_tof  = tof_idx_np[b_raw]
-            b_mask = relevant_tof[b_tof.astype(np.int64)]
-            if not b_mask.any():
-                continue
-
-            b_raw_f = b_raw[b_mask]
-            b_pix   = np.repeat(np.arange(b0, b1, dtype=np.int32), b_counts)[b_mask]
-            b_tof_f = b_tof[b_mask].astype(np.int64)
-
-            b_mzs  = mz_arr_np[b_tof_f]
-            b_ints = intensity_np[b_raw_f]
-            b_push = np.searchsorted(push_indptr, b_raw_f, side="right") - 1
-            b_scns = (b_push % scan_max).astype(np.uint32)
-
-            all_pix.append(b_pix)
-            all_mzs_l.append(b_mzs)
-            all_scn_l.append(b_scns)
-            all_int_l.append(b_ints)
-
-        if not all_pix:
-            logger.warning("No peaks found in any extraction window — skipping mob coloc.")
-            for col in NEW_COLS:
-                df[col] = np.nan
-            return df
-
-        pix_ids  = np.concatenate(all_pix)
-        mzs_all  = np.concatenate(all_mzs_l)
-        scan_ids = np.concatenate(all_scn_l)
-        ints_all = np.concatenate(all_int_l)
-
-        total_filtered = len(mzs_all)
-        total_all      = int(peak_counts_pp.sum())
-        n_workers = min(os.cpu_count() or 1, 16)
-        logger.info(
-            f"Mobility colocalization: peak loading done in "
-            f"{time.perf_counter() - _t0:.0f}s — {total_filtered:,} relevant peaks "
-            f"({100.0 * total_filtered / max(total_all, 1):.1f}% of {total_all:,} total); "
-            f"sorting per-pixel m/z across {n_workers} threads…"
-        )
-        _t0 = time.perf_counter()
-
-        # Rust binary-searches per-pixel m/z windows, so peaks must be ordered by
-        # (pixel_id, mz). pix_ids is ALREADY globally non-decreasing here: the batch
-        # loop above emits pixels in ascending order and b_pix is ascending within
-        # each batch, so a global lexsort over ~2.5e9 rows is wasted work — only the
-        # m/z axis needs sorting *within* each pixel. Compute the CSR pixel offsets
-        # from the already-sorted pix_ids, then sort each pixel's disjoint m/z slice
-        # in parallel (numpy argsort releases the GIL; disjoint slice writes are
-        # race-free). This replaces a single-threaded ~11 min lexsort with a parallel
-        # segmented sort that also does strictly less total work (Σ k·log k over
-        # pixels, not N·log N).
-        # ponytail: relies on pix_ids being pixel-sorted by construction above; if
-        # that batch loop changes, restore `np.lexsort((mzs_all, pix_ids))`.
-        pixel_offsets_arr = np.searchsorted(pix_ids, np.arange(n_pixels + 1), side="left")
-
-        def _sort_pixel_slices(pxs):
-            for px in pxs:
-                s = int(pixel_offsets_arr[px])
-                e = int(pixel_offsets_arr[px + 1])
-                if e - s > 1:
-                    loc = np.argsort(mzs_all[s:e], kind="stable")
-                    mzs_all[s:e]  = mzs_all[s:e][loc]
-                    scan_ids[s:e] = scan_ids[s:e][loc]
-                    ints_all[s:e] = ints_all[s:e][loc]
-
-        if n_pixels > 1:
-            with ThreadPoolExecutor(max_workers=n_workers) as _ex:
-                list(_ex.map(_sort_pixel_slices,
-                             np.array_split(np.arange(n_pixels), n_workers * 4)))
-        logger.info(f"Mobility colocalization: per-pixel sort done in {time.perf_counter() - _t0:.0f}s")
-
-        # CSR offsets: pixel_offsets[px] … pixel_offsets[px+1] = peak range for pixel px
-        pixel_offsets = pixel_offsets_arr.astype(np.uint64).tolist()
-
-        # Pixel coordinates in the same order as sorted_fids
-        pixel_xi_list = [coord_map[fid][0] for fid in sorted_fids]
-        pixel_yi_list = [coord_map[fid][1] for fid in sorted_fids]
-
-        flat_mzs   = mzs_all
-        flat_scans = scan_ids
-        flat_ints  = ints_all
-
-        # Build feature m/z windows: flat array (n_features × 6 × 2)
-        # ppm_factor already defined above
-        n_features = len(groups)
-        feature_mz_windows = np.empty(n_features * 6 * 2, dtype=np.float32)
-
-        # Build candidate CSR arrays
-        _t0 = time.perf_counter()
-        cand_ptr: list[int] = [0]
-        cand_k0_lo_list: list[float] = []
-        cand_k0_hi_list: list[float] = []
-        cand_df_indices: list = []  # df label indices in order
-
-        for fi, (_, grp) in enumerate(groups):
-            feat_mz = float(grp["feature_mz"].iloc[0])
-            win_base = fi * 12
-            for oi, offset in enumerate(_MZ_OFFSET_VALUES):
-                qmz = feat_mz + offset
-                feature_mz_windows[win_base + oi * 2]     = float(qmz * (1.0 - ppm_factor))
-                feature_mz_windows[win_base + oi * 2 + 1] = float(qmz * (1.0 + ppm_factor))
-
-            cand_indices = grp.index.tolist()
-            cand_df_indices.extend(cand_indices)
-            cand_ptr.append(cand_ptr[-1] + len(cand_indices))
-            for idx in cand_indices:
-                pred_k0 = df.at[idx, "_pred_inv_k0"]
-                if pd.isna(pred_k0):
-                    cand_k0_lo_list.append(float("nan"))
-                    cand_k0_hi_list.append(float("nan"))
-                else:
-                    cand_k0_lo_list.append(float(pred_k0) - k0_half_win)
-                    cand_k0_hi_list.append(float(pred_k0) + k0_half_win)
-
-        logger.info(
-            f"Mobility colocalization: candidate CSR built in "
-            f"{time.perf_counter() - _t0:.0f}s — processing {n_features} feature groups "
-            f"({len(cand_df_indices)} candidates) via Rust…"
-        )
-        _t0 = time.perf_counter()
-        raw = _rs_mob_coloc(
-            flat_mzs,
-            flat_scans,
-            flat_ints,
-            pixel_offsets,
-            pixel_xi_list,
-            pixel_yi_list,
-            mob_arr.astype(np.float64).tolist(),
-            feature_mz_windows,
-            cand_ptr,
-            cand_k0_lo_list,
-            cand_k0_hi_list,
-            max_x,
-            max_y,
-        )
-        logger.info(f"Mobility colocalization: Rust kernel done in {time.perf_counter() - _t0:.0f}s")
-        raw_mat = np.asarray(raw, dtype=np.float64).reshape(len(cand_df_indices), 10)
-
-        for col_i, col in enumerate(NEW_COLS):
-            df[col] = pd.Series(raw_mat[:, col_i], index=cand_df_indices, dtype=np.float64)
-
-        # Rebuild per-candidate M0 images from the already-loaded flat arrays so
-        # protein-level pairwise r can be computed without a second TDF read.
-        # Only build images for candidates in proteins with ≥2 detected members
-        # (singletons cannot contribute to within-protein r).
-        if protein_coloc and "protein" in df.columns:
-            _prot_sizes = df.groupby("protein").size()
-            _multi_prots = set(_prot_sizes[_prot_sizes >= 2].index)
-            _needs_img = frozenset(
-                df.index[
-                    df["protein"].isin(_multi_prots)
-                    & df["_pred_inv_k0"].notna()
-                ]
-            )
-        else:
-            _needs_img = frozenset()
-
-        if _needs_img:
-            pixel_xi_arr = np.array(pixel_xi_list, dtype=np.int32)
-            pixel_yi_arr = np.array(pixel_yi_list, dtype=np.int32)
-            _n_pix_total = max_y * max_x
-            _pred_inv_k0_map = df["_pred_inv_k0"].to_dict()
-
-            def _build_group_images(grp):
-                cands_needed = [i for i in grp.index if i in _needs_img]
-                if not cands_needed:
-                    return []
-                feat_mz = float(grp["feature_mz"].iloc[0])
-                mz_lo = feat_mz * (1.0 - ppm_factor)
-                mz_hi = feat_mz * (1.0 + ppm_factor)
-                # NB: this is a full O(len(mzs_all)) scan (mzs_all is sorted
-                # per-pixel, not globally, so no binary search shortcut here) —
-                # ~2-3 billion elements on a whole-tissue section. Dispatched
-                # across threads below because numpy's comparison/logical-and
-                # ufuncs release the GIL for arrays past a small internal
-                # threshold, so concurrent calls genuinely run on separate
-                # cores. This was previously the dominant single-threaded cost
-                # of mobility colocalization (hours on a dense whole section).
-                # ponytail: still O(N) per feature; a global mz-sort + binary
-                # search per feature would cut this further, at the cost of a
-                # full extra sorted copy of mzs_all/pix_ids/scan_ids/ints_all.
-                # Revisit if threading alone isn't enough headroom.
-                # In-place &= so only two length-N boolean temporaries are alive
-                # instead of three; see the worker-count cap below, which is
-                # sized against exactly this.
-                mz_mask = mzs_all >= mz_lo
-                mz_mask &= mzs_all <= mz_hi
-                if not mz_mask.any():
-                    return []
-                sub_pix  = pix_ids[mz_mask]
-                sub_mob  = mob_arr[scan_ids[mz_mask]]
-                # bincount requires float64 weights
-                sub_ints = ints_all[mz_mask].astype(np.float64)
-                flat_xy  = (
-                    pixel_yi_arr[sub_pix].astype(np.int64) * max_x
-                    + pixel_xi_arr[sub_pix].astype(np.int64)
-                )
-                out = []
-                for idx in cands_needed:
-                    pred_k0 = _pred_inv_k0_map[idx]
-                    k0_mask = (
-                        (sub_mob >= pred_k0 - k0_half_win)
-                        & (sub_mob <= pred_k0 + k0_half_win)
-                    )
-                    if k0_mask.any():
-                        img_flat = np.bincount(
-                            flat_xy[k0_mask],
-                            weights=sub_ints[k0_mask],
-                            minlength=_n_pix_total,
-                        ).astype(np.float32)
-                    else:
-                        img_flat = np.zeros(_n_pix_total, dtype=np.float32)
-                    out.append((idx, img_flat.reshape(max_y, max_x)))
-                return out
-
-            _needed_groups = [grp for _, grp in groups if any(i in _needs_img for i in grp.index)]
-            _n_groups_needed = len(_needed_groups)
-            # Each worker's m/z window scan holds two length-N boolean temporaries
-            # (N = len(mzs_all)), so peak RAM here is workers x 2N, NOT 2N. On a
-            # whole section that product is what runs the machine out of memory:
-            # her2 has 3.16e9 relevant peaks, so 64 threads is 64 x 6.3 GB = 405 GB
-            # of transient masks on top of ~60 GB of base arrays and a 42 GB image
-            # array. It died silently at exactly this line three times before the
-            # count was capped. Size the pool against free memory instead.
-            _mask_bytes_per_worker = 2 * mzs_all.size
-            _avail = _available_memory_bytes()
-            _n_workers = _memory_capped_workers(_mask_bytes_per_worker, available=_avail)
-            logger.info(
-                f"Mobility colocalization: rebuilding per-candidate M0 images for "
-                f"{_n_groups_needed} feature groups across {_n_workers} threads "
-                f"({_mask_bytes_per_worker / 1e9:.1f} GB of scan masks per thread, "
-                f"{(_avail / 1e9) if _avail else float('nan'):.0f} GB free) "
-                f"(this is the O(N) full-array-scan step — watch the progress line below "
-                f"for how it's tracking)…"
-            )
-            _t0 = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=_n_workers) as _ex:
-                for _gi, _group_results in enumerate(_ex.map(_build_group_images, _needed_groups), start=1):
-                    _log_progress(
-                        "Mobility colocalization: M0 image rebuild",
-                        _gi, _n_groups_needed, _t0, every=max(1, _n_groups_needed // 20),
-                    )
-                    for idx, img in _group_results:
-                        _cand_m0_images[idx] = img
-            logger.info(
-                f"Mobility colocalization: M0 image rebuild done in "
-                f"{time.perf_counter() - _t0:.0f}s ({len(_cand_m0_images)} images)"
-            )
-
-    else:
-        # ------------------------------------------------------------------ #
-        # Python fallback: per-feature read with pre-read optimisation        #
-        # ------------------------------------------------------------------ #
-        _ones = np.ones((1, max_y, max_x), dtype=np.float32)
-        _neighbor_counts = _neighbor_sum_batch(_ones)[0]
-        _N = max_y * max_x
-        _W_sum = float(_neighbor_counts.sum())
-
-        _MZ_OFFSETS_DICT = {
-            "m0": _MZ_OFFSET_VALUES[0],
-            "m1": _MZ_OFFSET_VALUES[1],
-            "m2": _MZ_OFFSET_VALUES[2],
-            "na": _MZ_OFFSET_VALUES[3],
-            "k":  _MZ_OFFSET_VALUES[4],
-            "chca": _MZ_OFFSET_VALUES[5],
-        }
-        ppm_factor = extraction_ppm * 1e-6
-        result_rows: dict = {}
-
-        _n_groups_fallback = len(groups)
-        logger.info(
-            f"Mobility colocalization: processing {_n_groups_fallback} feature groups "
-            f"via the pure-Python fallback (no Rust extension found — this re-reads "
-            f"the TDF per pixel per feature and is far slower; install/build "
-            f"ms1rescore_rs for the Rust path)…"
-        )
-        _t0 = time.perf_counter()
-
-        for _fi, (feat_key, grp) in enumerate(groups, start=1):
-            _log_progress(
-                "Mobility colocalization: fallback loop",
-                _fi, _n_groups_fallback, _t0, every=max(1, _n_groups_fallback // 20),
-            )
-            feat_mz = float(grp["feature_mz"].iloc[0])
-            cand_indices = grp.index.tolist()
-
-            mz_ranges = {
-                key: (
-                    (feat_mz + offset) * (1.0 - ppm_factor),
-                    (feat_mz + offset) * (1.0 + ppm_factor),
-                )
-                for key, offset in _MZ_OFFSETS_DICT.items()
-            }
-
-            pixel_data: dict[str, list] = {key: [] for key in _MZ_OFFSETS_DICT}
-            for fid, (xi, yi) in coord_map.items():
-                fd = tims[int(fid), :, :]
-                if not len(fd):
-                    continue
-                mz_vals = fd["mz_values"].values
-                scan_idx = fd["scan_indices"].values
-                int_vals = fd["intensity_values"].values
-                for key, (mz_lo, mz_hi) in mz_ranges.items():
-                    mz_mask = (mz_vals >= mz_lo) & (mz_vals <= mz_hi)
-                    if not mz_mask.any():
-                        continue
-                    pixel_data[key].append((xi, yi, scan_idx[mz_mask], int_vals[mz_mask]))
-
-            for idx in cand_indices:
-                pred_k0 = df.at[idx, "_pred_inv_k0"]
-                if pd.isna(pred_k0):
-                    result_rows[idx] = {c: np.nan for c in NEW_COLS}
-                    continue
-
-                scan_in = (mob_arr >= pred_k0 - k0_half_win) & (mob_arr <= pred_k0 + k0_half_win)
-
-                imgs: dict[str, np.ndarray] = {}
-                for key, hits in pixel_data.items():
-                    img = np.zeros((max_y, max_x), dtype=np.float32)
-                    for xi, yi, s_idx, i_vals in hits:
-                        mask = scan_in[s_idx]
-                        if mask.any():
-                            img[yi, xi] += i_vals[mask].sum()
-                    imgs[key] = img
-
-                r_m1 = _pearson_r_images(imgs["m0"], imgs["m1"])
-                r_m2 = _pearson_r_images(imgs["m0"], imgs["m2"])
-                valid_r = [v for v in (r_m1, r_m2) if not np.isnan(v)]
-                r_mean = float(np.mean(valid_r)) if valid_r else np.nan
-
-                m0 = imgs["m0"]
-                if protein_coloc:
-                    _cand_m0_images[idx] = m0
-                nonzero = m0[m0 > 0]
-                cv = float(nonzero.std() / nonzero.mean()) if len(nonzero) > 1 else 0.0
-                morans_val, _ = _morans_gearys_chunk(m0[np.newaxis], _neighbor_counts, _N, _W_sum)
-
-                result_rows[idx] = {
-                    "isotope_colocalization_m1_mob":   r_m1,
-                    "isotope_colocalization_m2_mob":   r_m2,
-                    "isotope_colocalization_mean_mob": r_mean,
-                    "adduct_colocalization_na_mob":    _pearson_r_images(imgs["m0"], imgs["na"]),
-                    "adduct_colocalization_k_mob":     _pearson_r_images(imgs["m0"], imgs["k"]),
-                    "adduct_colocalization_chca_mob":  _pearson_r_images(imgs["m0"], imgs["chca"]),
-                    "fraction_detected_mob":    float((m0 > 0).mean()),
-                    "intensity_cv_mob":         cv,
-                    "log_mean_intensity_mob":   float(np.log1p(m0.mean())),
-                    "spatial_morans_i_mob":     float(morans_val[0]),
-                }
-
-        logger.info(f"Mobility colocalization: fallback loop done in {time.perf_counter() - _t0:.0f}s")
-        result_df = pd.DataFrame.from_dict(result_rows, orient="index")
+    if not all_pix:
+        logger.warning("No peaks found in any extraction window — skipping mob coloc.")
         for col in NEW_COLS:
-            df[col] = result_df[col]
+            df[col] = np.nan
+        return df
 
-    # NaN fill with column median (same policy for both paths)
+    pix_ids  = np.concatenate(all_pix)
+    mzs_all  = np.concatenate(all_mzs_l)
+    scan_ids = np.concatenate(all_scn_l)
+    ints_all = np.concatenate(all_int_l)
+
+    total_filtered = len(mzs_all)
+    total_all      = int(peak_counts_pp.sum())
+    n_workers = min(os.cpu_count() or 1, 16)
+    logger.info(
+        f"Mobility colocalization: peak loading done in "
+        f"{time.perf_counter() - _t0:.0f}s — {total_filtered:,} relevant peaks "
+        f"({100.0 * total_filtered / max(total_all, 1):.1f}% of {total_all:,} total); "
+        f"sorting per-pixel m/z across {n_workers} threads…"
+    )
+    _t0 = time.perf_counter()
+
+    # Rust binary-searches per-pixel m/z windows, so peaks must be ordered by
+    # (pixel_id, mz). pix_ids is ALREADY globally non-decreasing here: the batch
+    # loop above emits pixels in ascending order and b_pix is ascending within
+    # each batch, so a global lexsort over ~2.5e9 rows is wasted work — only the
+    # m/z axis needs sorting *within* each pixel. Compute the CSR pixel offsets
+    # from the already-sorted pix_ids, then sort each pixel's disjoint m/z slice
+    # in parallel (numpy argsort releases the GIL; disjoint slice writes are
+    # race-free). This replaces a single-threaded ~11 min lexsort with a parallel
+    # segmented sort that also does strictly less total work (Σ k·log k over
+    # pixels, not N·log N).
+    # ponytail: relies on pix_ids being pixel-sorted by construction above; if
+    # that batch loop changes, restore `np.lexsort((mzs_all, pix_ids))`.
+    pixel_offsets_arr = np.searchsorted(pix_ids, np.arange(n_pixels + 1), side="left")
+
+    def _sort_pixel_slices(pxs):
+        for px in pxs:
+            s = int(pixel_offsets_arr[px])
+            e = int(pixel_offsets_arr[px + 1])
+            if e - s > 1:
+                loc = np.argsort(mzs_all[s:e], kind="stable")
+                mzs_all[s:e]  = mzs_all[s:e][loc]
+                scan_ids[s:e] = scan_ids[s:e][loc]
+                ints_all[s:e] = ints_all[s:e][loc]
+
+    if n_pixels > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as _ex:
+            list(_ex.map(_sort_pixel_slices,
+                         np.array_split(np.arange(n_pixels), n_workers * 4)))
+    logger.info(f"Mobility colocalization: per-pixel sort done in {time.perf_counter() - _t0:.0f}s")
+
+    # CSR offsets: pixel_offsets[px] … pixel_offsets[px+1] = peak range for pixel px
+    pixel_offsets = pixel_offsets_arr.astype(np.uint64).tolist()
+
+    # Pixel coordinates in the same order as sorted_fids
+    pixel_xi_list = [coord_map[fid][0] for fid in sorted_fids]
+    pixel_yi_list = [coord_map[fid][1] for fid in sorted_fids]
+
+    flat_mzs   = mzs_all
+    flat_scans = scan_ids
+    flat_ints  = ints_all
+
+    # Build feature m/z windows: flat array (n_features × 6 × 2)
+    # ppm_factor already defined above
+    n_features = len(groups)
+    feature_mz_windows = np.empty(n_features * 6 * 2, dtype=np.float32)
+
+    # Build candidate CSR arrays
+    _t0 = time.perf_counter()
+    cand_ptr: list[int] = [0]
+    cand_k0_lo_list: list[float] = []
+    cand_k0_hi_list: list[float] = []
+    cand_df_indices: list = []  # df label indices in order
+
+    for fi, (_, grp) in enumerate(groups):
+        feat_mz = float(grp["feature_mz"].iloc[0])
+        win_base = fi * 12
+        for oi, offset in enumerate(_MZ_OFFSET_VALUES):
+            qmz = feat_mz + offset
+            feature_mz_windows[win_base + oi * 2]     = float(qmz * (1.0 - ppm_factor))
+            feature_mz_windows[win_base + oi * 2 + 1] = float(qmz * (1.0 + ppm_factor))
+
+        cand_indices = grp.index.tolist()
+        cand_df_indices.extend(cand_indices)
+        cand_ptr.append(cand_ptr[-1] + len(cand_indices))
+        for idx in cand_indices:
+            pred_k0 = df.at[idx, "_pred_inv_k0"]
+            if pd.isna(pred_k0):
+                cand_k0_lo_list.append(float("nan"))
+                cand_k0_hi_list.append(float("nan"))
+            else:
+                cand_k0_lo_list.append(float(pred_k0) - k0_half_win)
+                cand_k0_hi_list.append(float(pred_k0) + k0_half_win)
+
+    logger.info(
+        f"Mobility colocalization: candidate CSR built in "
+        f"{time.perf_counter() - _t0:.0f}s — processing {n_features} feature groups "
+        f"({len(cand_df_indices)} candidates) via Rust…"
+    )
+    _t0 = time.perf_counter()
+    raw = _rs_mob_coloc(
+        flat_mzs,
+        flat_scans,
+        flat_ints,
+        pixel_offsets,
+        pixel_xi_list,
+        pixel_yi_list,
+        mob_arr.astype(np.float64).tolist(),
+        feature_mz_windows,
+        cand_ptr,
+        cand_k0_lo_list,
+        cand_k0_hi_list,
+        max_x,
+        max_y,
+    )
+    logger.info(f"Mobility colocalization: Rust kernel done in {time.perf_counter() - _t0:.0f}s")
+    raw_mat = np.asarray(raw, dtype=np.float64).reshape(len(cand_df_indices), 10)
+
+    for col_i, col in enumerate(NEW_COLS):
+        df[col] = pd.Series(raw_mat[:, col_i], index=cand_df_indices, dtype=np.float64)
+
+    # Rebuild per-candidate M0 images from the already-loaded flat arrays so
+    # protein-level pairwise r can be computed without a second TDF read.
+    # Only build images for candidates in proteins with ≥2 detected members
+    # (singletons cannot contribute to within-protein r).
+    if protein_coloc and "protein" in df.columns:
+        _prot_sizes = df.groupby("protein").size()
+        _multi_prots = set(_prot_sizes[_prot_sizes >= 2].index)
+        _needs_img = frozenset(
+            df.index[
+                df["protein"].isin(_multi_prots)
+                & df["_pred_inv_k0"].notna()
+            ]
+        )
+    else:
+        _needs_img = frozenset()
+
+    if _needs_img:
+        pixel_xi_arr = np.array(pixel_xi_list, dtype=np.int32)
+        pixel_yi_arr = np.array(pixel_yi_list, dtype=np.int32)
+        _n_pix_total = max_y * max_x
+        _pred_inv_k0_map = df["_pred_inv_k0"].to_dict()
+
+        def _build_group_images(grp):
+            cands_needed = [i for i in grp.index if i in _needs_img]
+            if not cands_needed:
+                return []
+            feat_mz = float(grp["feature_mz"].iloc[0])
+            mz_lo = feat_mz * (1.0 - ppm_factor)
+            mz_hi = feat_mz * (1.0 + ppm_factor)
+            # NB: this is a full O(len(mzs_all)) scan (mzs_all is sorted
+            # per-pixel, not globally, so no binary search shortcut here) —
+            # ~2-3 billion elements on a whole-tissue section. Dispatched
+            # across threads below because numpy's comparison/logical-and
+            # ufuncs release the GIL for arrays past a small internal
+            # threshold, so concurrent calls genuinely run on separate
+            # cores. This was previously the dominant single-threaded cost
+            # of mobility colocalization (hours on a dense whole section).
+            # ponytail: still O(N) per feature; a global mz-sort + binary
+            # search per feature would cut this further, at the cost of a
+            # full extra sorted copy of mzs_all/pix_ids/scan_ids/ints_all.
+            # Revisit if threading alone isn't enough headroom.
+            # In-place &= so only two length-N boolean temporaries are alive
+            # instead of three; see the worker-count cap below, which is
+            # sized against exactly this.
+            mz_mask = mzs_all >= mz_lo
+            mz_mask &= mzs_all <= mz_hi
+            if not mz_mask.any():
+                return []
+            sub_pix  = pix_ids[mz_mask]
+            sub_mob  = mob_arr[scan_ids[mz_mask]]
+            # bincount requires float64 weights
+            sub_ints = ints_all[mz_mask].astype(np.float64)
+            flat_xy  = (
+                pixel_yi_arr[sub_pix].astype(np.int64) * max_x
+                + pixel_xi_arr[sub_pix].astype(np.int64)
+            )
+            out = []
+            for idx in cands_needed:
+                pred_k0 = _pred_inv_k0_map[idx]
+                k0_mask = (
+                    (sub_mob >= pred_k0 - k0_half_win)
+                    & (sub_mob <= pred_k0 + k0_half_win)
+                )
+                if k0_mask.any():
+                    img_flat = np.bincount(
+                        flat_xy[k0_mask],
+                        weights=sub_ints[k0_mask],
+                        minlength=_n_pix_total,
+                    ).astype(np.float32)
+                else:
+                    img_flat = np.zeros(_n_pix_total, dtype=np.float32)
+                out.append((idx, img_flat.reshape(max_y, max_x)))
+            return out
+
+        _needed_groups = [grp for _, grp in groups if any(i in _needs_img for i in grp.index)]
+        _n_groups_needed = len(_needed_groups)
+        # Each worker's m/z window scan holds two length-N boolean temporaries
+        # (N = len(mzs_all)), so peak RAM here is workers x 2N, NOT 2N. On a
+        # whole section that product is what runs the machine out of memory:
+        # her2 has 3.16e9 relevant peaks, so 64 threads is 64 x 6.3 GB = 405 GB
+        # of transient masks on top of ~60 GB of base arrays and a 42 GB image
+        # array. It died silently at exactly this line three times before the
+        # count was capped. Size the pool against free memory instead.
+        _mask_bytes_per_worker = 2 * mzs_all.size
+        _avail = _available_memory_bytes()
+        _n_workers = _memory_capped_workers(_mask_bytes_per_worker, available=_avail)
+        logger.info(
+            f"Mobility colocalization: rebuilding per-candidate M0 images for "
+            f"{_n_groups_needed} feature groups across {_n_workers} threads "
+            f"({_mask_bytes_per_worker / 1e9:.1f} GB of scan masks per thread, "
+            f"{(_avail / 1e9) if _avail else float('nan'):.0f} GB free) "
+            f"(this is the O(N) full-array-scan step — watch the progress line below "
+            f"for how it's tracking)…"
+        )
+        _t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=_n_workers) as _ex:
+            for _gi, _group_results in enumerate(_ex.map(_build_group_images, _needed_groups), start=1):
+                _log_progress(
+                    "Mobility colocalization: M0 image rebuild",
+                    _gi, _n_groups_needed, _t0, every=max(1, _n_groups_needed // 20),
+                )
+                for idx, img in _group_results:
+                    _cand_m0_images[idx] = img
+        logger.info(
+            f"Mobility colocalization: M0 image rebuild done in "
+            f"{time.perf_counter() - _t0:.0f}s ({len(_cand_m0_images)} images)"
+        )
+
+    # NaN fill with column median
     for col in NEW_COLS:
         valid = df[col].dropna()
         df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
@@ -2900,20 +2192,15 @@ def compute_mobility_colocalization_features(
             if n == 1:
                 df.at[valid_idx[0], "protein_colocalization_mob_n_partners"] = 0.0
                 continue
-            # Vectorised Pearson r: L2-normalise then sgemm for the full n×n matrix
-            X = np.stack(
-                [_cand_m0_images[i].ravel() for i in valid_idx], axis=0
-            ).astype(np.float32)                       # (n, H*W)
-            if tic_normalize:
-                col_sum = X.sum(axis=0)
-                X /= np.where(col_sum > 0, col_sum, 1.0)[np.newaxis, :]
-            X -= X.mean(axis=1, keepdims=True)         # centre each image
-            norms = np.linalg.norm(X, axis=1)          # (n,)
-            good = norms > 1e-10
-            X[~good] = 0.0
-            norms = np.where(good, norms, 1.0)
-            X /= norms[:, np.newaxis]
-            C = X @ X.T                                # (n, n) Pearson r matrix
+            # (n, n) Pearson r matrix. A constant image correlates at r = 0 with
+            # every partner and still counts as one.
+            corr_v, good, _ = _pearson_r_matrix(
+                np.stack([_cand_m0_images[i] for i in valid_idx]).astype(np.float32),
+                np.arange(n), tic_normalize=tic_normalize,
+            )
+            good = good.astype(np.intp)
+            C = np.zeros((n, n), dtype=np.float32)
+            C[np.ix_(good, good)] = corr_v
             np.fill_diagonal(C, np.nan)
             for ci, idx in enumerate(valid_idx):
                 row = C[ci]
@@ -2964,9 +2251,7 @@ def compute_spatial_autocorrelation_full(
     N = height * width
 
     # Precompute neighbour counts per pixel — same for all features.
-    ones = np.ones((1, height, width), dtype=np.float32)
-    neighbor_counts = _neighbor_sum_batch(ones)[0]  # (H, W) float32
-    W_sum = float(neighbor_counts.sum())
+    neighbor_counts, W_sum = _queen_weights(height, width)
 
     mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
     mz_to_img_idx = {float(mz): i for i, mz in enumerate(mz_arr)}

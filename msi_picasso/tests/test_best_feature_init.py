@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from msi_picasso.pipeline import _find_best_feature_labels, _rescore_lda, _tdc_qvalues
+from msi_picasso.pipeline import _find_best_feature_labels, _rescore_linear, _tdc_qvalues
 
 
 # ---------------------------------------------------------------------------
@@ -316,22 +316,6 @@ class TestProteinRollup:
             assert (block_labels == 1).sum() == 1
             assert (block_labels == 0).sum() == len(block_labels) - 1
 
-    def test_protein_rollup_threads_through_include_mask(self):
-        """protein must be sliced/expanded consistently with include_mask (H-fdr-2)."""
-        X, is_decoy, protein, n_proteins, _n_block_rows = _make_protein_block_df()
-        include_mask = np.ones(len(is_decoy), dtype=bool)
-        include_mask[-1] = False  # drop one decoy row
-
-        result = _find_best_feature_labels(
-            X, is_decoy, ["block_feature"], init_fdr=0.2, min_seed_positives=1,
-            protein=protein, include_mask=include_mask,
-        )
-        assert result is not None
-        labels, _, n_passing = result
-        assert n_passing == n_proteins
-        assert len(labels) == len(is_decoy)
-        assert labels[-1] == 0  # excluded row always label 0
-
 
 # ---------------------------------------------------------------------------
 # Fallback to ppm-based seeding when best-feature init returns None
@@ -344,7 +328,7 @@ class TestPpmFallback:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, importances, feat_names, _, _ = _rescore_lda(
+        scores, importances, feat_names, _, _ = _rescore_linear(
             df,
             feat,
             init_ppm_threshold=4.0,
@@ -361,7 +345,7 @@ class TestPpmFallback:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, _, _, _, _ = _rescore_lda(
+        scores, _, _, _, _ = _rescore_linear(
             df,
             feat,
             init_ppm_threshold=4.0,
@@ -383,7 +367,7 @@ class TestBestFeatureSeedingInLDA:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, _, _, _, _ = _rescore_lda(df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=3)
+        scores, _, _, _, _ = _rescore_linear(df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=3)
 
         assert np.isfinite(scores).all()
 
@@ -391,7 +375,7 @@ class TestBestFeatureSeedingInLDA:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, _, _, _, _ = _rescore_lda(df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=3)
+        scores, _, _, _, _ = _rescore_linear(df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=3)
 
         is_decoy = df["is_decoy"].values
         assert scores[~is_decoy].mean() > scores[is_decoy].mean()
@@ -400,7 +384,7 @@ class TestBestFeatureSeedingInLDA:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, importances, feat_names, _, _ = _rescore_lda(
+        scores, importances, feat_names, _, _ = _rescore_linear(
             df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=2
         )
 

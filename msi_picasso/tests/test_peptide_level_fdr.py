@@ -120,19 +120,3 @@ def test_asymmetric_multiplicity_is_warned_about(caplog):
         _peptide_level_qvalues(scores, is_decoy, peptides)
 
     assert "multiplicity" in caplog.text.lower()
-
-
-def test_estimate_mask_is_subset_to_the_representatives():
-    """Decoy-split (H-fdr-2b) must keep working through the rollup."""
-    peptides = np.array(["A", "A", "B", "C"])
-    is_decoy = np.array([False, False, True, True])
-    scores = np.array([3.0, 1.0, 2.0, 0.5])
-    # hold out the second decoy from estimation
-    mask = np.array([True, True, True, False])
-
-    q, is_rep = _peptide_level_qvalues(scores, is_decoy, peptides, estimate_mask=mask)
-
-    assert is_rep.sum() == 3
-    # a held-out decoy gets NaN by design (it is excluded from the estimate);
-    # every target representative must still carry a finite q
-    assert np.isfinite(q[is_rep & ~is_decoy]).all()
