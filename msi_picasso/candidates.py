@@ -1,9 +1,8 @@
-"""Targets and decoys (BENCH "Bench closed": the adopted candidate set).
+"""Targets and decoys.
 
 Targets: the LC-MS/MS peptides of the PSM file plus their LC-observed HyP forms ('<seq>+h<n>').
 Decoys: residue-substitution decoys of each target, chosen on sequence-only properties (D1C_RAW, or D1b), one
 decoy set per seed; K seeds per run. HyP decoys are the base decoy plus the same n O.
-Nothing here reads MALDI data, and no decoy is chosen with any MALDI evidence.
 """
 import hashlib
 

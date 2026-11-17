@@ -1,9 +1,7 @@
-"""The adopted score (BENCH "Bench closed"): five evidence terms, M1, per-ion competition, q-values, proteins.
+"""The adopted score: five evidence terms, M1, per-ion competition, q-values, proteins.
 
 Every term is read at the candidate's own query m/z from the evidence table Q (one row per query m/z, extract.py),
-so a decoy gets its evidence from the same code as a target. Nothing here reads `is_decoy` except the TDC counts,
-the per-ion competition (only targets remove, by design) and the decoy partner rule (a decoy pairs with its parent
-protein's targets, as a false target in that protein would).
+so a decoy gets its evidence from the same code as a target. 
 
 Q columns: mz (sorted), iso_r (r of the M and M+1 images), env0..env2 (M, M+1, M+2 envelope), p90 and isum (the
 M image's 90th percentile of non-zero pixels and its sum), mm1_r (r of the M-1 and M images), cen (signed

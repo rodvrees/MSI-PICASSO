@@ -1,4 +1,4 @@
-"""Figures for checking a run (cli --figures; RD 2026-11-17 kept these of the old debug set):
+"""Figures for checking a run (cli --figures):
   ids_vs_fdr.png        target peptides and proteins (picked) reported at each q threshold
   scores.png            target / decoy peptide score distributions and the PP plot (decoy vs target CDF)
   terms.png             target / decoy distribution of each of the five terms (all rows)
