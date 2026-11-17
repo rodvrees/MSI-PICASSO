@@ -1,5 +1,9 @@
 """Bench parity of the package (RD 2026-11-17: layer A exact, layer B explained).
 
+Valid at tag port-parity-exact (run it from a worktree of that tag): later commits fix three bench behaviours on
+purpose (exact target masses, exclusion of decoys whose parent is out of range, parent partners excluded by m/z),
+so the candidate set no longer equals the bench's.
+
 Layer A (method): the package's candidates and score, fed with the bench store's evidence (peaks.parquet columns and
 corr_protein), must reproduce the bench's real world rep 0 exactly: same rows, same terms, same IDs, same proteins.
 References: make_bench_ref.py (bench code, frozen package) -> /home/robbe/MALDI_MSI_score/port_ref/.

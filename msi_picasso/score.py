@@ -75,12 +75,13 @@ def partner_pairs(c, valid):
     tgt = base[~is_d].drop_duplicates(["feature_mz", "protein"])
     dec = base[is_d].drop_duplicates(["feature_mz", "protein"]).copy()
     dec["key"] = dec.protein.astype(str).str.removeprefix("DECOY_")
+    dec["parent_mz"] = dec.parent_peptide.map(c[~c.is_decoy].set_index("peptide").feature_mz)
     tp = tgt.rename(columns={"feature_mz": "partner_mz", "qi": "pqi", "protein": "key", "peptide": "partner_peptide"})[
         ["key", "partner_mz", "pqi", "partner_peptide"]]
     dp = dec.merge(tp, on="key")
-    # ponytail: as the bench, the parent is excluded by name after the (m/z, protein) de-duplication, so an isobaric
-    # sibling target of the parent (her2: 2 ions, 26 decoys) can stand in for the parent's own image; open question.
-    dp = dp[dp.partner_peptide != dp.parent_peptide]
+    # the parent's ion, not only the parent's name: an isobaric sibling target (I/L) carries the parent's image
+    # (2026-11-17, RD; the bench excluded by name only)
+    dp = dp[dp.partner_mz != dp.parent_mz]
     tt = tgt.merge(tgt.rename(columns={"feature_mz": "partner_mz", "qi": "pqi"})[["protein", "partner_mz", "pqi"]],
                    on="protein")
     cols = ["feature_mz", "protein", "qi", "partner_mz", "pqi"]

@@ -20,12 +20,6 @@ FLOOR_PPM = 10.0  # minimum decoy mass shift without decoy_min_shift_da
 EXCLUDE_PPM = 20.0  # parent-family exclusion window
 # decoy method -> (match keys in priority order, variants per target); the closest mass-defect residual breaks ties
 DECOYS = {"d1c_raw": (["arom", "pro", "acid", "basic"], 100), "d1b": (["arom"], 30)}
-# Residue masses at 5 decimals, summed from water in sequence order: the targets' masses as the bench had them (the
-# earlier package's Rust digest). They are up to 1.7e-4 Da off the exact masses (decoys use exact pyteomics masses).
-# ponytail: kept for bench parity; switch to pmass.fast_mass once RD decides (open question of the port).
-RESIDUE = dict(G=57.02146, A=71.03711, V=99.06841, L=113.08406, I=113.08406, P=97.05276, F=147.06841, W=186.07931,
-               M=131.04049, S=87.03203, T=101.04768, C=103.00919, Y=163.06333, H=137.05891, D=115.02694, E=129.04259,
-               N=114.04293, Q=128.05858, K=128.09496, R=156.10111)
 AVERAGINE = (("C", 0.04443), ("H", 0.06981), ("N", 0.01221), ("O", 0.01329), ("S", 0.00037))
 
 
@@ -60,7 +54,7 @@ def read_targets(psm_path, reader="fragpipe"):
         pep, df = pep[pep.q <= PEPTIDE_FDR], df[df.q <= PEPTIDE_FDR]  # HyP forms too: only from passing PSMs
     t = pd.DataFrame({"peptide": sorted(pep.sequence)})
     t["protein"] = t.peptide.map(pep.set_index("sequence").protein)
-    t["mass"] = [_mass5(s) for s in t.peptide]
+    t["mass"] = [pmass.fast_mass(s) for s in t.peptide]
     t["hyp_base"], t["mh_mz"] = None, t.mass + PROTON
     forms = set(zip(df.sequence[df.n_hyp > 0], df.n_hyp[df.n_hyp > 0]))
     hyp = []
@@ -70,13 +64,6 @@ def read_targets(psm_path, reader="fragpipe"):
         r["mass"], r["mh_mz"] = r.mass + k * O_MASS, r.mh_mz + k * O_MASS  # added after the proton, as the bench
         hyp.append(r)
     return pd.concat([t, *hyp], ignore_index=True)
-
-
-def _mass5(seq):
-    m = 18.010565
-    for a in seq:
-        m += RESIDUE[a]
-    return m
 
 
 def _accession(a):
@@ -157,7 +144,7 @@ def world(targets, seeds, method="d1c_raw", min_shift_da=None, mz_range=(0, np.i
     parts = [_in_range(pd.concat([t, d.assign(seed=s)], ignore_index=True), mz_range) for s, d in zip(seeds, ds)]
     c = pd.concat([parts[0][~parts[0].is_decoy]] + [p[p.is_decoy] for p in parts], ignore_index=True)
     c = c[~c.is_decoy | ~c.peptide.duplicated()].reset_index(drop=True)
-    c = c[~excluded_decoys(c)].reset_index(drop=True)
+    c = c[~excluded_decoys(c, targets.groupby("peptide").mh_mz.first())].reset_index(drop=True)
     c["is_decoy"] = c.is_decoy.astype(bool)
     return c
 
@@ -168,12 +155,11 @@ def _in_range(db, mz_range):
     return db.iloc[np.lexsort((np.arange(len(db)), db.mh_mz.to_numpy(), db.feature_mz.to_numpy()))]
 
 
-def excluded_decoys(c, ppm=EXCLUDE_PPM):
+def excluded_decoys(c, tmass, ppm=EXCLUDE_PPM):
     """Decoys within ppm of their parent's [M+H]+ + n x 1.00336 (n = 0, +-1, +-2) + k O (k = 0, +-1, +-2, +-3): there
-    they would read an ion the parent family owns (its isotopes, its HyP forms).
-    ponytail: as the bench, the parent mass comes from the targets in c, so a decoy whose parent lies outside the m/z
-    range is never excluded (311-512 decoys per dataset); open question for RD (fix: parent masses from all targets)."""
-    tmass = c[~c.is_decoy].groupby("peptide").mh_mz.first()
+    they would read an ion the parent family owns (its isotopes, its HyP forms). tmass: [M+H]+ of every target
+    (peptide index), also those outside the m/z range, whose isotopes or HyP forms may lie inside it (2026-11-17, RD;
+    the bench looked up only the targets in range)."""
     dm = c.mh_mz - c.parent_peptide.map(tmass)
     tol = ppm * 1e-6 * c.mh_mz
     hit = np.any([(dm - n * NEUTRON - k * O_MASS).abs() <= tol for n in (0, 1, -1, 2, -2) for k in (0, 1, -1, 2, -2, 3, -3)],
@@ -194,5 +180,6 @@ if __name__ == "__main__":  # self-checks
     assert abs(hd.loc["AGLPGEVGAK+h1", "mass"] - hd.loc["AGLPGEVGAK", "mass"] - O_MASS) < 1e-9
     c = pd.DataFrame({"peptide": ["T", "D1", "D2"], "is_decoy": [False, True, True], "parent_peptide": [None, "T", "T"],
                       "mh_mz": [1000.0, 1000.0 + NEUTRON + 1e-3, 1010.0]})
-    assert list(excluded_decoys(c)) == [False, True, False]
+    assert list(excluded_decoys(c, c[~c.is_decoy].set_index("peptide").mh_mz)) == [False, True, False]
+    assert list(excluded_decoys(c.iloc[1:], pd.Series({"T": 1000.0}))) == [True, False]  # parent out of range
     print("candidates ok")

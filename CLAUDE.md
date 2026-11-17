@@ -53,11 +53,12 @@ exactly the method the closed bench adopted (`bench/BENCH.md`, "Bench closed (20
    label. The envelope term uses averagine at the query m/z, never the candidate's formula.
 4. **Decoys are chosen without MALDI data.** No decoy may be picked, kept or dropped by evidence; the exclusion uses
    masses only.
-5. **Bench parity.** `scripts/check_bench_parity.py A` must stay exact (same rows, terms, IDs, proteins as the bench,
-   from the bench store's evidence). Do not change pandas operation order in `score.terms`, `partner_pairs`,
-   `peptide_table`, `protein_table`, the RNG call sequence in `candidates.decoys`, or the row order of
-   `candidates.world` without re-running it. Known deliberate copies of bench behaviour: target masses from 5-decimal
-   residue masses (`candidates.RESIDUE`), the 1.00728 proton in the decoy floor.
+5. **Bench parity.** At tag `port-parity-exact` the package reproduced the bench exactly on the bench's own evidence
+   (`scripts/check_bench_parity.py A`, run from a worktree of that tag). Three later fixes change the candidate set
+   on purpose: exact target masses (the bench summed 5-decimal residue masses), decoys of out-of-range parents also
+   excluded, a decoy's parent partner excluded by m/z (isobaric siblings). Any other change to the method needs a
+   reason in PROGRESS.md; the decoy RNG call sequence and the 1.00728 proton in the decoy floor are kept as the
+   bench had them.
 
 ## Layout
 
@@ -69,7 +70,7 @@ MSI-PICASSO/
 │   ├── score.py        terms, M1, per-ion competition, q-values, proteins, m/z offset
 │   ├── cli.py          config (DEFAULTS), run(), main()
 │   ├── figures.py      check figures (ids_vs_fdr, scores, terms, mz, proteins/, candidates/)
-│   └── tests/test_msi_picasso.py   module self-checks + layer-A parity
+│   └── tests/test_msi_picasso.py   module self-checks
 └── scripts/
     ├── check_bench_parity.py  A: exact port check; B: full run vs bench, per term and per ID
     └── make_bench_ref.py      reference dumps from the bench code (bench interpreter, frozen package)
@@ -89,5 +90,6 @@ The installed Rust extension `ms1rescore_rs` is only for that frozen code.
 
 - Interpreter `/home/robbe/.pyenv/versions/MSIscore/bin/python`; editable install of this folder.
 - Run from outside `/home/robbe/MALDI_MSI_score`: its `psm_utils/` checkout shadows the installed psm_utils.
-- `pytest` (from `/tmp` or elsewhere): self-checks, then layer-A parity (about 3 min) when `port_ref/` exists.
+- `pytest` (from `/tmp` or elsewhere): the self-checks. Parity: `check_bench_parity.py` at tag `port-parity-exact`
+  (references in `/home/robbe/MALDI_MSI_score/port_ref/`).
 - A full run needs about 2 minutes and 30-60 GB RAM per dataset (alphatims holds all events in memory).
