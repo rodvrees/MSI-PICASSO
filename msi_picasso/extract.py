@@ -1,4 +1,4 @@
-"""Evidence at each query m/z, from one alphatims load of a Bruker timsTOF MALDI .d (BENCH "Bench closed").
+"""Evidence at each query m/z, from one alphatims load of a Bruker timsTOF MALDI .d.
 
 One frame = one pixel. Pass 1 sums, per frame, the events (all mobility scans) in +-ppm windows at M-1, M, M+1 and
 M+2 of every query; pass 2 builds the M m/z profile (1 ppm bins, +-25 ppm) over the query's own top-decile pixels.

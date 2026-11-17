@@ -1,4 +1,4 @@
-"""Bench parity of the package (RD 2026-11-17: layer A exact, layer B explained).
+"""Bench parity of the package.
 
 Valid at tag port-parity-exact (run it from a worktree of that tag): later commits fix three bench behaviours on
 purpose (exact target masses, exclusion of decoys whose parent is out of range, parent partners excluded by m/z),

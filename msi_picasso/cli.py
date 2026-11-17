@@ -1,4 +1,4 @@
-"""picasso -c config.toml: the adopted MSI-PICASSO method end to end (BENCH "Bench closed").
+"""picasso -c config.toml: the adopted MSI-PICASSO method end to end.
 
 Steps: targets (PSM file) -> decoys (K seeds) -> evidence at every query m/z (.d) -> m/z offset -> score ->
 per-ion competition -> peptide q -> proteins -> output. Each step's wall time and the peak RSS after it go to run.json.
