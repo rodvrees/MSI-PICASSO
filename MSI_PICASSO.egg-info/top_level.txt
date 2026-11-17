@@ -1,2 +1,0 @@
-msi-picasso-rs
-msi_picasso

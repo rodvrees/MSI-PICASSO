@@ -1,9 +1,9 @@
 """Pixelated Dash GUI for MSI-PICASSO (palette derived from the logo).
 
-A thin wrapper: it writes a TOML config, launches the ``picasso`` CLI as a
-subprocess, tails its log, and renders the on-disk results (TSV tables +
-interactive Plotly plots + an on-demand ion-image viewer). It never
-re-implements pipeline logic.
+A thin wrapper: it writes a TOML config (keys = ``cli.DEFAULTS``), launches the
+``picasso`` CLI as a subprocess, tails its log, and renders the on-disk results
+(run.json counts, peptides.tsv / proteins.tsv, Plotly plots, the CLI's figures/).
+It never re-implements pipeline logic, so a GUI run is a CLI run.
 
 Run:  ``picasso-gui``            (browser at http://127.0.0.1:8050)
       ``picasso-gui --desktop``  (native window, needs the ``desktop`` extra)
@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import glob
 import json
 import os
 import subprocess
@@ -25,16 +24,15 @@ import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx, ALL, no_update
 
+from msi_picasso.cli import DEFAULTS
+
 # --- Logo-derived palette (must match assets/picasso.css) ---
 NAVY, PURPLE, BLUE, CYAN = "#001050", "#3d0f8f", "#0060c0", "#00a0b0"
 GREEN, YELLOW, ORANGE, RED = "#4fb020", "#f0b000", "#f08000", "#d82814"
 PAPER, INK = "#f5f7fb", "#001050"
 PIXEL_FONT = "VT323, PressStart2P, monospace"
-# Sequential ion ramp: white -> cyan -> blue -> navy (monotonic lightness, blue-family).
-ION_COLORSCALE = [[0.0, "#ffffff"], [0.33, CYAN], [0.66, BLUE], [1.0, NAVY]]
 
 _ASSETS = os.path.join(os.path.dirname(__file__), "assets")
-_PKG_DATA = os.path.join(os.path.dirname(__file__), "package_data")
 _CONFIGS_DIR = Path(__file__).resolve().parents[2] / "configs"
 _CONSOLE_LOG = "gui_console.log"
 
@@ -42,85 +40,56 @@ _CONSOLE_LOG = "gui_console.log"
 _JOB: dict = {"proc": None, "outdir": None, "cancelled": False}
 
 # --------------------------------------------------------------------------
-# Config schema → field metadata (data-driven form; no hand-listing of types)
+# Config: the form is cli.DEFAULTS, key for key. A blank field = the CLI default.
 # --------------------------------------------------------------------------
-def _load_schema_props() -> dict:
-    try:
-        s = json.load(open(os.path.join(_PKG_DATA, "config_schema.json")))
-        return s["properties"]["MSI-PICASSO"]["properties"]
-    except Exception:
-        return {}
+_PATH_KEYS = ("maldi_d", "lcms_peptides", "output_dir")  # own widgets with a Browse button
+_DECOY_METHODS = ("d1c_raw", "d1b")
+_STANDARD_KEYS = ("psm_utils_reader", "tic_quantile", "tic_normalize", "mz_offset_ppm",
+                  "decoy_min_shift_da", "gt_peptides", "figures")
+_ADVANCED_KEYS = ("decoy_seeds", "extraction_ppm", "mz_range", "tissue_mask", "threads")
+_CFG_KEYS = _STANDARD_KEYS + _ADVANCED_KEYS
+# A new CLI key must get a field here, or a GUI run could not reproduce a CLI run.
+assert set(_PATH_KEYS + ("decoy_method",) + _CFG_KEYS) == set(DEFAULTS), "GUI form out of sync with cli.DEFAULTS"
 
 
-_SCHEMA = _load_schema_props()
-
-# File paths / core choices handled by their own widgets in "Essentials".
-_ESSENTIAL_KEYS = ("maldi_d", "lcms_peptides", "output_dir", "model", "decoy_method")
-
-# Common knobs shown as plain fields in "Settings".
-_STANDARD_KEYS = (
-    "maldi_query_raw", "single_round", "lcms_id_format", "psm_utils_reader",
-    "im2deep_calibration", "ppm_tolerance", "matching_ppm", "features_preset",
-    "use_protein_level_feats", "use_spatial_ranker_features", "region_coloc",
-    "mob_coloc", "match_ccs", "verbose",
-)
-
-# Revealed by the "Advanced settings" disclosure.
-_ADVANCED_KEYS = (
-    "substitution_n_residues", "substitution_mass_shift_min_da",
-    "rbf_svm_c", "rbf_svm_gamma", "svm_c", "n_interaction_features",
-    "init_fdr", "train_fdr", "max_iter", "r2_seed_percentile", "min_seed_positives",
-    "init_ppm_threshold", "winner_percentile", "lcms_prior_weight", "spatial_prior_weight",
-    "ccs_window_multiplier", "region_coloc_k", "coloc_tic_quantile",
-    "coloc_common_mode", "coloc_tic_normalize", "drop_zero_signal", "mob_window_multiplier",
-)
-
-_FORM_KEYS = set(_ESSENTIAL_KEYS) | set(_STANDARD_KEYS) | set(_ADVANCED_KEYS)
-_N_EXTRA_ROWS = 8  # ponytail: fixed spare key/value slots; TOML upload covers bulk.
+def _show(v):
+    """Config value -> form text (TOML literal for numbers / lists, bare text for strings)."""
+    if v is None or isinstance(v, (str, bool)):
+        return v
+    return json.dumps(v)
 
 
-def _scalar_keys() -> list[str]:
-    """Top-level keys that render as a single field (skip nested dicts / list types)."""
-    out = []
-    for k, meta in _SCHEMA.items():
-        if k in ("config_file", "im2deep", "maldi_extraction"):
-            continue
-        t = meta.get("type", [])
-        t = [t] if isinstance(t, str) else t
-        if "object" in t or "array" in t:
-            continue
-        out.append(k)
-    return sorted(out)
+def _parse(s):
+    """Form text -> config value: a TOML literal if it is one (0.5, 0, [0, 1], true), else the text (paths, auto)."""
+    if isinstance(s, str):
+        s = s.strip()
+        try:
+            return tomllib.loads(f"v = {s}")["v"]
+        except tomllib.TOMLDecodeError:
+            return s
+    return s
 
 
-def _field_kind(key: str) -> tuple[str, list | None]:
-    meta = _SCHEMA.get(key, {})
-    enum = [e for e in (meta.get("enum") or []) if e is not None]
-    t = meta.get("type", ["string"])
-    t = [t] if isinstance(t, str) else t
-    if enum:
-        return "enum", enum
-    if "boolean" in t:
-        return "bool", None
-    if "integer" in t or "number" in t:
-        return "number", None
-    return "string", None
+def config_from_toml(text: str) -> tuple[dict, list[str]]:
+    """[MSI-PICASSO] table -> (known keys with underscore spelling, ignored unknown keys)."""
+    sec = {k.replace("-", "_"): v for k, v in tomllib.loads(text).get("MSI-PICASSO", {}).items()}
+    return {k: v for k, v in sec.items() if k in DEFAULTS}, sorted(set(sec) - set(DEFAULTS))
+
+
+def section_from_form(values: dict) -> dict:
+    """Form values (key -> text / bool / None) -> the [MSI-PICASSO] table; blank fields are left out."""
+    return {k: _parse(v) for k, v in values.items() if v not in (None, "")}
 
 
 def _render_field(key: str):
-    kind, enum = _field_kind(key)
-    label = html.Label(key.replace("_", " "))
     fid = {"role": "cfg", "key": key}
-    if kind == "enum":
-        ctrl = dcc.Dropdown(id=fid, options=[{"label": e, "value": e} for e in enum], clearable=True)
-    elif kind == "bool":
+    if isinstance(DEFAULTS[key], bool):
         ctrl = dcc.Dropdown(id=fid, options=[{"label": "true", "value": True},
-                                             {"label": "false", "value": False}], clearable=True)
-    elif kind == "number":
-        ctrl = dcc.Input(id=fid, type="number", debounce=True)
+                                             {"label": "false", "value": False}],
+                            placeholder=f"default: {str(DEFAULTS[key]).lower()}", clearable=True)
     else:
-        ctrl = dcc.Input(id=fid, type="text", debounce=True)
-    return html.Div([label, ctrl])
+        ctrl = dcc.Input(id=fid, type="text", debounce=True, placeholder=f"default: {_show(DEFAULTS[key])}")
+    return html.Div([html.Label(key.replace("_", " ")), ctrl])
 
 
 # --------------------------------------------------------------------------
@@ -153,76 +122,33 @@ def _read_tsv(path: Path) -> pd.DataFrame | None:
         return None
 
 
-def _score_r2_col(df: pd.DataFrame) -> str | None:
-    cols = [c for c in df.columns if c.endswith("_score_r2")]
-    return cols[0] if cols else None
-
-
-def _cfg_get(cfg: dict, key: str, default=None):
-    """Read a config value tolerant of hyphen/underscore key spelling."""
-    return cfg.get(key, cfg.get(key.replace("_", "-"), default))
-
-
-def _resolved_maldi_d(outdir: Path) -> str | None:
-    p = outdir / ".full_config.json"
-    if p.exists():
-        try:
-            return _cfg_get(json.loads(p.read_text())["MSI-PICASSO"], "maldi_d")
-        except Exception:
-            pass
-    p = outdir / "gui_config.toml"
-    if p.exists():
-        try:
-            return _cfg_get(tomllib.loads(p.read_text())["MSI-PICASSO"], "maldi_d")
-        except Exception:
-            pass
-    return None
-
-
 # --------------------------------------------------------------------------
-# Figure builders (from ms1rescore_matches.tsv — no pipeline re-run)
+# Figure builders (from peptides.tsv / proteins.tsv — no pipeline re-run)
 # --------------------------------------------------------------------------
-def build_ids_vs_fdr(matches: pd.DataFrame) -> go.Figure:
+def build_ids_vs_fdr(peptides: pd.DataFrame, proteins: pd.DataFrame | None) -> go.Figure:
     fig = go.Figure()
-    fig.update_layout(template=TEMPLATE, title="IDs vs FDR",
-                      xaxis_title="reweighted q-value", yaxis_title="cumulative target IDs")
-    if "is_tdc_winner" not in matches or "reweighted_q_value" not in matches:
-        return fig
-    w = matches[matches["is_tdc_winner"] & ~matches["is_decoy"]].copy()
-    w = w.dropna(subset=["reweighted_q_value"]).sort_values("reweighted_q_value")
-    if w.empty:
-        return fig
-    y = np.arange(1, len(w) + 1)
-    fig.add_trace(go.Scatter(x=w["reweighted_q_value"], y=y, mode="lines",
-                             line=dict(color=BLUE, width=3), name="target IDs",
-                             hovertemplate="q=%{x:.4f}<br>IDs=%{y}<extra></extra>"))
+    fig.update_layout(template=TEMPLATE, title="IDs vs FDR", xaxis_title="q-value", yaxis_title="reported targets")
+    for df, col, name, color in ((peptides, "q", "peptides", BLUE), (proteins, "q_picked", "proteins (picked)", GREEN)):
+        if df is None or col not in df:
+            continue
+        q = np.sort(df.loc[~df["is_decoy"], col].dropna().to_numpy())
+        fig.add_trace(go.Scatter(x=q, y=np.arange(1, len(q) + 1), mode="lines", line=dict(color=color, width=3),
+                                 line_shape="hv", name=name, hovertemplate="q=%{x:.4f}<br>IDs=%{y}<extra></extra>"))
     fig.add_vline(x=0.01, line=dict(color=ORANGE, width=2, dash="dot"),
                   annotation_text="1% FDR", annotation_font_color=ORANGE)
-    fig.update_xaxes(range=[0, min(0.1, float(w["reweighted_q_value"].max()) + 1e-3)])
+    fig.update_xaxes(range=[0, 0.1])
     return fig
 
 
-def build_score_dist(matches: pd.DataFrame) -> go.Figure:
+def build_score_dist(peptides: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
-    col = _score_r2_col(matches)
-    fig.update_layout(template=TEMPLATE, title="Score distribution (round 2)",
-                      xaxis_title=col or "score", yaxis_title="candidates", barmode="overlay")
-    if col is None:
-        return fig
-    tgt = matches.loc[~matches["is_decoy"], col].dropna()
-    dec = matches.loc[matches["is_decoy"], col].dropna()
+    fig.update_layout(template=TEMPLATE, title="Peptide score distribution",
+                      xaxis_title="score s (best row per peptide)", yaxis_title="peptides", barmode="overlay")
     # blue=target, orange=decoy — CVD-safe pair from the logo; legend = 2nd encoding.
-    fig.add_trace(go.Histogram(x=tgt, name="target", marker_color=BLUE, opacity=0.7, nbinsx=60))
-    fig.add_trace(go.Histogram(x=dec, name="decoy", marker_color=ORANGE, opacity=0.7, nbinsx=60))
-    return fig
-
-
-def build_ion_image(img: np.ndarray, mz: float) -> go.Figure:
-    fig = go.Figure(go.Heatmap(z=img, colorscale=ION_COLORSCALE, colorbar=dict(outlinecolor=NAVY, outlinewidth=2)))
-    fig.update_layout(template=TEMPLATE, title=f"Ion image  m/z {mz:.4f}",
-                      yaxis=dict(scaleanchor="x", autorange="reversed"))
-    fig.update_xaxes(showgrid=False, visible=False)
-    fig.update_yaxes(showgrid=False, visible=False)
+    for dec, name, color in ((False, "target", BLUE), (True, "decoy", ORANGE)):
+        x = peptides.loc[peptides["is_decoy"] == dec, "s"].dropna()
+        fig.add_trace(go.Histogram(x=x, name=name, marker_color=color, opacity=0.7, nbinsx=80,
+                                   histnorm="probability density"))
     return fig
 
 
@@ -265,19 +191,6 @@ def _header():
     ])
 
 
-def _extra_rows():
-    opts = [{"label": k, "value": k} for k in _scalar_keys()]
-    rows = []
-    for i in range(_N_EXTRA_ROWS):
-        rows.append(html.Div(className="row", style={"marginBottom": "6px"}, children=[
-            html.Div(className="col", children=dcc.Dropdown(
-                id={"role": "extra-key", "idx": i}, options=opts, placeholder="parameter…", clearable=True)),
-            html.Div(className="col", children=dcc.Input(
-                id={"role": "extra-val", "idx": i}, type="text", placeholder="value", style={"width": "100%"})),
-        ]))
-    return rows
-
-
 def _tab_configure():
     return html.Div(className="content", children=[
         html.Div(className="card", children=[
@@ -296,16 +209,9 @@ def _tab_configure():
             _path_field("maldi_d", "MALDI .d directory"),
             _path_field("lcms_peptides", "LC-MS/MS PSM table"),
             _path_field("output_dir", "Output directory"),
-            html.Div(className="row", children=[
-                html.Div(className="col", children=_labeled("Model", dcc.Dropdown(
-                    id="in-model", clearable=False,
-                    options=[{"label": m, "value": m} for m in ("lda", "qda", "svm", "rbf_svm", "gbt")]))),
-                html.Div(className="col", children=_labeled("Decoy method", dcc.Dropdown(
-                    id="in-decoy_method", clearable=False,
-                    options=[{"label": m, "value": m} for m in
-                             ("substitution", "shuffle", "mz_shift", "mz_shuffle",
-                              "entrapment", "balanced_shuffle", "paired_shuffle")]))),
-            ]),
+            _labeled("Decoy method", dcc.Dropdown(
+                id="in-decoy_method", options=[{"label": m, "value": m} for m in _DECOY_METHODS],
+                placeholder=f"default: {DEFAULTS['decoy_method']}", clearable=True)),
         ]),
         html.Div(className="card", children=[
             html.H2("3 · Settings"),
@@ -315,14 +221,8 @@ def _tab_configure():
                 html.Div(className="details-body field-grid",
                          children=[_render_field(k) for k in _ADVANCED_KEYS]),
             ]),
-            html.Details([
-                html.Summary("More parameters"),
-                html.Div(className="details-body", children=[
-                    html.P("Set any remaining parameter by name — no TOML needed. Values are parsed "
-                           "as numbers / true / false where possible.", className="hint"),
-                    *_extra_rows(),
-                ]),
-            ]),
+            html.P("Blank = the CLI default (shown greyed). Numbers, lists ([0, 1]) and true/false are "
+                   "read as TOML; anything else as text.", className="hint"),
         ]),
         html.Div(className="card", children=[
             html.H2("4 · Run"),
@@ -388,18 +288,27 @@ app.layout = make_layout()
 # --------------------------------------------------------------------------
 # Preset / upload → loaded-config store
 # --------------------------------------------------------------------------
+def _load(text: str, what: str):
+    try:
+        cfg, unknown = config_from_toml(text)
+    except Exception as exc:
+        return no_update, f"Could not read TOML: {exc}"
+    msg = f"{what} loaded — fields populated."
+    if unknown:
+        msg += f" Ignored keys the CLI does not know: {', '.join(unknown)}."
+    return cfg, msg
+
+
 @app.callback(
     Output("loaded-config", "data", allow_duplicate=True),
+    Output("run-msg", "children", allow_duplicate=True),
     Input("preset", "value"),
     prevent_initial_call=True,
 )
 def preset_to_store(path):
     if not path:
-        return no_update
-    try:
-        return tomllib.loads(Path(path).read_text()).get("MSI-PICASSO", {})
-    except Exception:
-        return no_update
+        return no_update, no_update
+    return _load(Path(path).read_text(), Path(path).name)
 
 
 @app.callback(
@@ -411,39 +320,21 @@ def preset_to_store(path):
 def upload_to_store(contents):
     if not contents:
         return no_update, no_update
-    try:
-        _, b64 = contents.split(",", 1)
-        text = base64.b64decode(b64).decode("utf-8")
-        cfg = tomllib.loads(text).get("MSI-PICASSO", {})
-        return cfg, "Config uploaded — fields populated."
-    except Exception as exc:
-        return no_update, f"Could not read TOML: {exc}"
+    return _load(base64.b64decode(contents.split(",", 1)[1]).decode("utf-8"), "Config")
 
 
 @app.callback(
     Output("in-maldi_d", "value"), Output("in-lcms_peptides", "value"),
-    Output("in-output_dir", "value"), Output("in-model", "value"),
-    Output("in-decoy_method", "value"),
+    Output("in-output_dir", "value"), Output("in-decoy_method", "value"),
     Output({"role": "cfg", "key": ALL}, "value"),
-    Output({"role": "extra-key", "idx": ALL}, "value"),
-    Output({"role": "extra-val", "idx": ALL}, "value"),
     Input("loaded-config", "data"),
     State({"role": "cfg", "key": ALL}, "id"),
     prevent_initial_call=True,
 )
 def populate_fields(cfg, cfg_ids):
     cfg = cfg or {}
-    ess = [_cfg_get(cfg, k) for k in _ESSENTIAL_KEYS]
-    # standard + advanced fields, in the DOM order Dash gives us
-    cfg_vals = [_cfg_get(cfg, cid["key"]) for cid in cfg_ids]
-    # leftover scalar keys → the "More parameters" rows
-    leftover = [k for k in _scalar_keys()
-                if k not in _FORM_KEYS and _cfg_get(cfg, k) is not None]
-    ek = [None] * _N_EXTRA_ROWS
-    ev = [None] * _N_EXTRA_ROWS
-    for i, k in enumerate(leftover[:_N_EXTRA_ROWS]):
-        ek[i], ev[i] = k, str(_cfg_get(cfg, k))
-    return (*ess, cfg_vals, ek, ev)
+    return (*(cfg.get(k) for k in _PATH_KEYS + ("decoy_method",)),
+            [_show(cfg.get(cid["key"])) for cid in cfg_ids])
 
 
 # --------------------------------------------------------------------------
@@ -545,76 +436,48 @@ def browser_action(entry_clicks, choose, cancel, cwd, entries, target):
 # --------------------------------------------------------------------------
 # Run
 # --------------------------------------------------------------------------
-def _coerce(val: str):
-    """Best-effort parse of a free-text extra value into bool/number/str."""
-    s = val.strip()
-    if s.lower() in ("true", "false"):
-        return s.lower() == "true"
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        return s
+def launch(section: dict) -> subprocess.Popen:
+    """Write <output_dir>/gui_config.toml and start `picasso -c` on it; console -> gui_console.log."""
+    import tomli_w
+    out = Path(section["output_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    cfg_path = out / "gui_config.toml"
+    cfg_path.write_text(tomli_w.dumps({"MSI-PICASSO": section}))
+    console = open(out / _CONSOLE_LOG, "w")
+    # Launch via the installed `picasso` console script, NOT `python -m msi_picasso.cli`:
+    # `-m` prepends the cwd to sys.path, so a cwd holding a psm_utils/ checkout would shadow
+    # the installed package. Console scripts don't add cwd; cwd=out is a neutral dir as a further guard.
+    picasso_exe = Path(sys.executable).with_name("picasso")
+    cmd = ([str(picasso_exe), "-c", str(cfg_path)] if picasso_exe.exists()
+           else [sys.executable, "-m", "msi_picasso.cli", "-c", str(cfg_path)])
+    env = dict(os.environ, PYTHONUNBUFFERED="1")  # the CLI logs with print; unbuffered = a live log
+    return subprocess.Popen(cmd, stdout=console, stderr=subprocess.STDOUT, cwd=str(out), env=env)
 
 
 @app.callback(
     Output("run-msg", "children"), Output("run-btn", "disabled", allow_duplicate=True),
     Output("results-dir", "value", allow_duplicate=True),
     Input("run-btn", "n_clicks"),
-    State("loaded-config", "data"),
     State("in-maldi_d", "value"), State("in-lcms_peptides", "value"),
-    State("in-output_dir", "value"), State("in-model", "value"), State("in-decoy_method", "value"),
+    State("in-output_dir", "value"), State("in-decoy_method", "value"),
     State({"role": "cfg", "key": ALL}, "value"), State({"role": "cfg", "key": ALL}, "id"),
-    State({"role": "extra-key", "idx": ALL}, "value"), State({"role": "extra-val", "idx": ALL}, "value"),
     prevent_initial_call=True,
 )
-def run_picasso(n, base_cfg, maldi_d, lcms, outdir, model, decoy, cfg_vals, cfg_ids, ekeys, evals):
+def run_picasso(n, maldi_d, lcms, outdir, decoy, cfg_vals, cfg_ids):
     if _JOB["proc"] is not None and _JOB["proc"].poll() is None:
         return "A run is already in progress.", True, no_update
-    if not outdir:
-        return "Set an output directory first.", False, no_update
-
-    # Base config = whatever preset/upload provided (long-tail keys + nested tables).
-    section = dict(base_cfg or {})
-
-    def put(key, val):
-        if val is None or val == "":
-            return
-        section.pop(key.replace("-", "_"), None)
-        section.pop(key.replace("_", "-"), None)
-        section[key.replace("_", "-")] = val  # write hyphen form (matches presets)
-
-    for k, v in zip(_ESSENTIAL_KEYS, (maldi_d, lcms, outdir, model, decoy)):
-        put(k, v)
-    for cid, v in zip(cfg_ids, cfg_vals):
-        put(cid["key"], v)
-    for k, v in zip(ekeys or [], evals or []):
-        if k and v not in (None, ""):
-            put(k, _coerce(v))
-
-    import tomli_w
-    out = Path(outdir)
-    out.mkdir(parents=True, exist_ok=True)
-    cfg_path = out / "gui_config.toml"
+    values = dict(zip(_PATH_KEYS + ("decoy_method",), (maldi_d, lcms, outdir, decoy)))
+    values.update({cid["key"]: v for cid, v in zip(cfg_ids, cfg_vals)})
+    section = section_from_form(values)
+    missing = [k for k in _PATH_KEYS if k not in section]
+    if missing:
+        return f"Set {', '.join(missing)} first.", False, no_update
     try:
-        cfg_path.write_text(tomli_w.dumps({"MSI-PICASSO": section}))
+        proc = launch(section)
     except Exception as exc:
-        return f"Could not write config: {exc}", False, no_update
-
-    console = open(out / _CONSOLE_LOG, "w")
-    # Launch via the installed `picasso` console script, NOT `python -m msi_picasso.cli`:
-    # `-m` prepends the cwd to sys.path, so running from the repo root lets the vendored
-    # source dirs (psm_utils/, ms2pip/, deeplc/ …) shadow the installed packages and break
-    # imports. Console scripts don't add cwd; cwd=out is a neutral dir as a further guard.
-    picasso_exe = Path(sys.executable).with_name("picasso")
-    cmd = ([str(picasso_exe), "-c", str(cfg_path)] if picasso_exe.exists()
-           else [sys.executable, "-m", "msi_picasso.cli", "-c", str(cfg_path)])
-    proc = subprocess.Popen(cmd, stdout=console, stderr=subprocess.STDOUT, cwd=str(out))
-    _JOB.update(proc=proc, outdir=str(out), cancelled=False)
-    return f"Launched (pid {proc.pid}). Watch the Live Log tab.", True, str(out)
+        return f"Could not start the run: {exc}", False, no_update
+    _JOB.update(proc=proc, outdir=section["output_dir"], cancelled=False)
+    return f"Launched (pid {proc.pid}). Watch the Live Log tab.", True, section["output_dir"]
 
 
 @app.callback(
@@ -648,7 +511,9 @@ def poll_log(_n):
     log_path = Path(outdir) / _CONSOLE_LOG
     text = ""
     if log_path.exists():
-        text = "\n".join(log_path.read_text(errors="replace").splitlines()[-400:]) or "(waiting for output…)"
+        # split on \n only and keep the text after the last \r: a tqdm bar shows as its latest state, one line
+        lines = [ln.rsplit("\r", 1)[-1] for ln in log_path.read_text(errors="replace").split("\n")]
+        text = "\n".join(lines[-400:]) or "(waiting for output…)"
     rc = proc.poll()
     if rc is None:  # running → cancel enabled, run disabled
         return "running…", "log-status running", text, True, False
@@ -682,19 +547,19 @@ def _table(df: pd.DataFrame | None):
                       "color": "#ffffff", "border": f"2px solid {NAVY}"})
 
 
-def _gallery(debug_dir: Path):
-    if not debug_dir.is_dir():
-        return html.Div()
-    pngs = sorted(glob.glob(str(debug_dir / "*.png")))
+def _gallery(fig_dir: Path):
+    """figures/ written by the CLI (figures = true): check plots, protein and per-candidate ion images."""
+    pngs = sorted(fig_dir.rglob("*.png")) if fig_dir.is_dir() else []
     if not pngs:
         return html.Div()
-    figs = []
-    for p in pngs:
-        b64 = base64.b64encode(Path(p).read_bytes()).decode()
-        figs.append(html.Figure([html.Img(src=f"data:image/png;base64,{b64}"),
-                                 html.Figcaption(Path(p).name)]))
-    return html.Div(className="card", children=[html.H2("Debug figures"),
-                                                html.Div(figs, className="gallery")])
+    # ponytail: base64-inlined (~10 MB for a full figures/ dir); serve via a Flask route if that gets slow.
+    figs = [html.Figure([html.Img(src="data:image/png;base64," + base64.b64encode(p.read_bytes()).decode()),
+                         html.Figcaption(str(p.relative_to(fig_dir)))]) for p in pngs]
+    return html.Div(className="card", children=[html.H2("Figures"), html.Div(figs, className="gallery")])
+
+
+def _counts(d: dict | None) -> str:
+    return " / ".join(str(v) for v in d.values()) if d else "–"
 
 
 @app.callback(
@@ -706,58 +571,30 @@ def load_results(_n, outdir):
     if not outdir or not Path(outdir).is_dir():
         return html.P("Set a valid results directory.", className="hint"), None
     out = Path(outdir)
-    matches = _read_tsv(out / "ms1rescore_matches.tsv")
-    peptides = _read_tsv(out / "ms1rescore_peptides.tsv")
-    if matches is None:
-        return html.P("No ms1rescore_matches.tsv found here.", className="hint"), None
-
-    n_pep = 0 if peptides is None else len(peptides)
-    winners = matches[matches.get("is_tdc_winner", False) & ~matches["is_decoy"]] \
-        if "is_tdc_winner" in matches else matches[~matches["is_decoy"]]
-    n_1pct = int((winners.get("reweighted_q_value", pd.Series(dtype=float)) <= 0.01).sum())
+    peptides = _read_tsv(out / "peptides.tsv")
+    proteins = _read_tsv(out / "proteins.tsv")
+    if peptides is None or not (out / "run.json").exists():
+        return html.P("No peptides.tsv / run.json here (run not finished?).", className="hint"), None
+    info = json.loads((out / "run.json").read_text())
+    off = info.get("mz_offset", {}).get("used")
     summary = html.Div(className="stat-row", children=[
-        _stat(len(matches), "candidates"), _stat(int((~matches["is_decoy"]).sum()), "targets"),
-        _stat(n_1pct, "target winners ≤1% FDR"), _stat(n_pep, "peptide winners (file)")])
-
-    plots = html.Div(className="card", children=[html.H2("Plots"), html.Div(className="row", children=[
-        html.Div(className="col", children=dcc.Graph(figure=build_ids_vs_fdr(matches))),
-        html.Div(className="col", children=dcc.Graph(figure=build_score_dist(matches))),
-    ])])
-
-    wsort = winners.dropna(subset=["reweighted_q_value"]).sort_values("reweighted_q_value") \
-        if "reweighted_q_value" in winners else winners
-    mzs = wsort["feature_mz"].dropna().unique()[:200] if "feature_mz" in wsort else []
-    ion_card = html.Div(className="card", children=[
-        html.H2("Ion-image viewer"),
-        html.P("Extracts the ion image on demand from the raw .d (needs alphatims/imzy).", className="hint"),
-        dcc.Dropdown(id="ion-mz", options=[{"label": f"{mz:.4f}", "value": float(mz)} for mz in mzs],
-                     placeholder="Select an identified m/z…"),
-        dcc.Loading(dcc.Graph(id="ion-graph", figure=_empty_fig("Select an m/z above."))),
+        _stat(_counts(info.get("ids")), "peptides at 1 / 5 / 10% FDR"),
+        _stat(_counts(info.get("proteins_picked")), "proteins (picked) at 1 / 5 / 10%"),
+        *([_stat(_counts(info["gt"]), "GT peptides at 1 / 5 / 10%")] if info.get("gt") else []),
+        _stat(f"{info.get('n_targets', '–')} / {info.get('n_decoys', '–')}", "target / decoy peptides"),
+        _stat("–" if off is None else f"{off:+.2f} ppm", "m/z offset used"),
     ])
 
+    plots = html.Div(className="card", children=[html.H2("Plots"), html.Div(className="row", children=[
+        html.Div(className="col", children=dcc.Graph(figure=build_ids_vs_fdr(peptides, proteins))),
+        html.Div(className="col", children=dcc.Graph(figure=build_score_dist(peptides))),
+    ])])
+    tp = peptides[~peptides["is_decoy"]].sort_values("q")
     tables = html.Div(className="card", children=[html.H2("Tables"),
-        html.H3("Peptide winners"), _table(peptides),
-        html.H3("All candidates (matches)"), _table(matches)])
-
-    return summary, html.Div([plots, ion_card, tables, _gallery(out / "debug")])
-
-
-@app.callback(
-    Output("ion-graph", "figure"), Input("ion-mz", "value"), State("results-dir", "value"),
-    prevent_initial_call=True,
-)
-def show_ion_image(mz, outdir):
-    if mz is None:
-        return _empty_fig("Select an m/z above.")
-    maldi_d = _resolved_maldi_d(Path(outdir)) if outdir else None
-    if not maldi_d or not Path(maldi_d).exists():
-        return _empty_fig("Raw .d path not found for this run.")
-    try:
-        from msi_picasso.maldi_query import query_raw_maldi
-        _, images, _, _, _ = query_raw_maldi(maldi_d, np.array([float(mz)]), extraction_ppm=25.0)
-        return build_ion_image(np.asarray(images)[0], float(mz))
-    except Exception as exc:
-        return _empty_fig(f"Could not extract ion image: {exc}")
+        html.H3("Target peptides (by q)"), _table(tp),
+        html.H3("Proteins (by picked q)"),
+        _table(None if proteins is None else proteins[~proteins["is_decoy"]].sort_values("q_picked"))])
+    return summary, html.Div([plots, tables, _gallery(out / "figures")])
 
 
 # --------------------------------------------------------------------------
