@@ -30,6 +30,8 @@ exactly the method the closed bench adopted (`bench/BENCH.md`, "Bench closed (20
    Tissue mask: frame TIC >= its `tic_quantile` quantile.
 4. **m/z offset** (`score.mz_offset`): label-free global offset for the flank term (mode of the signed centroid over
    the top 1% rows by the other four terms; used only if z > 6 and |o| >= 1 ppm).
+   It is reliable only when the top 1% rows are mostly true matches (many IDs). Check `mz_offset` in `run.json`: with
+   few IDs or z near the cut, set `mz_offset_ppm = 0` unless there is independent evidence of an offset (her2 is pinned).
 5. **Score** (`score.terms`, `score.m1`): five terms, fixed z-sum with signs (+, +, -, -, -):
    coloc (same-protein Pearson r of M images, weighted by sqrt(p90 p90') x the partner's evidence rank, partners
    within 20 ppm dropped, shrunk to the median with weight 4), iso (r of M and M+1 images), kl (envelope vs averagine
