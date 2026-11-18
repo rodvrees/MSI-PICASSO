@@ -1,0 +1,160 @@
+/* MSI-PICASSO GUI: pixel theme, palette from the logo. Dash loads every .css / .js in assets/.
+   Fonts: Silkscreen (headings, labels, buttons), Departure Mono (text, inputs, tables),
+   Px437 IBM VGA 8x16 (the live log; pixel-exact at 16 px). Licences in assets/fonts/. */
+
+@font-face { font-family: "Silkscreen"; src: url("/assets/fonts/Silkscreen-Regular.ttf") format("truetype"); font-display: swap; }
+@font-face { font-family: "Departure Mono"; src: url("/assets/fonts/DepartureMono-Regular.woff2") format("woff2"); font-display: swap; }
+@font-face { font-family: "IBM VGA"; src: url("/assets/fonts/WebPlus_IBM_VGA_8x16.woff") format("woff"); font-display: swap; }
+
+:root {
+    --navy: #001050; --purple: #3d0f8f; --blue: #0060c0; --cyan: #00a0b0;
+    --green: #4fb020; --yellow: #f0b000; --orange: #f08000; --red: #d82814;
+    --paper: #eef1f8; --dot: rgba(0, 16, 80, 0.22); --panel: #ffffff; --ink: #001050; --muted: #5a6172;
+    --term-bg: #0b1f12; --term-fg: #8dff9a; --term-dim: #4fa85c;
+    --head: "Silkscreen", "Courier New", monospace;
+    --text: "Departure Mono", "Courier New", monospace;
+    --tty: "IBM VGA", "Courier New", monospace;
+}
+
+/* Every face has one real weight: never let the browser fake a bold (it fills the pixel letters in). */
+* { box-sizing: border-box; font-synthesis: none; }
+h1, h2, h3, h4, b, strong, th, label, button, summary { font-weight: normal; }
+
+body {
+    margin: 0; color: var(--ink); font-family: var(--text); font-size: 15px; line-height: 1.4;
+    background-color: var(--paper);
+    background-image: radial-gradient(circle, var(--dot) 1px, transparent 1.4px);  /* faint dither dots */
+    background-size: 24px 24px;
+}
+
+img, .pixelated { image-rendering: pixelated; }
+
+/* ---- Top bar: small logo + the tabs, rainbow as its bottom edge (banner design still open) ---- */
+.topbar {
+    position: sticky; top: 0; z-index: 50; display: flex; align-items: center; gap: 18px;
+    padding: 6px 20px; background: var(--panel); border-bottom: 4px solid transparent;
+    border-image: linear-gradient(90deg, var(--purple) 0 14%, var(--blue) 14% 30%, var(--cyan) 30% 46%,
+        var(--green) 46% 62%, var(--yellow) 62% 76%, var(--orange) 76% 90%, var(--red) 90%) 1;
+}
+.topbar img { height: 34px; width: auto; image-rendering: auto; }
+.topbar .picasso-tabs { flex: 1; }
+.picasso-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.picasso-tabs .tab {
+    font-family: var(--head) !important; font-size: 13px !important; letter-spacing: 0.5px;
+    background: #e6eaf3 !important; color: var(--navy) !important; border: 3px solid var(--navy) !important;
+    padding: 6px 12px !important; width: auto !important; flex: 0 0 auto !important; white-space: nowrap;
+}
+.picasso-tabs .tab--selected { background: var(--navy) !important; color: #fff !important; }
+
+/* ---- Layout ---- */
+.content { padding: 22px 24px 40px; max-width: 1280px; margin: 0 auto; }
+.row { display: flex; gap: 18px; flex-wrap: wrap; }
+.col { flex: 1 1 320px; min-width: 0; }
+.field-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 4px 18px; }
+
+.card { background: var(--panel); border: 3px solid var(--navy); box-shadow: 6px 6px 0 var(--navy);
+    padding: 16px 18px; margin-bottom: 22px; min-width: 0; }
+.card h2 { font-family: var(--head); font-size: 22px; color: var(--navy); letter-spacing: 0.5px;
+    border-bottom: 3px solid var(--navy); padding-bottom: 6px; margin: 0 0 14px; }
+.card h3 { font-family: var(--head); font-size: 15px; color: var(--blue); margin: 16px 0 8px; letter-spacing: 0.5px; }
+label { font-family: var(--head); font-size: 12px; letter-spacing: 0.5px; display: block; margin: 12px 0 4px; }
+.hint { font-size: 13px; color: var(--muted); }
+.footer { text-align: center; font-size: 11px; color: var(--muted); padding: 0 16px 18px; }
+
+/* ---- Inputs ---- */
+input[type="text"], input[type="number"], textarea {
+    font-family: var(--text) !important; font-size: 15px !important; color: var(--ink); background: #fff;
+    border: 3px solid var(--navy) !important; border-radius: 0 !important; padding: 6px 8px; width: 100%;
+}
+input:focus, textarea:focus { outline: none; box-shadow: 4px 4px 0 var(--cyan); }
+input::placeholder { color: #8a91a3; }
+/* dcc.Dropdown */
+.dash-dropdown, .dash-dropdown * { font-family: var(--text); font-size: 15px; }
+
+/* ---- Buttons ---- */
+.btn {
+    font-family: var(--head); font-size: 15px; letter-spacing: 0.5px; color: #fff; background: var(--navy);
+    border: 3px solid var(--navy); box-shadow: 4px 4px 0 var(--cyan); padding: 8px 16px; cursor: pointer;
+}
+.btn:hover { background: var(--orange); box-shadow: 4px 4px 0 var(--navy); }
+.btn:active { transform: translate(4px, 4px); box-shadow: none; }
+.btn:focus-visible { outline: 3px solid var(--cyan); outline-offset: 2px; }
+.btn:disabled { background: #c3c9d6; color: #7d8496; border-color: #7d8496; box-shadow: 2px 2px 0 #7d8496; cursor: not-allowed; }
+.btn.btn-run { background: var(--orange); }
+.btn.btn-run:hover { background: var(--navy); }
+.btn.btn-small { font-size: 12px; padding: 5px 10px; box-shadow: 3px 3px 0 var(--cyan); }
+
+details { margin-top: 14px; border: 3px solid var(--navy); }
+details > summary { font-family: var(--head); font-size: 14px; letter-spacing: 0.5px; padding: 9px 14px;
+    cursor: pointer; list-style: none; user-select: none; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before { content: "▸ "; color: var(--orange); }
+details[open] > summary::before { content: "▾ "; }
+details[open] > summary { background: var(--navy); color: #fff; }
+.details-body { padding: 12px 14px; background: #fbfcfe; }
+
+.upload-box { font-size: 14px; color: var(--muted); border: 3px dashed var(--navy) !important; border-radius: 0 !important;
+    padding: 14px; text-align: center; background: #fff; cursor: pointer; }
+
+/* ---- File browser ---- */
+.fb-modal-backdrop { position: fixed; inset: 0; background: rgba(0, 16, 80, 0.5); z-index: 100;
+    display: flex; align-items: center; justify-content: center; }
+.fb-modal { background: var(--panel); border: 3px solid var(--navy); box-shadow: 10px 10px 0 var(--navy);
+    width: min(760px, 92vw); max-height: 80vh; display: flex; flex-direction: column; padding: 16px; gap: 10px; }
+.fb-title { font-family: var(--head); font-size: 15px; }
+.fb-path { font-size: 14px; border: 3px solid var(--navy); padding: 6px 10px; word-break: break-all; }
+.fb-list { overflow-y: auto; border: 3px solid var(--navy); flex: 1; }
+.fb-entry { font-size: 15px; padding: 5px 12px; cursor: pointer; border-bottom: 1px solid #dde3ef;
+    display: flex; align-items: center; gap: 8px; }
+.fb-entry:hover { background: var(--cyan); color: #fff; }
+.fb-entry.is-dir { color: var(--blue); }
+.fb-entry.is-d { color: var(--orange); }
+.fb-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
+/* ---- Live log: green phosphor terminal ---- */
+.log-head { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
+.log-status { font-family: var(--head); font-size: 14px; padding: 6px 12px; border: 3px solid var(--navy); }
+.log-status.running { background: var(--yellow); color: var(--navy); }
+.log-status.finished { background: var(--green); color: #fff; }
+.log-status.failed { background: var(--red); color: #fff; }
+.log-status.idle { background: #e6eaf3; }
+.log-pre {
+    font-family: var(--tty); font-size: 16px; line-height: 16px; margin: 0;
+    color: var(--term-fg); background-color: var(--term-bg);
+    background-image: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.18) 0 1px, transparent 1px 3px);  /* scanlines */
+    text-shadow: 0 0 4px rgba(141, 255, 154, 0.45);
+    border: 3px solid var(--navy); padding: 14px 16px; height: 62vh; min-height: 320px;
+    overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.log-pre .cursor { animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.log-pre .cursor.typing { animation: none; }  /* solid while characters arrive, blinking when idle */
+
+/* ---- Stat tiles ---- */
+.stat-row { display: flex; gap: 14px; flex-wrap: wrap; }
+.stat { flex: 1 1 170px; background: var(--navy); color: #fff; border: 3px solid var(--navy);
+    box-shadow: 4px 4px 0 var(--cyan); padding: 10px 14px; display: flex; flex-direction: column; gap: 4px; }
+.stat .stat-value { font-family: var(--head); font-size: 19px; white-space: nowrap; color: var(--yellow); font-variant-numeric: tabular-nums; }
+.stat .stat-label { font-size: 12px; }
+
+/* ---- Results ---- */
+.res-strip { display: flex; gap: 12px 16px; align-items: flex-end; flex-wrap: wrap; }
+.res-strip > div { min-width: 0; }
+.res-shell { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 800px) { .res-shell { grid-template-columns: minmax(0, 1fr); } }
+.subnav { position: sticky; top: 70px; display: flex; flex-direction: column; gap: 6px; }
+.subnav .btn { text-align: left; box-shadow: 3px 3px 0 var(--navy); background: #fff; color: var(--navy); }
+.subnav .btn.active { background: var(--navy); color: #fff; box-shadow: 3px 3px 0 var(--orange); }
+.subnav .btn:hover { background: var(--orange); color: #fff; }
+.pill { display: inline-block; font-family: var(--head); font-size: 11px; padding: 2px 7px; margin-right: 6px;
+    border: 2px solid var(--navy); }
+.pill.ok { background: var(--green); color: #fff; } .pill.no { background: #e6eaf3; }
+.pill.dec { background: var(--orange); color: #fff; } .pill.gt { background: var(--purple); color: #fff; }
+.detail-title { font-family: var(--head); font-size: 18px; margin: 0 0 6px; word-break: break-all; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; font-size: 14px; }
+.kv span:nth-child(odd) { color: var(--muted); }
+.grid-wrap { border: 3px solid var(--navy); }
+.linklike { font-family: var(--text); font-size: 14px; color: var(--blue); background: none; border: none;
+    padding: 0; text-align: left; text-decoration: underline; cursor: pointer; }
+.linklike:hover { color: var(--orange); }
+.linklike:focus-visible { outline: 2px solid var(--cyan); }

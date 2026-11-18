@@ -19,13 +19,19 @@ dependencies = [
 
 [project.optional-dependencies]
 figures = ["matplotlib>=3.7"]
+gui = ["dash>=2.16", "dash-ag-grid>=32.3", "plotly>=5", "tomli-w", "matplotlib>=3.7"]
+desktop = ["pywebview>=5"]
 
 [project.scripts]
 picasso = "msi_picasso.cli:main"
 msi-picasso = "msi_picasso.cli:main"
+picasso-gui = "msi_picasso.gui:main"
 
 [tool.pytest.ini_options]
 testpaths = ["msi_picasso/tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools.package-data]
+msi_picasso = ["assets/*", "assets/fonts/*"]

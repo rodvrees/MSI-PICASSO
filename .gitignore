@@ -3,3 +3,4 @@ __pycache__/
 target/
 catboost_info/
 .rawquery_cache/
+MSI_PICASSO.egg-info/
