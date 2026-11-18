@@ -13,6 +13,7 @@ and the coloc matrix: on-tissue M images, optionally TIC-normalised per pixel, m
 (common mode), centred and scaled to unit norm; r = row dot product.
 """
 import sqlite3
+import sys
 import time
 
 import numpy as np
@@ -99,19 +100,47 @@ def _r(a, b):
         return (a * b).sum(1) / np.sqrt((a * a).sum(1) * (b * b).sum(1))
 
 
+class _Progress:
+    """alphatims progress callback (any object with `max` and `value`): one line that grows, redrawn with \\r on each
+    whole-% step, so a terminal and the GUI log show a single bar instead of a tqdm line per update."""
+    max = 1
+
+    def __init__(self):
+        self._v, self._pct = 0, -1
+
+    @property
+    def value(self):
+        return self._v
+
+    @value.setter
+    def value(self, v):
+        self._v, pct = v, int(100 * v / max(self.max, 1))
+        if pct != self._pct:
+            self._pct = pct
+            bar = "#" * (pct // 5) + "." * (20 - pct // 5)
+            sys.stdout.write(f"\r{' ' * 24}loading the .d [{bar}] {pct:3d}%" + ("\n" if pct >= 100 else ""))
+            sys.stdout.flush()
+
+
 def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None, threads=32, log=print):
     """Evidence table Q (one row per query m/z in mzs, sorted), the unit-norm coloc rows X (valid rows only, float32),
     the on-tissue images (n_q, 3 windows M-1 / M / M+1, n_on), the top-decile-pixel m/z profiles (n_q, 51 bins,
     -25..25 ppm) and the image layout (grid index of each on-tissue pixel, grid shape).
     mask: optional (H * W,) bool on-tissue mask (bench parity); default tissue_mask(frame TIC, tic_quantile)."""
+    import warnings
     import alphatims.bruker as atb
+    import alphatims.utils
     import numba
     threads = min(threads, numba.config.NUMBA_NUM_THREADS)
     numba.set_num_threads(threads)
     t0 = time.time()
     mzs = np.asarray(mzs, np.float64)
     grid, shape, tic, _ = tdf_meta(d)
-    tims = atb.TimsTOF(str(d))
+    alphatims.utils.set_progress_callback(_Progress())
+    with warnings.catch_warnings():  # pandas ChainedAssignment FutureWarning inside alphatims' frame table setup
+        warnings.simplefilter("ignore", FutureWarning)
+        tims = atb.TimsTOF(str(d))
+    alphatims.utils.set_progress_callback(True)
     n_scan = int(tims.scan_max_index)
     indptr = np.asarray(tims.push_indptr, np.int64)
     n_frames = (len(indptr) - 1) // n_scan
@@ -120,8 +149,7 @@ def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None,
     frames = np.flatnonzero(grid[:n_frames] >= 0)
     frames = frames[np.argsort(grid[frames], kind="stable")]  # pixel (grid) order
     on = mask[grid[frames]] if mask is not None else tissue_mask(tic.reindex(frames).fillna(0).to_numpy(), tic_quantile)
-    log(f"[{time.time() - t0:.0f}s] loaded {d}: {len(tof):,} events, {len(frames)} pixels ({on.sum()} on tissue), "
-        f"{len(mzs)} queries")
+    log(f"{len(tof):,} events, {len(frames):,} pixels ({int(on.sum()):,} on tissue), {time.time() - t0:.0f} s")
     frame_sums, profile = _kernels()
     # pass 1: windows w = 4 q + c, c = 0 (M-1), 1 (M), 2 (M+1), 3 (M+2)
     cm = (mzs[:, None] + NEUTRON * np.arange(-1, 3)[None]).ravel()
@@ -129,7 +157,7 @@ def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None,
     A = np.zeros((len(frames), len(cm)), np.float32)
     frame_sums(indptr, tof, inten, n_scan, frames, ptr, win, A)
     A = A.reshape(len(frames), len(mzs), 4)
-    log(f"[{time.time() - t0:.0f}s] pass 1 done ({A.nbytes / 1e9:.1f} GB)")
+    log(f"isotope images (M-1 .. M+2) summed per pixel, {time.time() - t0:.0f} s")
     Q = pd.DataFrame({"mz": mzs})
     M = A[:, :, 1]
     Q["isum"] = M.sum(0, dtype=np.float64)
@@ -167,10 +195,9 @@ def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None,
     x = np.arange(-CEN_PPM, CEN_PPM + 1, dtype=float)
     with np.errstate(all="ignore"):
         Q["cen"] = (prof * x).sum(1) / prof.sum(1)
-    log(f"[{time.time() - t0:.0f}s] pass 2 done")
+    log(f"m/z profiles (+-{CEN_PPM} ppm) of the brightest pixels, {time.time() - t0:.0f} s")
     del tims, tof, inten, indptr, hi  # the event arrays: not needed past pass 2
     X, Q["valid"] = coloc_rows(img[:, 1], tic_normalize)
-    log(f"[{time.time() - t0:.0f}s] evidence done")
     return Q, X, img, prof, (grid[frames[on]], shape)
 
 

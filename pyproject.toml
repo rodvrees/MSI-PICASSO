@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 figures = ["matplotlib>=3.7"]
-gui = ["dash>=2.16", "plotly>=5", "tomli-w", "matplotlib>=3.7"]
+gui = ["dash>=2.16", "dash-ag-grid>=32.3", "plotly>=5", "tomli-w", "matplotlib>=3.7"]
 desktop = ["pywebview>=5"]
 
 [project.scripts]
@@ -34,4 +34,4 @@ testpaths = ["msi_picasso/tests"]
 where = ["."]
 
 [tool.setuptools.package-data]
-msi_picasso = ["assets/*"]
+msi_picasso = ["assets/*", "assets/fonts/*"]

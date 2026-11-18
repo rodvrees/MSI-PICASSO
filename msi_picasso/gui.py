@@ -2,7 +2,7 @@
 
 A thin wrapper: it writes a TOML config (keys = ``cli.DEFAULTS``), launches the
 ``picasso`` CLI as a subprocess, tails its log, and renders the on-disk results
-(run.json counts, peptides.tsv / proteins.tsv, Plotly plots, the CLI's figures/).
+(gui_results.py: run.json, the tables, rows / evidence and viewer/ as interactive views).
 It never re-implements pipeline logic, so a GUI run is a CLI run.
 
 Run:  ``picasso-gui``            (browser at http://127.0.0.1:8050)
@@ -19,18 +19,10 @@ import sys
 import tomllib
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx, ALL, no_update
+from dash import Dash, dcc, html, Input, Output, State, ctx, ALL, no_update
 
+from msi_picasso import gui_results
 from msi_picasso.cli import DEFAULTS
-
-# --- Logo-derived palette (must match assets/picasso.css) ---
-NAVY, PURPLE, BLUE, CYAN = "#001050", "#3d0f8f", "#0060c0", "#00a0b0"
-GREEN, YELLOW, ORANGE, RED = "#4fb020", "#f0b000", "#f08000", "#d82814"
-PAPER, INK = "#f5f7fb", "#001050"
-PIXEL_FONT = "VT323, PressStart2P, monospace"
 
 _ASSETS = os.path.join(os.path.dirname(__file__), "assets")
 _CONFIGS_DIR = Path(__file__).resolve().parents[2] / "configs"
@@ -46,7 +38,8 @@ _PATH_KEYS = ("maldi_d", "lcms_peptides", "output_dir")  # own widgets with a Br
 _DECOY_METHODS = ("d1c_raw", "d1b")
 _STANDARD_KEYS = ("psm_utils_reader", "tic_quantile", "tic_normalize", "mz_offset_ppm",
                   "decoy_min_shift_da", "gt_peptides", "figures")
-_ADVANCED_KEYS = ("decoy_seeds", "extraction_ppm", "mz_range", "tissue_mask", "threads")
+_ADVANCED_KEYS = ("decoy_seeds", "extraction_ppm", "mz_range", "tissue_mask", "threads",
+                  "viewer_all_targets", "viewer_all_decoys")
 _CFG_KEYS = _STANDARD_KEYS + _ADVANCED_KEYS
 # A new CLI key must get a field here, or a GUI run could not reproduce a CLI run.
 assert set(_PATH_KEYS + ("decoy_method",) + _CFG_KEYS) == set(DEFAULTS), "GUI form out of sync with cli.DEFAULTS"
@@ -92,72 +85,11 @@ def _render_field(key: str):
     return html.Div([html.Label(key.replace("_", " ")), ctrl])
 
 
-# --------------------------------------------------------------------------
-# Plotly template
-# --------------------------------------------------------------------------
-def _picasso_template() -> go.layout.Template:
-    t = go.layout.Template()
-    t.layout = go.Layout(
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        font=dict(family=PIXEL_FONT, size=16, color=INK),
-        colorway=[BLUE, ORANGE, GREEN, PURPLE, RED, CYAN, YELLOW],
-        margin=dict(l=60, r=24, t=48, b=52),
-        xaxis=dict(linecolor=NAVY, linewidth=2, gridcolor="#dde3ef", zeroline=False, ticks="outside"),
-        yaxis=dict(linecolor=NAVY, linewidth=2, gridcolor="#dde3ef", zeroline=False, ticks="outside"),
-        legend=dict(bgcolor="#ffffff", bordercolor=NAVY, borderwidth=2),
-    )
-    return t
-
-
-TEMPLATE = _picasso_template()
-
-
-# --------------------------------------------------------------------------
-# IO helpers
-# --------------------------------------------------------------------------
-def _read_tsv(path: Path) -> pd.DataFrame | None:
-    try:
-        return pd.read_csv(path, sep="\t")
-    except Exception:
-        return None
-
-
-# --------------------------------------------------------------------------
-# Figure builders (from peptides.tsv / proteins.tsv — no pipeline re-run)
-# --------------------------------------------------------------------------
-def build_ids_vs_fdr(peptides: pd.DataFrame, proteins: pd.DataFrame | None) -> go.Figure:
-    fig = go.Figure()
-    fig.update_layout(template=TEMPLATE, title="IDs vs FDR", xaxis_title="q-value", yaxis_title="reported targets")
-    for df, col, name, color in ((peptides, "q", "peptides", BLUE), (proteins, "q_picked", "proteins (picked)", GREEN)):
-        if df is None or col not in df:
-            continue
-        q = np.sort(df.loc[~df["is_decoy"], col].dropna().to_numpy())
-        fig.add_trace(go.Scatter(x=q, y=np.arange(1, len(q) + 1), mode="lines", line=dict(color=color, width=3),
-                                 line_shape="hv", name=name, hovertemplate="q=%{x:.4f}<br>IDs=%{y}<extra></extra>"))
-    fig.add_vline(x=0.01, line=dict(color=ORANGE, width=2, dash="dot"),
-                  annotation_text="1% FDR", annotation_font_color=ORANGE)
-    fig.update_xaxes(range=[0, 0.1])
-    return fig
-
-
-def build_score_dist(peptides: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.update_layout(template=TEMPLATE, title="Peptide score distribution",
-                      xaxis_title="score s (best row per peptide)", yaxis_title="peptides", barmode="overlay")
-    # blue=target, orange=decoy — CVD-safe pair from the logo; legend = 2nd encoding.
-    for dec, name, color in ((False, "target", BLUE), (True, "decoy", ORANGE)):
-        x = peptides.loc[peptides["is_decoy"] == dec, "s"].dropna()
-        fig.add_trace(go.Histogram(x=x, name=name, marker_color=color, opacity=0.7, nbinsx=80,
-                                   histnorm="probability density"))
-    return fig
-
-
-def _empty_fig(msg: str) -> go.Figure:
-    fig = go.Figure()
-    fig.update_layout(template=TEMPLATE, annotations=[dict(text=msg, showarrow=False,
-                      font=dict(size=18, color=INK), xref="paper", yref="paper", x=0.5, y=0.5)],
-                      xaxis=dict(visible=False), yaxis=dict(visible=False))
-    return fig
+def read_log(path: Path, n: int = 400) -> str:
+    """The console log as shown: read as bytes (text mode would turn \r into newlines), split on \n only, and keep
+    the text after a line's last \r, so a progress bar redrawn with \r shows as its latest state on one line."""
+    raw = path.read_bytes().decode(errors="replace")
+    return "\n".join(ln.rsplit("\r", 1)[-1] for ln in raw.split("\n")[-n:]).rstrip("\n")
 
 
 # --------------------------------------------------------------------------
@@ -182,12 +114,12 @@ def _path_field(field_id, label):
     ]))
 
 
-def _header():
-    return html.Div([
-        html.Div(className="picasso-header", children=[
-            html.Img(src="/assets/MSI-PICASSO-logo-t.png", alt="MSI-PICASSO"),
-        ]),
-        html.Div(className="rainbow-rule"),
+def _topbar():
+    tab = lambda label, value: dcc.Tab(label=label, value=value, className="tab", selected_className="tab--selected")
+    return html.Div(className="topbar", children=[
+        html.Img(src="/assets/MSI-PICASSO-logo-t.png", alt="MSI-PICASSO"),
+        dcc.Tabs(id="tabs", value="cfg", className="picasso-tabs", parent_className="picasso-tabs-parent",
+                 children=[tab("Configure", "cfg"), tab("Live log", "log"), tab("Results", "res")]),
     ])
 
 
@@ -236,31 +168,14 @@ def _tab_log():
     return html.Div(className="content", children=[
         html.Div(className="card", children=[
             html.H2("Live log"),
-            html.Div(style={"display": "flex", "alignItems": "center", "gap": "14px"}, children=[
+            html.Div(className="log-head", children=[
                 html.Div(id="log-status", className="log-status idle", children="idle"),
-                html.Button("■ CANCEL RUN", id="cancel-btn", className="btn", disabled=True),
+                html.Button("■ Cancel run", id="cancel-btn", className="btn", disabled=True),
             ]),
-            html.Pre(id="log-pre", className="log-pre", children="No run started yet."),
+            html.Pre(id="log-pre", className="log-pre"),  # filled by assets/log.js (typewriter)
         ]),
-        dcc.Interval(id="log-interval", interval=2000, n_intervals=0),
-    ])
-
-
-def _tab_results():
-    return html.Div(className="content", children=[
-        html.Div(className="card", children=[
-            html.H2("Results"),
-            _labeled("Results directory", html.Div([
-                dcc.Input(id="results-dir", type="text", value="",
-                          style={"width": "70%", "display": "inline-block"}),
-                html.Button("Browse", id="browse-results-dir", n_clicks=0,
-                            className="btn btn-small", style={"marginLeft": "8px"}),
-                html.Button("Load", id="load-results", n_clicks=0,
-                            className="btn btn-small", style={"marginLeft": "8px"}),
-            ])),
-            html.Div(id="results-summary"),
-        ]),
-        html.Div(id="results-body"),
+        dcc.Store(id="log-text", data="No run started yet."),
+        dcc.Interval(id="log-interval", interval=1000, n_intervals=0),
     ])
 
 
@@ -268,21 +183,25 @@ def make_layout():
     return html.Div([
         dcc.Store(id="loaded-config"),
         dcc.Store(id="fb-target"), dcc.Store(id="fb-cwd"), dcc.Store(id="fb-entries"),
-        _header(),
-        dcc.Tabs(id="tabs", value="cfg", className="picasso-tabs", children=[
-            dcc.Tab(label="CONFIGURE & RUN", value="cfg", className="tab", selected_className="tab--selected",
-                    children=_tab_configure()),
-            dcc.Tab(label="LIVE LOG", value="log", className="tab", selected_className="tab--selected",
-                    children=_tab_log()),
-            dcc.Tab(label="RESULTS", value="res", className="tab", selected_className="tab--selected",
-                    children=_tab_results()),
-        ]),
+        _topbar(),
+        html.Div(id="pane-cfg", children=_tab_configure()),
+        html.Div(id="pane-log", children=_tab_log(), hidden=True),
+        html.Div(id="pane-res", children=gui_results.layout(), hidden=True),
         html.Div(id="fb-modal-wrap"),
+        html.Div(className="footer", children="Fonts: Silkscreen and Departure Mono (SIL OFL); "
+                 "Px437 IBM VGA 8x16 by VileR, int10h.org (CC BY-SA 4.0)."),
     ])
 
 
 app = Dash(__name__, assets_folder=_ASSETS, title="MSI-PICASSO", suppress_callback_exceptions=True)
 app.layout = make_layout()
+gui_results.register(app)
+
+
+@app.callback(Output("pane-cfg", "hidden"), Output("pane-log", "hidden"), Output("pane-res", "hidden"),
+              Input("tabs", "value"))
+def show_pane(tab):  # panes stay mounted, so form values and loaded results survive a tab switch
+    return tab != "cfg", tab != "log", tab != "res"
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +282,7 @@ def _fb_view(cwd, entries):
                              id={"role": "fb-entry", "idx": i}))
     return html.Div(className="fb-modal-backdrop", children=[
         html.Div(className="fb-modal", children=[
-            html.Div("Select a file or folder", style={"fontFamily": PIXEL_FONT}),
+            html.Div("Select a file or folder", className="fb-title"),
             html.Div(cwd, className="fb-path"),
             html.Div(rows, className="fb-list"),
             html.Div(className="fb-actions", children=[
@@ -456,7 +375,7 @@ def launch(section: dict) -> subprocess.Popen:
 
 @app.callback(
     Output("run-msg", "children"), Output("run-btn", "disabled", allow_duplicate=True),
-    Output("results-dir", "value", allow_duplicate=True),
+    Output("results-dir", "value", allow_duplicate=True), Output("tabs", "value"),
     Input("run-btn", "n_clicks"),
     State("in-maldi_d", "value"), State("in-lcms_peptides", "value"),
     State("in-output_dir", "value"), State("in-decoy_method", "value"),
@@ -465,19 +384,19 @@ def launch(section: dict) -> subprocess.Popen:
 )
 def run_picasso(n, maldi_d, lcms, outdir, decoy, cfg_vals, cfg_ids):
     if _JOB["proc"] is not None and _JOB["proc"].poll() is None:
-        return "A run is already in progress.", True, no_update
+        return "A run is already in progress.", True, no_update, "log"
     values = dict(zip(_PATH_KEYS + ("decoy_method",), (maldi_d, lcms, outdir, decoy)))
     values.update({cid["key"]: v for cid, v in zip(cfg_ids, cfg_vals)})
     section = section_from_form(values)
     missing = [k for k in _PATH_KEYS if k not in section]
     if missing:
-        return f"Set {', '.join(missing)} first.", False, no_update
+        return f"Set {', '.join(missing)} first.", False, no_update, no_update
     try:
         proc = launch(section)
     except Exception as exc:
-        return f"Could not start the run: {exc}", False, no_update
-    _JOB.update(proc=proc, outdir=section["output_dir"], cancelled=False)
-    return f"Launched (pid {proc.pid}). Watch the Live Log tab.", True, section["output_dir"]
+        return f"Could not start the run: {exc}", False, no_update, no_update
+    _JOB.update(proc=proc, outdir=section["output_dir"], cancelled=False, shown=False)
+    return f"Launched (pid {proc.pid}).", True, section["output_dir"], "log"
 
 
 @app.callback(
@@ -499,102 +418,36 @@ def cancel_run(_n):
 
 @app.callback(
     Output("log-status", "children"), Output("log-status", "className"),
-    Output("log-pre", "children"), Output("run-btn", "disabled", allow_duplicate=True),
+    Output("log-text", "data"), Output("run-btn", "disabled", allow_duplicate=True),
     Output("cancel-btn", "disabled"),
+    Output("tabs", "value", allow_duplicate=True), Output("results-dir", "value", allow_duplicate=True),
+    Output("res-state", "data", allow_duplicate=True),
     Input("log-interval", "n_intervals"),
     prevent_initial_call=True,
 )
 def poll_log(_n):
     proc, outdir = _JOB["proc"], _JOB["outdir"]
+    keep = (no_update,) * 3
     if proc is None or outdir is None:
-        return "idle", "log-status idle", "No run started yet.", False, True
+        return "idle", "log-status idle", no_update, False, True, *keep
     log_path = Path(outdir) / _CONSOLE_LOG
-    text = ""
-    if log_path.exists():
-        # split on \n only and keep the text after the last \r: a tqdm bar shows as its latest state, one line
-        lines = [ln.rsplit("\r", 1)[-1] for ln in log_path.read_text(errors="replace").split("\n")]
-        text = "\n".join(lines[-400:]) or "(waiting for output…)"
+    text = (read_log(log_path) if log_path.exists() else "") or "(waiting for output…)"
     rc = proc.poll()
     if rc is None:  # running → cancel enabled, run disabled
-        return "running…", "log-status running", text, True, False
-    if _JOB.get("cancelled"):
-        return "cancelled ✗", "log-status failed", text, False, True
-    if rc == 0:
-        return "finished ✓", "log-status finished", text, False, True
-    return f"failed (exit {rc})", "log-status failed", text, False, True
+        return "running…", "log-status running", text, True, False, *keep
+    ok = rc == 0 and not _JOB.get("cancelled")
+    status = "finished ✓" if ok else "cancelled ✗" if _JOB.get("cancelled") else f"failed (exit {rc})"
+    jump = keep
+    if ok and not _JOB.get("shown") and (Path(outdir) / "run.json").exists():  # once per run: open its results
+        _JOB["shown"] = True
+        jump = ("res", outdir, gui_results.run_state(outdir))
+    return status, f"log-status {'finished' if ok else 'failed'}", text, False, True, *jump
 
 
-# --------------------------------------------------------------------------
-# Results
-# --------------------------------------------------------------------------
-def _stat(value, label):
-    return html.Div(className="stat", children=[
-        html.Div(f"{value}", className="stat-value"), html.Div(label, className="stat-label")])
-
-
-def _table(df: pd.DataFrame | None):
-    if df is None or df.empty:
-        return html.P("(empty)", className="hint")
-    show = df.copy()
-    for c in show.select_dtypes("float").columns:
-        show[c] = show[c].round(4)
-    return dash_table.DataTable(
-        data=show.to_dict("records"), columns=[{"name": c, "id": c} for c in show.columns],
-        page_size=12, sort_action="native", filter_action="native", style_table={"overflowX": "auto"},
-        style_cell={"fontFamily": "VT323, monospace", "fontSize": "16px",
-                    "border": f"2px solid {NAVY}", "padding": "4px 8px", "backgroundColor": "#ffffff"},
-        style_header={"fontFamily": PIXEL_FONT, "fontSize": "15px", "backgroundColor": NAVY,
-                      "color": "#ffffff", "border": f"2px solid {NAVY}"})
-
-
-def _gallery(fig_dir: Path):
-    """figures/ written by the CLI (figures = true): check plots, protein and per-candidate ion images."""
-    pngs = sorted(fig_dir.rglob("*.png")) if fig_dir.is_dir() else []
-    if not pngs:
-        return html.Div()
-    # ponytail: base64-inlined (~10 MB for a full figures/ dir); serve via a Flask route if that gets slow.
-    figs = [html.Figure([html.Img(src="data:image/png;base64," + base64.b64encode(p.read_bytes()).decode()),
-                         html.Figcaption(str(p.relative_to(fig_dir)))]) for p in pngs]
-    return html.Div(className="card", children=[html.H2("Figures"), html.Div(figs, className="gallery")])
-
-
-def _counts(d: dict | None) -> str:
-    return " / ".join(str(v) for v in d.values()) if d else "–"
-
-
-@app.callback(
-    Output("results-summary", "children"), Output("results-body", "children"),
-    Input("load-results", "n_clicks"), State("results-dir", "value"),
-    prevent_initial_call=True,
-)
-def load_results(_n, outdir):
-    if not outdir or not Path(outdir).is_dir():
-        return html.P("Set a valid results directory.", className="hint"), None
-    out = Path(outdir)
-    peptides = _read_tsv(out / "peptides.tsv")
-    proteins = _read_tsv(out / "proteins.tsv")
-    if peptides is None or not (out / "run.json").exists():
-        return html.P("No peptides.tsv / run.json here (run not finished?).", className="hint"), None
-    info = json.loads((out / "run.json").read_text())
-    off = info.get("mz_offset", {}).get("used")
-    summary = html.Div(className="stat-row", children=[
-        _stat(_counts(info.get("ids")), "peptides at 1 / 5 / 10% FDR"),
-        _stat(_counts(info.get("proteins_picked")), "proteins (picked) at 1 / 5 / 10%"),
-        *([_stat(_counts(info["gt"]), "GT peptides at 1 / 5 / 10%")] if info.get("gt") else []),
-        _stat(f"{info.get('n_targets', '–')} / {info.get('n_decoys', '–')}", "target / decoy peptides"),
-        _stat("–" if off is None else f"{off:+.2f} ppm", "m/z offset used"),
-    ])
-
-    plots = html.Div(className="card", children=[html.H2("Plots"), html.Div(className="row", children=[
-        html.Div(className="col", children=dcc.Graph(figure=build_ids_vs_fdr(peptides, proteins))),
-        html.Div(className="col", children=dcc.Graph(figure=build_score_dist(peptides))),
-    ])])
-    tp = peptides[~peptides["is_decoy"]].sort_values("q")
-    tables = html.Div(className="card", children=[html.H2("Tables"),
-        html.H3("Target peptides (by q)"), _table(tp),
-        html.H3("Proteins (by picked q)"),
-        _table(None if proteins is None else proteins[~proteins["is_decoy"]].sort_values("q_picked"))])
-    return summary, html.Div([plots, tables, _gallery(out / "figures")])
+# Hand each new log text to the typewriter in assets/log.js.
+app.clientside_callback(
+    "function(text) { if (window.picassoType) { window.picassoType(text); } return window.dash_clientside.no_update; }",
+    Output("log-pre", "title"), Input("log-text", "data"))
 
 
 # --------------------------------------------------------------------------

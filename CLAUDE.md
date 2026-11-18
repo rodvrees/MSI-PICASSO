@@ -41,7 +41,11 @@ exactly the method the closed bench adopted (`bench/BENCH.md`, "Bench closed (20
 7. **q-values**: peptide q = monotone (D + 1) / (k T) over each peptide's best row, k = decoy / target peptides
    before the competition. Proteins (`score.protein_table`): picked protein FDR (`q_picked`) and non-competitive `q`.
 8. **Output**: `peptides.tsv`, `proteins.tsv`, `rows.parquet` (every candidate with its terms), `evidence.parquet`,
-   `run.json` (config, offset, IDs, wall time and peak RSS per step), `figures/` with `figures = true`.
+   `run.json` (config, offset, IDs, wall time and peak RSS per step), `figures/` with `figures = true`, and
+   `viewer/` for the GUI (`cli.save_viewer`, read-only): `meta.npz` (pixel layout, TIC image, every query's m/z
+   profile) and `images.npy` (float16 M-1 / M / M+1 images, each scaled to its max) of the reported set (q <= 10%
+   peptides, target peptides of picked q <= 10% proteins, GT, top 50 decoys); `viewer_all_targets` /
+   `viewer_all_decoys` add every target / decoy query.
 
 ## Critical invariants
 
@@ -72,7 +76,8 @@ MSI-PICASSO/
 │   ├── score.py        terms, M1, per-ion competition, q-values, proteins, m/z offset
 │   ├── cli.py          config (DEFAULTS), run(), main()
 │   ├── figures.py      check figures (ids_vs_fdr, scores, terms, mz, proteins/, candidates/)
-│   ├── gui.py          `picasso-gui` (extra `gui`): form = cli.DEFAULTS -> gui_config.toml -> `picasso -c`; results viewer
+│   ├── gui.py          `picasso-gui` (extra `gui`): form = cli.DEFAULTS -> gui_config.toml -> `picasso -c`; live log
+│   ├── gui_results.py  the GUI's results viewer (Overview / Proteins / Peptides / Run QC; dash-ag-grid + Plotly)
 │   └── tests/test_msi_picasso.py   module self-checks
 └── scripts/
     ├── check_bench_parity.py  A: exact port check; B: full run vs bench, per term and per ID
