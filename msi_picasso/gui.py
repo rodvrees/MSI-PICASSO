@@ -38,7 +38,7 @@ _PATH_KEYS = ("maldi_d", "lcms_peptides", "output_dir")  # own widgets with a Br
 _DECOY_METHODS = ("d1c_raw", "d1b")
 _STANDARD_KEYS = ("psm_utils_reader", "tic_quantile", "tic_normalize", "mz_offset_ppm",
                   "decoy_min_shift_da", "gt_peptides", "figures")
-_ADVANCED_KEYS = ("decoy_seeds", "extraction_ppm", "mz_range", "tissue_mask", "threads",
+_ADVANCED_KEYS = ("decoy_seeds", "query_seeds", "extraction_ppm", "mz_range", "tissue_mask", "threads",
                   "viewer_all_targets", "viewer_all_decoys")
 _CFG_KEYS = _STANDARD_KEYS + _ADVANCED_KEYS
 # A new CLI key must get a field here, or a GUI run could not reproduce a CLI run.

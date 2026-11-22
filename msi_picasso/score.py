@@ -17,7 +17,11 @@ from msi_picasso.candidates import PROTON, averagine
 
 TERMS = ["coloc", "iso", "kl", "mm1", "flank"]
 SIGNS = np.array([1.0, 1.0, -1.0, -1.0, -1.0])
+# profile terms (bench 2, 2026-11-21), used when Q carries profile_features' columns: name -> signed weight
+EXTRA = {"crat": -0.5, "m1c": -0.25, "m1g": -0.1}
 MM1_HINGE, FLANK_HINGE = 0.5, 2.0  # one-sided terms: max(0, x - hinge)
+DGRAD_HINGE, M1C_HINGE, M1G_HINGE = 1.0, 0.5, 3.0
+SLOPE_PPM, CRAT_PPM = 6.0, 2.5  # log-slope fit window, centre window of the ratio terms (ppm from the offset)
 SHRINK = 4.0  # coloc shrunk to the median: (n x + 4 median) / (n + 4), n = partners
 SELFWIT_PPM = 20.0  # partners within 2 x the +-10 ppm window read the same TOF peak: dropped
 ION_PPM, ION_TAU = 0.05, 1.0  # per-ion competition window and soft penalty
@@ -88,16 +92,115 @@ def partner_pairs(c, valid):
     return p[np.abs(p.partner_mz - p.feature_mz) / p.feature_mz * 1e6 >= SELFWIT_PPM].copy()
 
 
+def _log_slope(P, x, c):
+    """Per row: slope of log(P / row max) against x - c over the sampled bins (P > 0) within SLOPE_PPM of c (NaN
+    with fewer than 3)."""
+    pn = P / np.maximum(P.max(1, keepdims=True), 1e-12)
+    sel = np.abs(x - c) <= SLOPE_PPM
+    out = np.full(len(P), np.nan)
+    for i in range(len(P)):
+        k = sel & (P[i] > 0)
+        if k.sum() >= 3:
+            out[i] = np.polyfit(x[k] - c, np.log(pn[i][k]), 1)[0]
+    return out
+
+
+def _interp(P, x, grid):
+    """Per row: P linearly interpolated over its sampled bins (P > 0) at grid (NaN with fewer than 5)."""
+    out = np.full((len(P), len(grid)), np.nan)
+    for i in range(len(P)):
+        k = P[i] > 0
+        if k.sum() >= 5:
+            out[i] = np.interp(grid, x[k], P[i, k])
+    return out
+
+
+def run_sigma(pn, iso):
+    """Run peak width (ppm, Gaussian sigma) of the +-25 ppm M profiles, label-free: per profile of the 200 highest-iso
+    queries, the sigma (5..20 ppm) whose best fit A G(x - mu; s) + a noise(x) + b (A >= 0, mu on a 0.25 ppm grid
+    over +-35, sampled bins only) has the least squared error; the median. noise = the median normalised profile of
+    the queries below the 30% iso quantile (box + background slope)."""
+    x, mus = np.arange(-25, 26, dtype=float), np.arange(-35, 35.01, 0.25)
+    m = (pn > 0).astype(float)
+    lo = np.nan_to_num(iso, nan=0) < np.nanquantile(iso, 0.3)
+    noise = np.nanmedian(np.where(m > 0, pn, np.nan)[lo], 0)
+    noise = np.where(np.isfinite(noise), noise, np.nanmedian(noise))
+    top = np.argsort(-np.nan_to_num(iso, nan=-1))[:200]
+    pn, m = pn[top], m[top]
+    yy = (m * pn ** 2).sum(1)
+    sig = np.arange(5, 21, 1.0)
+    best = []
+    for s in sig:
+        sse = np.full((len(pn), len(mus)), np.inf)
+        for j, mu in enumerate(mus):
+            D = np.stack([np.exp(-0.5 * ((x - mu) / s) ** 2), np.ones_like(x), noise], 1)
+            M = np.einsum("qi,ij,ik->qjk", m, D, D) + 1e-9 * np.eye(3)
+            r = np.einsum("qi,ij->qj", m * pn, D)
+            b = np.linalg.solve(M, r[..., None])[..., 0]
+            ok = b[:, 0] >= 0
+            sse[ok, j] = (yy - (b * r).sum(1))[ok]
+        best.append(sse.min(1))
+    return float(np.median(sig[np.argmin(best, 0)]))
+
+
+def profile_features(Q, prof2, offset):
+    """Q plus four per-query profile features (bench 2, 2026-11-21), label-free, from the top-decile-pixel M-1 and M
+    m/z profiles prof2 (n_q, 2, 121 bins, -60..60 ppm) and run-level constants only:
+      dgrad  log-slope of the M profile at the offset (bins within 6 ppm) x sigma_run^2, minus its median over queries:
+             how far the peak apex sits from the query (ppm; 0 for a centred peak). Replaces the centroid in flank.
+      crat   best M sample within 2.5 ppm of the offset / the +-25 ppm profile max (1: the peak is centred on the query)
+      m1c    best M-1 sample within 2.5 ppm of the exact M-1 position / the M-1 profile max within 60 ppm (1: an ion's
+             apex sits at M-1, so the query reads the M+1 isotope of a lighter ion)
+      m1g    |M-1 log-slope x sigma_run^2 at the run's M-1 apex shift - its median| (small: an M-1 apex where expected)
+    sigma_run: run_sigma; M-1 apex shift: the shift (-15..15 ppm, 0.5 steps) of the M-1 profile that best matches the
+    M profile shape (mean r over the 10% highest-iso queries, +-20 ppm). Returns (Q, {sigma_run, m1_shift} in ppm)."""
+    x60 = np.arange(-60, 61, dtype=float)
+    P1, P = prof2[:, 0].astype(float), prof2[:, 1].astype(float)
+    p = P[:, 35:86]  # M, -25..25 ppm
+    x = x60[35:86]
+    pn = p / np.maximum(p.max(1, keepdims=True), 1e-12)
+    iso = Q.iso_r.to_numpy()
+    s = run_sigma(pn, iso)
+    Q = Q.copy()
+    dg = _log_slope(p, x, offset) * s ** 2
+    Q["dgrad"] = dg - np.nanmedian(dg)
+    cm = np.abs(x - offset) <= CRAT_PPM
+    Q["crat"] = np.where((p[:, cm] > 0).any(1), pn[:, cm].max(1), np.nan)
+    cm, lm = np.abs(x60 - offset) <= CRAT_PPM, np.abs(x60 - offset) <= 60
+    Q["m1c"] = np.where((P1[:, cm] > 0).any(1), P1[:, cm].max(1) / np.maximum(P1[:, lm].max(1), 1e-12), np.nan)
+    # run-level M-1 apex shift, label-free (the high-iso queries)
+    good = np.nan_to_num(iso, nan=-1) >= np.quantile(np.nan_to_num(iso, nan=-1), 0.9)
+    g = np.arange(-20, 20.01, 0.5)
+    A = _interp(P[good], x60, g)
+    A = A - np.nanmean(A, 1, keepdims=True)
+    best, s1 = -np.inf, 0.0
+    for sh in np.arange(-15, 15.01, 0.5):
+        Y = _interp(P1[good], x60, g + sh)
+        Y = Y - np.nanmean(Y, 1, keepdims=True)
+        v = np.nanmean((A * Y).sum(1) / np.sqrt((A * A).sum(1) * (Y * Y).sum(1)))
+        if v > best:
+            best, s1 = v, sh
+    m1g = _log_slope(P1, x60, offset + s1) * s ** 2
+    Q["m1g"] = np.abs(m1g - np.nanmedian(m1g))
+    return Q, dict(sigma_run=float(s), m1_shift=float(s1))
+
+
 def terms(c, Q, pair_r, offset=0.0):
-    """The five term columns (raw values, before z-scoring) of candidates c (with qi = their Q row), in TERMS order.
-    Per-run (label-blind) fills: store NaNs -> the median over all rows; a no-signal row without coloc -> the pooled
-    minimum coloc. offset (ppm) is subtracted from the signed centroid before |.| (label-free m/z offset)."""
+    """The term columns (raw values, before z-scoring) of candidates c (with qi = their Q row): TERMS, then the EXTRA
+    profile terms when Q has profile_features' columns. Per-run (label-blind) fills: store NaNs -> the median over all
+    rows; a no-signal row without coloc -> the pooled minimum coloc. flank: max(0, |dgrad| - 1) when Q has dgrad,
+    else the centroid form (|centroid - offset| ppm, hinge 2; mz_offset needs it, before the profile features).
+    Bench 2 coloc (isogate1): pass extract.slot_r_fn as pair_r."""
     q = c.qi.to_numpy()
     d = pd.DataFrame(index=c.index)
+    bench2 = "dgrad" in Q
     d["iso"] = _filled(Q.iso_r.to_numpy()[q])
     d["kl"] = averagine_kl(Q.mz.to_numpy(), Q[["env0", "env1", "env2"]].to_numpy(float))[q]  # per query m/z
     d["mm1"] = np.maximum(0.0, _filled(Q.mm1_r.to_numpy()[q]) - MM1_HINGE)
-    d["flank"] = np.maximum(0.0, _filled(np.abs(Q.cen.to_numpy()[q] - offset)) - FLANK_HINGE)
+    if bench2:
+        d["flank"] = _filled(np.maximum(0.0, np.abs(Q.dgrad.to_numpy()) - DGRAD_HINGE)[q])
+    else:
+        d["flank"] = np.maximum(0.0, _filled(np.abs(Q.cen.to_numpy()[q] - offset)) - FLANK_HINGE)
     # coloc: partner pairs weighted by sqrt(p90_a p90_b) x the partner's evidence (percentile rank of the other four
     # terms' M1 sum over all rows, mean per m/z)
     sub = _z(d[["iso", "kl", "mm1", "flank"]].to_numpy(float)) @ SIGNS[1:]
@@ -118,12 +221,25 @@ def terms(c, Q, pair_r, offset=0.0):
     n = pd.Series(m.n.fillna(0).to_numpy(float), c.index)
     d["coloc"] = x.where(n < 1, (n * x + SHRINK * x.median()) / (n + SHRINK))
     d["n_partners"] = n
-    return d[TERMS + ["n_partners"]]
+    extra = []
+    if bench2:
+        d["crat"] = _filled((1.0 - Q.crat.to_numpy())[q])
+        d["m1c"] = _filled(np.maximum(0.0, Q.m1c.to_numpy() - M1C_HINGE)[q])
+        d["m1g"] = _filled(np.maximum(0.0, M1G_HINGE - Q.m1g.to_numpy())[q])
+        extra = list(EXTRA)
+    return d[TERMS + extra + ["n_partners"]]
+
+
+def term_weights(cols):
+    """(names, weights) of the score terms present in cols: the five TERMS (+, +, -, -, -), then the EXTRA terms."""
+    names = TERMS + [k for k in EXTRA if k in cols]
+    return names, np.r_[SIGNS, [EXTRA[k] for k in names[len(TERMS):]]]
 
 
 def m1(T):
-    """Fixed z-sum of the five terms (signs +, +, -, -, -)."""
-    return _z(T[TERMS].to_numpy(float)) @ SIGNS
+    """Fixed weighted z-sum of the terms present in T (term_weights)."""
+    names, w = term_weights(T)
+    return _z(T[names].to_numpy(float)) @ w
 
 
 def ion_competition(s, dec, mz):
@@ -206,7 +322,8 @@ def _picked_qvalues(best):
 
 def score_run(c, Q, pair_r, offset=0.0):
     """The adopted score of one run: (rows with terms, score s0 and final s and the `removed` flag, peptide table,
-    protein table). k = decoy / target peptides before the per-ion competition."""
+    protein table). k = decoy / target peptides before the per-ion competition. Q with profile_features' columns and
+    pair_r = extract.slot_r_fn give the bench 2 score; without them, the bench 1 score."""
     T = terms(c, Q, pair_r, offset)
     s0 = m1(T)
     dec, mz = c.is_decoy.to_numpy(bool), c.feature_mz.to_numpy(float)
