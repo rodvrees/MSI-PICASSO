@@ -18,6 +18,8 @@ DEFAULTS = dict(
     psm_utils_reader="fragpipe",
     decoy_method="d1c_raw",  # or "d1b" (fails G0: a known sequence-level leak)
     decoy_seeds=list(range(10)),  # K = 10 decoy sets
+    query_seeds=None,  # read the m/z of these seeds' candidates (a superset); None: decoy_seeds. Bench 2 read all 20
+    # seeds and scored draws of 10, and run-level medians (profile features, common mode) depend on the query set
     decoy_min_shift_da=None,  # a decoy differs from its target by at least this (Da); None: 10 ppm
     extraction_ppm=10.0,
     tic_quantile=0.25,  # on-tissue pixels: frame TIC >= this quantile
@@ -131,7 +133,9 @@ def run(cfg, log=print):
     mz_range = cfg["mz_range"] or tdf_meta(cfg["maldi_d"])[3]
     c = world(targets, cfg["decoy_seeds"], cfg["decoy_method"], cfg["decoy_min_shift_da"], mz_range)
     step("decoys")
-    mzs = np.unique(c.feature_mz.to_numpy())
+    qc = c if cfg["query_seeds"] is None else world(targets, cfg["query_seeds"], cfg["decoy_method"],
+                                                    cfg["decoy_min_shift_da"], mz_range)
+    mzs = np.unique(qc.feature_mz.to_numpy())
     say(2, "Decoys", f"{c.peptide[c.is_decoy].nunique():,} decoy peptides ({cfg['decoy_method']}, "
                      f"{len(cfg['decoy_seeds'])} seeds); {len(mzs):,} m/z to read")
     mask = np.load(cfg["tissue_mask"]) if cfg["tissue_mask"] else None

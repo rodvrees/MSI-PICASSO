@@ -76,6 +76,8 @@ isogate1 + `dgradcrat` + `m1cg`) and nothing else. New scoring ideas belong in a
    (`scripts/check_bench_parity.py A`, run from a worktree of that tag). Bench 2 (2026-11-22):
    `scripts/check_bench2_parity.py A` (package score on the bench 2 caches) and `B` (package extraction too)
    reproduce the bench 2 reference's 1 / 5 / 10% IDs and 5% ID sets on all 20 real draws of all three datasets.
+   A plain `picasso -c configs/<ds>_bench2.toml` reproduces real draw 0 (`decoy_seeds` = draw 0's seeds,
+   `query_seeds` = all 20, as the bench read them; amyloidosis on S0 without the +12/+30 forms).
    Three later bench 1 fixes change the candidate set on purpose: exact target masses (the bench summed 5-decimal residue masses), decoys of out-of-range parents also
    excluded, a decoy's parent partner excluded by m/z (isobaric siblings). Any other change to the method needs a
    reason in PROGRESS.md; the decoy RNG call sequence and the 1.00728 proton in the decoy floor are kept as the
