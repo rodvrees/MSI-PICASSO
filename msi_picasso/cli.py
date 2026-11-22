@@ -64,8 +64,9 @@ def gt_set(path):
 
 def save_viewer(out, cfg, rows, pt, prt, Q, img, prof, layout, prof2, mob):
     """viewer/ for picasso-gui: images.npy = float16 M-1 / M / M+1 on-tissue images of the saved queries, each scaled
-    to its max (meta scale); slot_images.npy = float16 best-component M images of the saved queries that switch
-    (meta slot_qi, slot_scale); meta.npz = which Q rows (qi), scale, on-tissue pixel index + grid shape, the TIC
+    to its max (meta scale); slot_images.npy = float16 M images of every mobility component of the saved queries (meta
+    slot_qi, slot_k = component index into mob_cen, slot_scale; Q.mob_switch says whether coloc read the best one)
+    meta.npz = which Q rows (qi), scale, on-tissue pixel index + grid shape, the TIC
     image, the +-25 ppm m/z profile of every query, and per saved query the M-1 / M profiles (prof2, +-60 ppm), the
     M mobilogram (mob_mg on the 1/K0 bins mob_kb) and its components (mob_cen, mob_area, mob_siso, mob_best). Saved queries: the reported set (peptides at q <= VIEWER_Q, the target
     peptides of proteins at picked q <= VIEWER_Q, GT, the top decoys) plus all targets / decoys on request.
@@ -90,15 +91,13 @@ def save_viewer(out, cfg, rows, pt, prt, Q, img, prof, layout, prof2, mob):
     tic = tic[tic.index < len(grid)]
     px = grid[tic.index.to_numpy()]
     tic_img[px[px >= 0]] = tic.to_numpy()[px >= 0]
-    sw = Q.mob_switch.to_numpy()
-    slot_qi = qi[sw[qi]]
-    si = mob["img"][(np.cumsum(sw) - 1)[slot_qi]]
+    slot_qi, slot_k, si = mob["component_images"](qi)
     slot_scale = np.maximum(si.max(1), 1e-30)
     np.save(v / "slot_images.npy", (si / slot_scale[:, None]).astype(np.float16))
     np.savez(v / "meta.npz", qi=qi, scale=scale.astype(np.float32), pix=layout[0], shape=np.array(layout[1]),
              tic=tic_img, prof=prof.astype(np.float32), prof2=prof2[qi].astype(np.float32), mob_kb=mob["kb"],
              mob_mg=mob["mg"][qi], mob_cen=mob["cen"][qi], mob_area=mob["area"][qi], mob_siso=mob["siso"][qi],
-             mob_best=mob["best"][qi], slot_qi=slot_qi, slot_scale=slot_scale.astype(np.float32))
+             mob_best=mob["best"][qi], slot_qi=slot_qi, slot_k=slot_k, slot_scale=slot_scale.astype(np.float32))
     return len(qi)
 
 
@@ -167,6 +166,7 @@ def run(cfg, log=print):
     pt.drop(columns="qi").to_csv(out / "peptides.tsv", sep="\t")
     prt.drop(columns="qi").to_csv(out / "proteins.tsv", sep="\t")
     n_view = save_viewer(out, cfg, rows, pt, prt, Q, img, prof, layout, prof2, mob)
+    del mob["component_images"]  # frees the event arrays
     info = dict(config=cfg, n_targets=int((~pt.is_decoy).sum()), n_decoys=int(pt.is_decoy.sum()),
                 mz_offset=dict(used=o, estimate=o_auto[1], z=o_auto[2], accepted=o_auto[0]),
                 profile=prof_run, mob_switched=int(Q.mob_switch.sum()),

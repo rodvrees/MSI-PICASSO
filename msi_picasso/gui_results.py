@@ -101,19 +101,28 @@ def _saved(d, qi, key="qi"):
     return k if k < len(m[key]) and m[key][k] == int(qi) else None
 
 
-def slot_image(d, qi):
-    """(H, W) best-mobility-component M image of a switched query from viewer/, NaN off tissue; None if not saved."""
-    k = _saved(d, qi, "slot_qi")
-    if k is None or d["slot"] is None:
-        return None
+def slot_image(d, qi, k=None):
+    """(H, W) M image of mobility component k (index into mob_cen; None: the best) of query qi from viewer/, NaN off
+    tissue; None if not saved (runs before every component was saved hold only the switched queries' best one)."""
     m = d["meta"]
+    if d["slot"] is None or _saved(d, qi) is None:
+        return None
+    qi = int(qi)
+    best = int(m["mob_best"][_saved(d, qi)])
+    k = best if k is None else int(k)
+    if "slot_k" in m:
+        hit = np.flatnonzero((m["slot_qi"] == qi) & (m["slot_k"] == k))
+    else:
+        hit = [] if k != best or (j := _saved(d, qi, "slot_qi")) is None else [j]
+    if not len(hit):
+        return None
+    j = int(hit[0])
     h, w = (int(x) for x in m["shape"])
     im = np.full(h * w, np.nan, np.float32)
-    im[m["pix"]] = np.asarray(d["slot"][k], np.float32) * m["slot_scale"][k]
+    im[m["pix"]] = np.asarray(d["slot"][j], np.float32) * m["slot_scale"][j]
     return im.reshape(h, w)
 
 
-# ------------------------------------------------------------------ figures (pure functions of the loaded data)
 def _fig(title="", **kw):
     f = go.Figure()
     f.update_layout(template=TEMPLATE, title=title, **kw)
@@ -465,7 +474,8 @@ def mobility_fig(d, pep):
     kb, y = m["mob_kb"], m["mob_mg"][k].astype(float)
     cen, area, siso, best = m["mob_cen"][k], m["mob_area"][k], m["mob_siso"][k], int(m["mob_best"][k])
     sw = bool(d["Q"].mob_switch[qi])
-    f = _fig(f"Mobilogram: {'switched to component' if sw else 'full window'} (iso r {d['Q'].iso_r[qi]:.2f})",
+    f = _fig(f"Mobilogram: {'switched to component' if sw else 'full window'} (iso r {d['Q'].iso_r[qi]:.2f}); "
+             "click a component for its image",
              xaxis_title="1/K0 (V s / cm²)", yaxis_title="intensity", height=330, legend=LEGEND_TOP,
              margin=dict(t=80))
     f.add_trace(go.Scatter(x=kb, y=y, mode="lines", name="M", line=dict(color=NAVY, width=2), fill="tozeroy",
@@ -478,25 +488,46 @@ def mobility_fig(d, pep):
     for j in np.flatnonzero(np.isfinite(cen)):
         sd = cen[j] * MOB_W / 100 / 2.3548
         g = area[j] * tot * np.exp(-0.5 * ((xx - cen[j]) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
-        f.add_trace(go.Scatter(x=xx, y=g, mode="lines", name=f"{area[j]:.0%}, r {siso[j]:.2f}",
+        f.add_trace(go.Scatter(x=xx, y=g, mode="lines", name=f"{area[j]:.0%}, r {siso[j]:.2f}", customdata=[j] * len(xx),
+                               hovertemplate=f"component {j}: {area[j]:.0%}, r {siso[j]:.2f}<br>click to show its image"
+                                             "<extra></extra>",
                                line=dict(color=ORANGE if j == best else CYAN, width=3 if j == best else 1.5,
                                          dash=None if j == best else "dot")))
     f.update_xaxes(range=[kb[band].min(), kb[band].max()])
     return f
 
 
-def mobility_images(d, pep):
-    """The M image (full mobility window) next to the best component's M image, for a switched query."""
+def mobility_images(d, pep, k=None):
+    """The M image of the full mobility window, of the best component and, when k is another component (clicked in the
+    mobilogram), of that one. The one coloc reads is framed in orange; the others have grey titles (inspection only)."""
     qi = d["pt"].qi.get(pep)
     full, comp = ion_image(d, qi, 1), slot_image(d, qi)
     if comp is None:
         return None
-    f = make_subplots(1, 2, subplot_titles=("M, full mobility window", "M, best component (what coloc reads)"),
-                      horizontal_spacing=0.03, shared_xaxes="all", shared_yaxes="all")
-    f.add_trace(_image_trace(full), 1, 1)
-    f.add_trace(_image_trace(comp), 1, 2)
-    f.update_layout(template=TEMPLATE, height=330, margin=dict(l=10, r=10, t=40, b=10))
-    _square(f, 2)
+    qi = int(qi)
+    sw = bool(d["Q"].mob_switch[qi])
+    m, s = d["meta"], _saved(d, qi)
+    best = int(m["mob_best"][s])
+    lab = lambda j: f"component {j} ({m['mob_area'][s][j]:.0%}, r {m['mob_siso'][s][j]:.2f})"
+    panels = [("M, full mobility window", full, not sw), (f"M, best {lab(best)}", comp, sw)]
+    if k is not None and int(k) != best and (other := slot_image(d, qi, k)) is not None:
+        panels.append((f"M, clicked {lab(int(k))}", other, False))
+    n = len(panels)
+    f = make_subplots(1, n, horizontal_spacing=0.03, shared_xaxes="all", shared_yaxes="all",
+                      subplot_titles=[f"{t}: {'<b>coloc reads this</b>' if on else 'not used'}" for t, _, on in panels])
+    for i, (_, im, on) in enumerate(panels, 1):
+        f.add_trace(_image_trace(im), 1, i)
+        f.layout.annotations[i - 1].font = dict(color=ORANGE if on else GREY, size=12)
+        if on:
+            f.add_shape(type="rect", xref=f"x{'' if i == 1 else i} domain", yref=f"y{'' if i == 1 else i} domain",
+                        x0=0, x1=1, y0=0, y1=1, line=dict(color=ORANGE, width=4))
+    verdict = ("SWITCHED: coloc reads the best component" if sw else
+               "NOT switched: coloc reads the full window (components shown for checking only)")
+    f.update_layout(template=TEMPLATE, height=370, margin=dict(l=10, r=10, t=75, b=10),
+                    title=dict(text=f"{verdict}<br><sup>best component M / M+1 r {m['mob_siso'][s][best]:.2f} vs full "
+                                    f"window iso r {d['Q'].iso_r[qi]:.2f} (switch needs +0.1)</sup>",
+                               font=dict(color=ORANGE if sw else NAVY, size=14)))
+    _square(f, n)
     return f
 
 
@@ -850,6 +881,16 @@ def register(app):
             html.H3(f"M ion images (best {N_PROT_IMAGES} saved peptides, each on its own scale)"), _graph(imgs),
             _graph(corr)])
 
+    @app.callback(Output("mob-imgs", "children"), Input("mob-fig", "clickData"), State("sel-peptide", "data"),
+                  State("res-state", "data"), prevent_initial_call=True)
+    def mobility_click(click, pep, state):
+        d = _data(state)
+        cd = (click or {}).get("points", [{}])[0].get("customdata")
+        if d is None or cd is None or not pep:
+            return no_update
+        mi = mobility_images(d, pep, cd[0] if isinstance(cd, list) else cd)
+        return [_graph(mi)] if mi else no_update
+
     @app.callback(Output("pep-detail", "children"), Input("sel-peptide", "data"), Input("res-q", "value"),
                   State("res-state", "data"), prevent_initial_call=True)
     def peptide_detail(pep, thr, state):
@@ -885,8 +926,9 @@ def register(app):
                 html.Div(className="row", children=[
                     html.Div(className="col", children=_graph(envelope_fig(d, pep))),
                     html.Div(className="col", children=_graph(profile_fig(d, pep)))])]),
-            html.Div(className="card", children=[html.H2("Mobility"), _graph(mobility_fig(d, pep)),
-                                                 *([_graph(mi)] if (mi := mobility_images(d, pep)) else [])]),
+            html.Div(className="card", children=[html.H2("Mobility"), _graph(mobility_fig(d, pep), "mob-fig"),
+                                                 html.Div(id="mob-imgs", children=[_graph(mi)] if (
+                                                     mi := mobility_images(d, pep)) else [])]),
             html.Div(className="card", children=[
                 html.H2("Competition"),
                 html.H3(f"All candidates on this ion (within {ION_PPM} ppm)"), _small_table(ion),

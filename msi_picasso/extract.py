@@ -287,7 +287,7 @@ def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None,
                             img[:, 1], tic_normalize, threads)
     Q["mob_switch"] = sw
     log(f"mobility components: {int(sw.sum()):,} queries switch to their best component, {time.time() - t0:.0f} s")
-    del tims, tof, inten, indptr  # the event arrays: not needed past the mobility passes
+    del tims, tof, inten, indptr  # the event arrays live on only in mob["component_images"] (viewer)
     X, Q["valid"] = coloc_rows(img[:, 1], tic_normalize)
     return Q, X, img, prof2, (grid[frames[on]], shape), mob
 
@@ -340,7 +340,7 @@ def mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames, mzs, ppm, iso
     r > its full-window iso r (NaN: the median) + SLOT_GATE. Returns (switch (n_q,) bool, mob): mob["XS"]
     (n_switch, n_on) = the switched queries' best-slot M images transformed as coloc rows (TIC per pixel when
     tic_normalize, minus the common mode scaled by the slot's share of the window, centred, unit norm); for the
-    viewer only: "img" the same images raw, "mg" (n_q, n_bin) on-tissue M mobilograms, "kb" the bins' 1/K0, "cen" /
+    viewer only: "component_images" (q -> every component image of queries q, raw), "mg" (n_q, n_bin) on-tissue M mobilograms, "kb" the bins' 1/K0, "cen" /
     "area" (n_q, MOB_K) component centres and shares (NaN: no slot), "siso" their M / M+1 r, "best" the best slot."""
     from scipy.ndimage import gaussian_filter1d
     mobilograms, slot_moments, slot_image = _kernels()[2:]
@@ -383,7 +383,6 @@ def mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames, mzs, ppm, iso
     Y = np.zeros((len(frames), len(qs)), np.float32)
     slot_image(indptr, tof, inten, n_scan, frames, ptr, win, np.ascontiguousarray(R[qs, :, best[qs]]), Y)
     Y = np.ascontiguousarray(Y.T)
-    raw = Y.copy()
     tic = full.sum(0) if tic_normalize else np.ones(full.shape[1], np.float32)
     tic = np.where(tic > 0, tic, 1).astype(np.float32)
     cmode = (full / tic[None]).mean(0)
@@ -393,7 +392,19 @@ def mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames, mzs, ppm, iso
     Y -= share[:, None] * cmode[None]
     Y -= Y.mean(1, keepdims=True)
     Y /= np.maximum(np.sqrt((Y * Y).sum(1, keepdims=True)), 1e-10)
-    return sw, dict(XS=Y, img=raw, mg=mg.astype(np.float32), kb=kb, cen=cen, area=area, siso=siso, best=best)
+
+    def component_images(q):
+        """(qi, k, raw M images (n, n_on)) of every component of the queries q (viewer only; keeps the event arrays
+        alive until the caller drops it)."""
+        q = np.asarray(q, np.int64)
+        qq, kk = np.nonzero(slots[q])
+        qq = q[qq]
+        ptr, win = _windows(mzs[qq] * (1 - ppm * 1e-6), mzs[qq] * (1 + ppm * 1e-6), tof_mz)
+        out = np.zeros((len(frames), len(qq)), np.float32)
+        slot_image(indptr, tof, inten, n_scan, frames, ptr, win, np.ascontiguousarray(R[qq, :, kk]), out)
+        return qq, kk, np.ascontiguousarray(out.T)
+
+    return sw, dict(XS=Y, component_images=component_images, mg=mg.astype(np.float32), kb=kb, cen=cen, area=area, siso=siso, best=best)
 
 
 def coloc_rows(flat, tic_normalize):

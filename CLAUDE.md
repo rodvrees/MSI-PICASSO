@@ -28,8 +28,9 @@ isogate1 + `dgradcrat` + `m1cg`) and nothing else. New scoring ideas belong in a
    (+-10 ppm) of every query; pass 2 builds the M-1 and M m/z profiles (1 ppm bins, +-60 ppm) over the query's own
    top-decile pixels; passes 3-5 (`extract.mobility_slots`, isogate1) split each query's on-tissue M mobilogram into
    fixed-width (1.5% FWHM) components, compute each component's M / M+1 image r without storing the images, and
-   switch a query to its best component when that r beats the full window's iso r by 0.1 (`Q.mob_switch`; only the
-   switched queries' component images are built, as coloc rows). Output: the evidence table Q (one row per query
+   switch a query to its best component when that r beats the full window's iso r by 0.1 (`Q.mob_switch`). The best
+   component's image of a switched query is its coloc row; the event arrays then stay alive (in
+   `mob["component_images"]`) until the viewer has built every component's image of the saved queries. Output: the evidence table Q (one row per query
    m/z) and the coloc rows (on-tissue M images after optional per-pixel TIC normalisation and common-mode removal =
    minus the mean image over all queries; unit norm).
    Tissue mask: frame TIC >= its `tic_quantile` quantile.
@@ -55,8 +56,8 @@ isogate1 + `dgradcrat` + `m1cg`) and nothing else. New scoring ideas belong in a
    peak RSS per step), `figures/` with `figures = true`, and
    `viewer/` for the GUI (`cli.save_viewer`, read-only): `meta.npz` (pixel layout, TIC image, every query's m/z
    profile; per saved query the M-1 / M profiles, the M mobilogram and its components), `images.npy` (float16
-   M-1 / M / M+1 images, each scaled to its max) and `slot_images.npy` (best-component M images of the saved
-   switched queries) of the reported set (q <= 10%
+   M-1 / M / M+1 images, each scaled to its max) and `slot_images.npy` (M images of every mobility component of
+   the saved queries; the GUI frames the image coloc reads and shows a component's image when it is clicked) of the reported set (q <= 10%
    peptides, target peptides of picked q <= 10% proteins, GT, top 50 decoys); `viewer_all_targets` /
    `viewer_all_decoys` add every target / decoy query.
 
