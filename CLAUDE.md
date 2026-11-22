@@ -51,9 +51,12 @@ isogate1 + `dgradcrat` + `m1cg`) and nothing else. New scoring ideas belong in a
 7. **q-values**: peptide q = monotone (D + 1) / (k T) over each peptide's best row, k = decoy / target peptides
    before the competition. Proteins (`score.protein_table`): picked protein FDR (`q_picked`) and non-competitive `q`.
 8. **Output**: `peptides.tsv`, `proteins.tsv`, `rows.parquet` (every candidate with its terms), `evidence.parquet`,
-   `run.json` (config, offset, IDs, wall time and peak RSS per step), `figures/` with `figures = true`, and
+   `run.json` (config, offset, run constants sigma_run / M-1 apex shift, switched queries, IDs, wall time and
+   peak RSS per step), `figures/` with `figures = true`, and
    `viewer/` for the GUI (`cli.save_viewer`, read-only): `meta.npz` (pixel layout, TIC image, every query's m/z
-   profile) and `images.npy` (float16 M-1 / M / M+1 images, each scaled to its max) of the reported set (q <= 10%
+   profile; per saved query the M-1 / M profiles, the M mobilogram and its components), `images.npy` (float16
+   M-1 / M / M+1 images, each scaled to its max) and `slot_images.npy` (best-component M images of the saved
+   switched queries) of the reported set (q <= 10%
    peptides, target peptides of picked q <= 10% proteins, GT, top 50 decoys); `viewer_all_targets` /
    `viewer_all_decoys` add every target / decoy query.
 

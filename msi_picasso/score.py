@@ -153,7 +153,7 @@ def profile_features(Q, prof2, offset):
              apex sits at M-1, so the query reads the M+1 isotope of a lighter ion)
       m1g    |M-1 log-slope x sigma_run^2 at the run's M-1 apex shift - its median| (small: an M-1 apex where expected)
     sigma_run: run_sigma; M-1 apex shift: the shift (-15..15 ppm, 0.5 steps) of the M-1 profile that best matches the
-    M profile shape (mean r over the 10% highest-iso queries, +-20 ppm)."""
+    M profile shape (mean r over the 10% highest-iso queries, +-20 ppm). Returns (Q, {sigma_run, m1_shift} in ppm)."""
     x60 = np.arange(-60, 61, dtype=float)
     P1, P = prof2[:, 0].astype(float), prof2[:, 1].astype(float)
     p = P[:, 35:86]  # M, -25..25 ppm
@@ -182,7 +182,7 @@ def profile_features(Q, prof2, offset):
             best, s1 = v, sh
     m1g = _log_slope(P1, x60, offset + s1) * s ** 2
     Q["m1g"] = np.abs(m1g - np.nanmedian(m1g))
-    return Q
+    return Q, dict(sigma_run=float(s), m1_shift=float(s1))
 
 
 def terms(c, Q, pair_r, offset=0.0):
@@ -230,10 +230,16 @@ def terms(c, Q, pair_r, offset=0.0):
     return d[TERMS + extra + ["n_partners"]]
 
 
+def term_weights(cols):
+    """(names, weights) of the score terms present in cols: the five TERMS (+, +, -, -, -), then the EXTRA terms."""
+    names = TERMS + [k for k in EXTRA if k in cols]
+    return names, np.r_[SIGNS, [EXTRA[k] for k in names[len(TERMS):]]]
+
+
 def m1(T):
-    """Fixed z-sum of the terms: the five TERMS (signs +, +, -, -, -) and the EXTRA profile terms present in T."""
-    names = TERMS + [k for k in EXTRA if k in T]
-    return _z(T[names].to_numpy(float)) @ np.r_[SIGNS, [EXTRA[k] for k in names[len(TERMS):]]]
+    """Fixed weighted z-sum of the terms present in T (term_weights)."""
+    names, w = term_weights(T)
+    return _z(T[names].to_numpy(float)) @ w
 
 
 def ion_competition(s, dec, mz):

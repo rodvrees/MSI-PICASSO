@@ -1,18 +1,18 @@
 """Figures for checking a run (cli --figures):
   ids_vs_fdr.png        target peptides and proteins (picked) reported at each q threshold
   scores.png            target / decoy peptide score distributions and the PP plot (decoy vs target CDF)
-  terms.png             target / decoy distribution of each of the five terms (all rows)
+  terms.png             target / decoy distribution of each score term (all rows)
   mz.png                target / decoy query m/z distribution
   proteins/*.png        on-tissue M images of the target peptides of the best reported proteins (+ GT proteins)
   candidates/*.png      per candidate: M-1 / M / M+1 images, envelope vs averagine, the +-25 ppm top-decile-pixel
-                        m/z profile, and the five z-scored term contributions (reported targets, top decoys, GT)
+                        m/z profile, and the weighted z-scored term contributions (reported targets, top decoys, GT)
 """
 from pathlib import Path
 
 import numpy as np
 
 from msi_picasso.extract import CEN_PPM
-from msi_picasso.score import SIGNS, TERMS, _z, averagine_dist3, ids
+from msi_picasso.score import _z, averagine_dist3, ids, term_weights
 
 
 def _td_hist(ax, x, dec, bins):
@@ -33,7 +33,7 @@ def _image(ax, v, layout, title):
 N_PROT, N_CAND = 12, 20  # proteins and reported targets drawn (plus half as many top decoys, and every GT peptide)
 
 
-def save_figures(out, rows, pt, prt, Q, img, prof, layout, gt=()):
+def save_figures(out, rows, pt, prt, Q, img, prof, layout, gt=(), offset=0.0):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -66,8 +66,9 @@ def save_figures(out, rows, pt, prt, Q, img, prof, layout, gt=()):
     plt.close(fig)
 
     rdec = rows.is_decoy.to_numpy(bool)
-    fig, axs = plt.subplots(1, 5, figsize=(16, 3))
-    for ax, term in zip(axs, TERMS):
+    terms, w = term_weights(rows)
+    fig, axs = plt.subplots(1, len(terms), figsize=(3.2 * len(terms), 3))
+    for ax, term in zip(axs, terms):
         x = rows[term].to_numpy(float)
         _td_hist(ax, x, rdec, np.linspace(np.nanmin(x), np.nanmax(x), 60))
         ax.set(title=term, yscale="log")
@@ -94,7 +95,7 @@ def save_figures(out, rows, pt, prt, Q, img, prof, layout, gt=()):
         fig.savefig(out / "proteins" / f"{prot.replace('|', '_')}.png", dpi=110, bbox_inches="tight")
         plt.close(fig)
 
-    Z = _z(rows[TERMS].to_numpy(float)) * SIGNS
+    Z = _z(rows[terms].to_numpy(float)) * w
     bi = rows.groupby("peptide").s.idxmax()  # each peptide's best row
     picks = [("T", p) for p in tg[tg.q <= 0.05].sort_values("s", ascending=False).index[:N_CAND]]
     picks += [("D", p) for p in pt[dec].sort_values("s", ascending=False).index[:N_CAND // 2]]
@@ -112,10 +113,14 @@ def save_figures(out, rows, pt, prt, Q, img, prof, layout, gt=()):
         axs[3].bar(np.arange(3) + .2, ref, .4, label="averagine")
         axs[3].set(xticks=range(3), xticklabels=["M", "M+1", "M+2"], title=f"KL {r.kl:.2g}")
         axs[3].legend(fontsize=6)
-        axs[4].plot(x, prof[qi])
-        axs[4].axvline(Q.cen[qi], color="r", lw=.8)
-        axs[4].set(xlabel="ppm from query", title=f"centroid {Q.cen[qi]:+.2f} ppm")
-        axs[5].barh(TERMS, Z[rows.index.get_loc(bi[pep])])
+        axs[4].plot(x[prof[qi] > 0], prof[qi][prof[qi] > 0], ".-")  # sampled bins only
+        if "dgrad" in Q:
+            axs[4].axvline(Q.dgrad[qi] + offset, color="r", lw=.8)
+            axs[4].set(xlabel="ppm from query", title=f"dgrad {Q.dgrad[qi]:+.2f}, crat {Q.crat[qi]:.2f}")
+        else:
+            axs[4].axvline(Q.cen[qi], color="r", lw=.8)
+            axs[4].set(xlabel="ppm from query", title=f"centroid {Q.cen[qi]:+.2f} ppm")
+        axs[5].barh(terms, Z[rows.index.get_loc(bi[pep])])
         axs[5].set(title=f"s {r.s:.2f}, q {pt.q[pep]:.3f}")
         fig.suptitle(f"{kind} {pep} ({r.protein}) m/z {r.feature_mz:.4f}", fontsize=8)
         fig.savefig(out / "candidates" / f"{kind}_{i:03d}_{pep[:40]}.png", dpi=100, bbox_inches="tight")

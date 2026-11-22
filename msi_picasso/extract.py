@@ -205,7 +205,8 @@ def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None,
     """Evidence table Q (one row per query m/z in mzs, sorted), the unit-norm coloc rows X (valid rows only, float32),
     the on-tissue images (n_q, 3 windows M-1 / M / M+1, n_on), the top-decile-pixel M-1 / M m/z profiles (n_q, 2,
     121 bins, -60..60 ppm; the M -25..25 ppm part is prof2[:, 1, PW - CEN_PPM:PW + CEN_PPM + 1]), the image layout
-    (grid index of each on-tissue pixel, grid shape) and the switched queries' best-slot coloc rows XS (n_switch, n_on).
+    (grid index of each on-tissue pixel, grid shape) and the mobility components (mobility_slots: mob["XS"] = the
+    switched queries' best-slot coloc rows (n_switch, n_on)).
     mask: optional (H * W,) bool on-tissue mask (bench parity); default tissue_mask(frame TIC, tic_quantile)."""
     import warnings
     import alphatims.bruker as atb
@@ -282,13 +283,13 @@ def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None,
     # pass 3-5: mobility components; a query whose best component beats its full window on iso switches its coloc
     # image to that component's image (isogate1)
     k0 = np.asarray(tims.mobility_values, np.float64)
-    sw, XS = mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames[on], mzs, ppm, Q.iso_r.to_numpy(),
+    sw, mob = mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames[on], mzs, ppm, Q.iso_r.to_numpy(),
                             img[:, 1], tic_normalize, threads)
     Q["mob_switch"] = sw
     log(f"mobility components: {int(sw.sum()):,} queries switch to their best component, {time.time() - t0:.0f} s")
     del tims, tof, inten, indptr  # the event arrays: not needed past the mobility passes
     X, Q["valid"] = coloc_rows(img[:, 1], tic_normalize)
-    return Q, X, img, prof2, (grid[frames[on]], shape), XS
+    return Q, X, img, prof2, (grid[frames[on]], shape), mob
 
 
 def mob_fit(y, x):
@@ -336,9 +337,11 @@ def mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames, mzs, ppm, iso
     """isogate1 (bench 2, 2026-11-19). Per query, label-blind: fixed-width components of its on-tissue M mobilogram
     (mob_fit, within the apex +-MOB_BAND); every M and M+1 event split over them by responsibility
     a_k g_k / (sum_j a_j g_j + MOB_BASE max height); best slot = highest M / M+1 image r. The query switches when that
-    r > its full-window iso r (NaN: the median) + SLOT_GATE. Returns (switch (n_q,) bool, XS (n_switch, n_on) the
-    switched queries' best-slot M images transformed as coloc rows: TIC per pixel when tic_normalize, minus the common
-    mode scaled by the slot's share of the window, centred, unit norm)."""
+    r > its full-window iso r (NaN: the median) + SLOT_GATE. Returns (switch (n_q,) bool, mob): mob["XS"]
+    (n_switch, n_on) = the switched queries' best-slot M images transformed as coloc rows (TIC per pixel when
+    tic_normalize, minus the common mode scaled by the slot's share of the window, centred, unit norm); for the
+    viewer only: "img" the same images raw, "mg" (n_q, n_bin) on-tissue M mobilograms, "kb" the bins' 1/K0, "cen" /
+    "area" (n_q, MOB_K) component centres and shares (NaN: no slot), "siso" their M / M+1 r, "best" the best slot."""
     from scipy.ndimage import gaussian_filter1d
     mobilograms, slot_moments, slot_image = _kernels()[2:]
     nq = len(mzs)
@@ -380,6 +383,7 @@ def mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames, mzs, ppm, iso
     Y = np.zeros((len(frames), len(qs)), np.float32)
     slot_image(indptr, tof, inten, n_scan, frames, ptr, win, np.ascontiguousarray(R[qs, :, best[qs]]), Y)
     Y = np.ascontiguousarray(Y.T)
+    raw = Y.copy()
     tic = full.sum(0) if tic_normalize else np.ones(full.shape[1], np.float32)
     tic = np.where(tic > 0, tic, 1).astype(np.float32)
     cmode = (full / tic[None]).mean(0)
@@ -389,7 +393,7 @@ def mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames, mzs, ppm, iso
     Y -= share[:, None] * cmode[None]
     Y -= Y.mean(1, keepdims=True)
     Y /= np.maximum(np.sqrt((Y * Y).sum(1, keepdims=True)), 1e-10)
-    return sw, Y
+    return sw, dict(XS=Y, img=raw, mg=mg.astype(np.float32), kb=kb, cen=cen, area=area, siso=siso, best=best)
 
 
 def coloc_rows(flat, tic_normalize):

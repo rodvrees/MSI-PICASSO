@@ -60,10 +60,12 @@ def gt_set(path):
                   if "[" in x and x.count("[") == x.count("P[Oxidation]")}
 
 
-def save_viewer(out, cfg, rows, pt, prt, Q, img, prof, layout):
+def save_viewer(out, cfg, rows, pt, prt, Q, img, prof, layout, prof2, mob):
     """viewer/ for picasso-gui: images.npy = float16 M-1 / M / M+1 on-tissue images of the saved queries, each scaled
-    to its max (meta scale); meta.npz = which Q rows (qi), scale, on-tissue pixel index + grid shape, the TIC image,
-    the +-25 ppm m/z profile of every query. Saved queries: the reported set (peptides at q <= VIEWER_Q, the target
+    to its max (meta scale); slot_images.npy = float16 best-component M images of the saved queries that switch
+    (meta slot_qi, slot_scale); meta.npz = which Q rows (qi), scale, on-tissue pixel index + grid shape, the TIC
+    image, the +-25 ppm m/z profile of every query, and per saved query the M-1 / M profiles (prof2, +-60 ppm), the
+    M mobilogram (mob_mg on the 1/K0 bins mob_kb) and its components (mob_cen, mob_area, mob_siso, mob_best). Saved queries: the reported set (peptides at q <= VIEWER_Q, the target
     peptides of proteins at picked q <= VIEWER_Q, GT, the top decoys) plus all targets / decoys on request.
     Read-only use of the run's arrays: nothing here feeds the score."""
     from msi_picasso.extract import tdf_meta
@@ -86,8 +88,15 @@ def save_viewer(out, cfg, rows, pt, prt, Q, img, prof, layout):
     tic = tic[tic.index < len(grid)]
     px = grid[tic.index.to_numpy()]
     tic_img[px[px >= 0]] = tic.to_numpy()[px >= 0]
+    sw = Q.mob_switch.to_numpy()
+    slot_qi = qi[sw[qi]]
+    si = mob["img"][(np.cumsum(sw) - 1)[slot_qi]]
+    slot_scale = np.maximum(si.max(1), 1e-30)
+    np.save(v / "slot_images.npy", (si / slot_scale[:, None]).astype(np.float16))
     np.savez(v / "meta.npz", qi=qi, scale=scale.astype(np.float32), pix=layout[0], shape=np.array(layout[1]),
-             tic=tic_img, prof=prof.astype(np.float32))
+             tic=tic_img, prof=prof.astype(np.float32), prof2=prof2[qi].astype(np.float32), mob_kb=mob["kb"],
+             mob_mg=mob["mg"][qi], mob_cen=mob["cen"][qi], mob_area=mob["area"][qi], mob_siso=mob["siso"][qi],
+             mob_best=mob["best"][qi], slot_qi=slot_qi, slot_scale=slot_scale.astype(np.float32))
     return len(qi)
 
 
@@ -127,8 +136,8 @@ def run(cfg, log=print):
                      f"{len(cfg['decoy_seeds'])} seeds); {len(mzs):,} m/z to read")
     mask = np.load(cfg["tissue_mask"]) if cfg["tissue_mask"] else None
     say(3, "Evidence", f"reading {Path(cfg['maldi_d']).name}")
-    Q, X, img, prof2, layout, XS = extract(cfg["maldi_d"], mzs, cfg["extraction_ppm"], cfg["tic_quantile"],
-                                           cfg["tic_normalize"], mask, cfg["threads"], more)
+    Q, X, img, prof2, layout, mob = extract(cfg["maldi_d"], mzs, cfg["extraction_ppm"], cfg["tic_quantile"],
+                                            cfg["tic_normalize"], mask, cfg["threads"], more)
     prof = prof2[:, 1, PW - CEN_PPM:PW + CEN_PPM + 1]  # M, -25..25 ppm (viewer, figures)
     c["qi"] = np.searchsorted(Q.mz.to_numpy(), c.feature_mz.to_numpy())
     assert (Q.mz.to_numpy()[c.qi] == c.feature_mz.to_numpy()).all(), "candidate without its own query m/z"
@@ -143,8 +152,8 @@ def run(cfg, log=print):
     else:
         say(4, "m/z offset", f"{o:+.2f} ppm (estimate {o_auto[1]:+.2f} ppm, z {o_auto[2]:.1f}, "
                              f"{'accepted' if o != 0 else 'not accepted: needs z > 6 and at least 1 ppm'})")
-    Q = profile_features(Q, prof2, o)  # needs the offset
-    rows, pt, prt = score_run(c, Q, slot_r_fn(XS, Q.mob_switch.to_numpy(), X, Q.valid.to_numpy()), o)
+    Q, prof_run = profile_features(Q, prof2, o)  # needs the offset
+    rows, pt, prt = score_run(c, Q, slot_r_fn(mob["XS"], Q.mob_switch.to_numpy(), X, Q.valid.to_numpy()), o)
     step("score")
     say(5, "Score", f"{len(rows):,} candidates scored; {int(rows.removed.sum()):,} lost their ion to a better target")
     gt = gt_set(cfg["gt_peptides"]) if cfg["gt_peptides"] else set()
@@ -153,9 +162,10 @@ def run(cfg, log=print):
     Q.to_parquet(out / "evidence.parquet")
     pt.drop(columns="qi").to_csv(out / "peptides.tsv", sep="\t")
     prt.drop(columns="qi").to_csv(out / "proteins.tsv", sep="\t")
-    n_view = save_viewer(out, cfg, rows, pt, prt, Q, img, prof, layout)
+    n_view = save_viewer(out, cfg, rows, pt, prt, Q, img, prof, layout, prof2, mob)
     info = dict(config=cfg, n_targets=int((~pt.is_decoy).sum()), n_decoys=int(pt.is_decoy.sum()),
                 mz_offset=dict(used=o, estimate=o_auto[1], z=o_auto[2], accepted=o_auto[0]),
+                profile=prof_run, mob_switched=int(Q.mob_switch.sum()),
                 ids={f"{a:g}": ids(pt, a) for a in (.01, .05, .1)},
                 proteins_picked={f"{a:g}": ids(prt, a, "q_picked") for a in (.01, .05, .1)},
                 proteins_nc={f"{a:g}": ids(prt, a) for a in (.01, .05, .1)},
@@ -164,7 +174,7 @@ def run(cfg, log=print):
     say(6, "Output", f"peptides.tsv, proteins.tsv, run.json; viewer/ with ion images of {n_view:,} m/z")
     if cfg["figures"]:
         from msi_picasso.figures import save_figures
-        save_figures(out / "figures", rows, pt, prt, Q, img, prof, layout, gt)
+        save_figures(out / "figures", rows, pt, prt, Q, img, prof, layout, gt, o)
         step("figures")
         say(7, "Figures", "PNG check figures in figures/")
     info["steps"] = steps

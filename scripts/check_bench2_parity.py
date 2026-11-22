@@ -80,14 +80,15 @@ def main(mode, dss):
         if mode == "A":
             qs = np.flatnonzero(sw_b)
             XS = np.stack([C[q, best_b[q]] for q in qs])
-            Qf = S.profile_features(Q.assign(mob_switch=sw_b), P_b, o)
+            Qf = S.profile_features(Q.assign(mob_switch=sw_b), P_b, o)[0]
         else:
             mask = np.load(cfg["tissue_mask"]) if cfg.get("tissue_mask") else None
-            Qp, Xp, img, P, layout, XS = extract(cfg["maldi_d"], Q.mz.to_numpy(), cfg["extraction_ppm"],
+            Qp, Xp, img, P, layout, mob = extract(cfg["maldi_d"], Q.mz.to_numpy(), cfg["extraction_ppm"],
                                                  cfg["tic_quantile"], cfg["tic_normalize"], mask, 64, print)
             cols = [k for k in Q.columns if k in Qp]
             print("  Q columns", "identical" if Qp[cols].equals(Q[cols]) else
                   {k: diff(Qp[k], Q[k]) for k in cols if not Qp[k].equals(Q[k]) and k != "valid"})
+            XS = mob["XS"]
             print("  X", diff(Xp, X), "| M-1 / M profiles vs r2prof:", diff(P.astype(np.float32), P_b))
             sw = Qp.mob_switch.to_numpy()
             print(f"  switched: package {int(sw.sum())}, bench {int(sw_b.sum())}, differ {int((sw != sw_b).sum())}")
@@ -95,7 +96,7 @@ def main(mode, dss):
             srow = np.cumsum(sw) - 1
             print("  slot rows vs bench C:", diff(XS[srow[both]], np.stack([C[q, best_b[q]] for q in both])))
             Q, X, P_b = Qp, Xp, P
-            Qf = S.profile_features(Q, P, o)
+            Qf = S.profile_features(Q, P, o)[0]
         B = bench_features(ds, st)
         for k, v in B.items():
             print(f"  {k}: {diff(Qf[k], v)}")

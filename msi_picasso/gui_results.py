@@ -16,7 +16,8 @@ import plotly.graph_objects as go
 from dash import ALL, Input, Output, State, Patch, ctx, dcc, html, no_update
 from plotly.subplots import make_subplots
 
-from msi_picasso.score import ION_PPM, SIGNS, TERMS, _z, averagine_dist3
+from msi_picasso.extract import MOB_BAND, MOB_W, PW
+from msi_picasso.score import CRAT_PPM, ION_PPM, _z, averagine_dist3, term_weights
 
 NAVY, PURPLE, BLUE, CYAN = "#001050", "#3d0f8f", "#0060c0", "#00a0b0"
 GREEN, YELLOW, ORANGE, RED, GREY = "#4fb020", "#f0b000", "#f08000", "#d82814", "#9aa3b8"
@@ -58,11 +59,14 @@ def _load(outdir: str, mtime: float) -> dict:
     pt["qi"] = best.qi.reindex(pt.index)
     pt["mz"] = best.feature_mz.reindex(pt.index)
     pt["n_rows"] = rows.groupby("peptide").size().reindex(pt.index)
-    z = pd.DataFrame(_z(rows[TERMS].to_numpy(float)) * SIGNS, index=rows.index, columns=TERMS)  # signed, as in s0
+    terms, w = term_weights(rows)  # five terms (bench 1 run) or eight (bench 2)
+    z = pd.DataFrame(_z(rows[terms].to_numpy(float)) * w, index=rows.index, columns=terms)  # weighted, as in s0
     v = out / "viewer"
     meta = dict(np.load(v / "meta.npz")) if (v / "meta.npz").exists() else None
     imgs = np.load(v / "images.npy", mmap_mode="r") if (v / "images.npy").exists() else None
-    return dict(info=info, pt=pt, prt=prt, rows=rows, Q=Q, best=best, z=z, meta=meta, imgs=imgs)
+    slot = np.load(v / "slot_images.npy", mmap_mode="r") if (v / "slot_images.npy").exists() else None
+    return dict(info=info, pt=pt, prt=prt, rows=rows, Q=Q, best=best, z=z, terms=terms, w=w, meta=meta, imgs=imgs,
+                slot=slot)
 
 
 def run_state(outdir):
@@ -85,6 +89,27 @@ def ion_image(d, qi, channel=1):
     h, w = (int(x) for x in m["shape"])
     im = np.full(h * w, np.nan, np.float32)
     im[m["pix"]] = np.asarray(d["imgs"][k, channel], np.float32) * m["scale"][k, channel]
+    return im.reshape(h, w)
+
+
+def _saved(d, qi, key="qi"):
+    """Index of Q row qi in the viewer's saved list meta[key], or None (not saved, or a run without it)."""
+    m = d["meta"]
+    if m is None or key not in m or qi is None or np.isnan(qi):
+        return None
+    k = np.searchsorted(m[key], int(qi))
+    return k if k < len(m[key]) and m[key][k] == int(qi) else None
+
+
+def slot_image(d, qi):
+    """(H, W) best-mobility-component M image of a switched query from viewer/, NaN off tissue; None if not saved."""
+    k = _saved(d, qi, "slot_qi")
+    if k is None or d["slot"] is None:
+        return None
+    m = d["meta"]
+    h, w = (int(x) for x in m["shape"])
+    im = np.full(h * w, np.nan, np.float32)
+    im[m["pix"]] = np.asarray(d["slot"][k], np.float32) * m["slot_scale"][k]
     return im.reshape(h, w)
 
 
@@ -243,20 +268,24 @@ def pp_plot(d):
 
 
 def term_dists(d):
-    """The five terms per candidate row as mirror histograms, like the score: target rows up, decoy rows / k down
-    (k = decoy rows per target row), log10(1 + count) so the few high-evidence targets stay visible."""
-    rows = d["rows"]
+    """The score's terms per candidate row as mirror histograms, like the score: target rows up, decoy rows / k down
+    (k = decoy rows per target row), log10(1 + count) so the few high-evidence targets stay visible. 5 per row."""
+    rows, terms, w = d["rows"], d["terms"], d["w"]
     dec = rows.is_decoy.to_numpy(bool)
-    f = make_subplots(1, 5, subplot_titles=[f"{t} ({'+' if s > 0 else '-'})" for t, s in zip(TERMS, SIGNS)],
-                      horizontal_spacing=0.065)
-    for i, t in enumerate(TERMS, 1):
+    nr = (len(terms) + 4) // 5
+    f = make_subplots(nr, 5, subplot_titles=[f"{t} ({x:+g})" for t, x in zip(terms, w)], horizontal_spacing=0.065,
+                      vertical_spacing=0.22)
+    for i, t in enumerate(terms):
         x = rows[t].to_numpy(float)
-        _mirror_bars(f, x, dec, np.linspace(np.nanmin(x), np.nanmax(x) + 1e-9, 51), "rows", row=1, col=i)
+        _mirror_bars(f, x, dec, np.linspace(np.nanmin(x), np.nanmax(x) + 1e-9, 51), "rows",
+                     row=i // 5 + 1, col=i % 5 + 1)
     f.for_each_trace(lambda tr: tr.update(showlegend=False) if tr.xaxis != "x" else None)
-    f.update_layout(template=TEMPLATE, barmode="overlay", bargap=0, height=340,
-                    title="The five terms (sign in the score)", margin=dict(t=90), legend=dict(LEGEND_TOP, y=1.16))
+    f.update_layout(template=TEMPLATE, barmode="overlay", bargap=0, height=90 + 250 * nr,
+                    title=f"The {len(terms)} terms (weight in the score)", margin=dict(t=90),
+                    legend=dict(LEGEND_TOP, y=1 + 0.16 / nr))
     f.update_yaxes(tickfont=dict(size=11))
-    f.update_yaxes(title_text="decoys / k  |  targets", row=1, col=1)
+    for r in range(1, nr + 1):
+        f.update_yaxes(title_text="decoys / k  |  targets", row=r, col=1)
     f.update_xaxes(nticks=4, tickfont=dict(size=11))
     return f
 
@@ -312,19 +341,26 @@ def mz_dist(d):
 
 
 def centroid_dist(d, thr):
+    """The flank term's input: the apex estimate dgrad (bench 2 runs; ppm from the offset, median 0) or the
+    top-decile centroid (bench 1 runs; ppm from the query, with the offset line)."""
     pt, Q = d["pt"], d["Q"]
-    o = d["info"]["mz_offset"]["used"]
-    f = _fig("m/z centroid of the brightest pixels", xaxis_title="ppm from the query m/z",
+    o = d["info"]["mz_offset"]["used"] or 0
+    col, mark = ("dgrad", 0) if "dgrad" in Q else ("cen", o)
+    f = _fig("Peak apex of the brightest pixels (dgrad)" if col == "dgrad" else "m/z centroid of the brightest pixels",
+             xaxis_title="ppm from the offset" if col == "dgrad" else "ppm from the query m/z",
              yaxis_title="density", barmode="overlay", height=300)
     rep = pt[(pt.q <= thr) & ~pt.is_decoy].qi.dropna().astype(int)
-    x = Q.cen.to_numpy()[pt.qi.dropna().astype(int)]
-    lo, hi = np.nanpercentile(x, [1, 99])
-    f.update_xaxes(range=[min(lo, (o or 0)) - 1, max(hi, (o or 0)) + 1])  # the bulk of the data, not the +-25 window
+    v = Q[col].to_numpy()
+    lo, hi = np.nanpercentile(v[pt.qi.dropna().astype(int)], [1, 99])
+    f.update_xaxes(range=[min(lo, mark) - 1, max(hi, mark) + 1])  # the bulk of the data
     for qi, name, color in ((pt[pt.is_decoy].qi.dropna().astype(int), "decoys", ORANGE),
                             (rep, f"targets at q <= {thr:.0%}", BLUE)):
-        f.add_trace(go.Histogram(x=Q.cen.to_numpy()[qi], name=name, marker_color=color, opacity=0.6,
+        f.add_trace(go.Histogram(x=v[qi], name=name, marker_color=color, opacity=0.6,
                                  histnorm="probability density", xbins=dict(start=-25, end=25, size=0.5)))
-    f.add_vline(x=o or 0, line=dict(color=NAVY, dash="dot"), annotation_text=f"offset {o or 0:+.2f} ppm")
+    if col == "dgrad":
+        f.add_vrect(x0=-1, x1=1, fillcolor=GREY, opacity=0.15, line_width=0, annotation_text="no flank penalty")
+    else:
+        f.add_vline(x=o, line=dict(color=NAVY, dash="dot"), annotation_text=f"offset {o:+.2f} ppm")
     return f
 
 
@@ -372,16 +408,118 @@ def profile_fig(d, pep):
     qi, m = d["pt"].qi.get(pep), d["meta"]
     if m is None or qi is None or np.isnan(qi):
         return empty_fig("no m/z profile saved")
-    qi = int(qi)
+    qi, k = int(qi), _saved(d, qi)
     prof = m["prof"][qi]
     half = (len(prof) - 1) // 2
+    if "dgrad" in d["Q"]:  # bench 2: unsaved queries show the +-25 ppm M profile only (empty bins are skipped)
+        p2 = m["prof2"][k] if k is not None else np.zeros((2, 2 * PW + 1))
+        if k is None:
+            p2[1, PW - half:PW + half + 1] = prof
+        return profile2_fig(d, qi, p2)
     cen, o = float(d["Q"].cen[qi]), d["info"]["mz_offset"]["used"] or 0.0
     f = _fig(f"m/z profile, centroid {cen:+.2f} ppm", xaxis_title="ppm from the query m/z", yaxis_title="intensity",
              height=300)
-    f.add_trace(go.Scatter(x=np.arange(-half, half + 1), y=prof, mode="lines", line=dict(color=BLUE, width=2,
-                           shape="hvh"), fill="tozeroy", fillcolor="rgba(0,96,192,0.12)", name="profile"))
+    x, k = np.arange(-half, half + 1), prof > 0  # only the sampled bins: TOF spacing leaves empty 1 ppm bins
+    f.add_trace(go.Scatter(x=x[k], y=prof[k], mode="lines+markers", line=dict(color=BLUE, width=2),
+                           marker=dict(size=4), fill="tozeroy", fillcolor="rgba(0,96,192,0.12)", name="profile"))
     f.add_vline(x=cen, line=dict(color=ORANGE, width=2), annotation_text="centroid")
     f.add_vline(x=o, line=dict(color=NAVY, dash="dot"), annotation_text="offset", annotation_position="bottom right")
+    return f
+
+
+def profile2_fig(d, qi, p2):
+    """Bench 2 view: the M profile (dgrad: apex, crat: the grey +-2.5 ppm window at the offset) and the M-1 profile
+    (ppm from the exact M-1 position, scaled to the M max; m1c: an apex at M-1, m1g: its slope at the run's M-1
+    apex shift), top-decile pixels, sampled bins only."""
+    Q, info = d["Q"], d["info"]
+    o = info["mz_offset"]["used"] or 0.0
+    x = np.arange(-PW, PW + 1)
+    f = _fig(f"m/z profiles: dgrad {Q.dgrad[qi]:+.2f} ppm, crat {Q.crat[qi]:.2f}, m1c {Q.m1c[qi]:.2f}, "
+             f"m1g {Q.m1g[qi]:.2f}", xaxis_title="ppm from the expected position", yaxis_title="intensity",
+             height=330, legend=LEGEND_TOP, margin=dict(t=80))
+    pm, p1 = p2[1], p2[0]
+    sc = pm.max() / max(p1.max(), 1e-30)
+    for p, name, color, fill in ((pm, "M", BLUE, "rgba(0,96,192,0.12)"),
+                                 *([(p1 * sc, f"M-1 (x{sc:.2g})", ORANGE, None)] if p1.max() > 0 else [])):
+        k = p > 0  # only the sampled bins: TOF spacing leaves empty 1 ppm bins
+        f.add_trace(go.Scatter(x=x[k], y=p[k], mode="lines+markers", name=name, marker=dict(size=4),
+                               line=dict(color=color, width=2), fill="tozeroy" if fill else None, fillcolor=fill))
+    f.add_vrect(x0=o - CRAT_PPM, x1=o + CRAT_PPM, fillcolor=GREY, opacity=0.2, line_width=0)
+    f.add_vline(x=o + float(Q.dgrad[qi]), line=dict(color=BLUE, width=2), annotation_text="M apex")
+    f.add_vline(x=o, line=dict(color=NAVY, dash="dot"), annotation_text="offset", annotation_position="bottom right")
+    f.add_vline(x=o + info["profile"]["m1_shift"], line=dict(color=ORANGE, dash="dash"), annotation_text="run M-1 apex",
+                annotation_position="top left")
+    f.update_xaxes(range=[-30, 30])
+    return f
+
+
+def mobility_fig(d, pep):
+    """The query's on-tissue M mobilogram and its fixed-width (1.5% FWHM) components (isogate1), each labelled with
+    its area share and M / M+1 image r; the best one bold. The query's coloc reads that component's image when it
+    switched (its r beats the full window's iso r by 0.1)."""
+    qi = d["pt"].qi.get(pep)
+    k, m = _saved(d, qi), d["meta"]
+    if k is None or "mob_mg" not in m:
+        return empty_fig("no mobilogram saved (run without mobility viewer output, or peptide not saved)")
+    qi = int(qi)
+    kb, y = m["mob_kb"], m["mob_mg"][k].astype(float)
+    cen, area, siso, best = m["mob_cen"][k], m["mob_area"][k], m["mob_siso"][k], int(m["mob_best"][k])
+    sw = bool(d["Q"].mob_switch[qi])
+    f = _fig(f"Mobilogram: {'switched to component' if sw else 'full window'} (iso r {d['Q'].iso_r[qi]:.2f})",
+             xaxis_title="1/K0 (V s / cm²)", yaxis_title="intensity", height=330, legend=LEGEND_TOP,
+             margin=dict(t=80))
+    f.add_trace(go.Scatter(x=kb, y=y, mode="lines", name="M", line=dict(color=NAVY, width=2), fill="tozeroy",
+                           fillcolor="rgba(0,16,80,0.08)"))
+    a = int(np.argmax(y))
+    band = (kb >= kb[a] * (1 - MOB_BAND)) & (kb <= kb[a] * (1 + MOB_BAND))
+    dk = np.median(np.abs(np.diff(kb)))
+    tot = y[band].sum() * dk
+    xx = np.linspace(kb[band].min(), kb[band].max(), 300)
+    for j in np.flatnonzero(np.isfinite(cen)):
+        sd = cen[j] * MOB_W / 100 / 2.3548
+        g = area[j] * tot * np.exp(-0.5 * ((xx - cen[j]) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
+        f.add_trace(go.Scatter(x=xx, y=g, mode="lines", name=f"{area[j]:.0%}, r {siso[j]:.2f}",
+                               line=dict(color=ORANGE if j == best else CYAN, width=3 if j == best else 1.5,
+                                         dash=None if j == best else "dot")))
+    f.update_xaxes(range=[kb[band].min(), kb[band].max()])
+    return f
+
+
+def mobility_images(d, pep):
+    """The M image (full mobility window) next to the best component's M image, for a switched query."""
+    qi = d["pt"].qi.get(pep)
+    full, comp = ion_image(d, qi, 1), slot_image(d, qi)
+    if comp is None:
+        return None
+    f = make_subplots(1, 2, subplot_titles=("M, full mobility window", "M, best component (what coloc reads)"),
+                      horizontal_spacing=0.03, shared_xaxes="all", shared_yaxes="all")
+    f.add_trace(_image_trace(full), 1, 1)
+    f.add_trace(_image_trace(comp), 1, 2)
+    f.update_layout(template=TEMPLATE, height=330, margin=dict(l=10, r=10, t=40, b=10))
+    _square(f, 2)
+    return f
+
+
+def head_anatomy(d, thr):
+    """The profile features of the score's head: the targets at q <= thr against the same number (at least 50) of
+    top-scoring decoys. Shows which feature keeps decoys out of the reported set."""
+    pt, Q = d["pt"], d["Q"]
+    if "dgrad" not in Q:
+        return empty_fig("run without profile features (bench 1 score)")
+    rep = pt[(pt.q <= thr) & ~pt.is_decoy].dropna(subset=["qi"])
+    dec = pt[pt.is_decoy].dropna(subset=["qi"]).nlargest(max(50, len(rep)), "s")
+    f = make_subplots(1, 2, subplot_titles=("M peak: apex dgrad vs centre ratio crat",
+                                            "M-1: centre ratio m1c vs slope m1g"), horizontal_spacing=0.1)
+    for sub, name, color in ((dec, f"top {len(dec)} decoys", ORANGE), (rep, f"targets at q <= {thr:.0%}", BLUE)):
+        q = sub.qi.astype(int).to_numpy()
+        for col, (a, b) in enumerate((("dgrad", "crat"), ("m1c", "m1g")), 1):
+            f.add_trace(go.Scattergl(x=Q[a].to_numpy()[q], y=Q[b].to_numpy()[q], mode="markers", name=name,
+                                     showlegend=col == 1, customdata=sub.index, marker=dict(color=color, size=6,
+                                     opacity=0.7), hovertemplate="%{customdata}<br>" + a + " %{x:.2f}<br>" + b
+                                     + " %{y:.2f}<extra></extra>"), 1, col)
+            f.update_xaxes(title_text=a, row=1, col=col)
+            f.update_yaxes(title_text=b, row=1, col=col)
+    f.update_layout(template=TEMPLATE, height=380, legend=LEGEND_TOP, margin=dict(t=80))
     return f
 
 
@@ -392,10 +530,11 @@ def terms_fig(d, pep):
     rows = d["rows"]
     idx = rows.index[(rows.peptide == pep) & ~rows.removed]
     zz = d["z"].loc[idx].iloc[int(np.argmax(rows.s[idx].to_numpy()))]
-    f = _fig(f"Term contributions (z, signed), s {b.s[pep]:.2f}", xaxis_title="contribution to s0", height=300)
-    f.add_trace(go.Bar(y=TERMS, x=zz.to_numpy(), orientation="h",
+    f = _fig(f"Term contributions (z x weight), s {b.s[pep]:.2f}", xaxis_title="contribution to s0",
+             height=120 + 30 * len(d["terms"]))
+    f.add_trace(go.Bar(y=d["terms"], x=zz.to_numpy(), orientation="h",
                        marker_color=[BLUE if v >= 0 else ORANGE for v in zz.to_numpy()],
-                       customdata=b.loc[pep, TERMS].to_numpy(float),
+                       customdata=b.loc[pep, d["terms"]].to_numpy(float),
                        hovertemplate="%{y}: %{x:+.2f} (raw %{customdata:.3g})<extra></extra>"))
     f.update_yaxes(autorange="reversed")
     return f
@@ -599,6 +738,14 @@ def register(app):
                   html.Div(className="col", children=_graph(centroid_dist(d, thr)))])]),
               html.Div(className="card", children=[html.H2("Score calibration"), html.Div(className="row", children=[
                   html.Div(className="col", children=_graph(pp_plot(d))), html.Div(className="col")])])]
+        pr = info.get("profile")
+        if pr:
+            qc.insert(2, html.Div(className="card", children=[
+                html.H2("Run constants (estimated label-free from this run)"), html.Div(className="stat-row", children=[
+                    _stat(f"{pr['sigma_run']:.1f} ppm", "m/z peak width (sigma), scales dgrad and m1g"),
+                    _stat(f"{pr['m1_shift']:+.1f} ppm", "M-1 apex shift vs M (m1g reads the slope there)"),
+                    _stat(f"{info['mob_switched']:,}", "queries switched to a mobility component")]),
+                html.H3("Head anatomy"), _graph(head_anatomy(d, thr))]))
         return stats, ov, qc
 
     @app.callback(Output("ids-fig", "figure"), Input("ids-fig", "relayoutData"), State("res-state", "data"),
@@ -724,6 +871,8 @@ def register(app):
         kv = [("protein", html.Button(r.protein, id="pep-protein-link", n_clicks=0, className="linklike",
                                       title="Open this protein")), ("query m/z", f"{mz:.5f}"), ("score s", f"{r.s:.3f}"),
               ("coloc partners", "–" if b is None else f"{int(b.n_partners)}"),
+              *([("coloc image", "best mobility component" if d["Q"].mob_switch[int(r.qi)] else "full window")]
+                if "mob_switch" in d["Q"] and np.isfinite(r.qi) else []),
               ("candidate rows", f"{int(r.n_rows)}")]
         return html.Div([
             html.Div(className="card", children=[
@@ -736,6 +885,8 @@ def register(app):
                 html.Div(className="row", children=[
                     html.Div(className="col", children=_graph(envelope_fig(d, pep))),
                     html.Div(className="col", children=_graph(profile_fig(d, pep)))])]),
+            html.Div(className="card", children=[html.H2("Mobility"), _graph(mobility_fig(d, pep)),
+                                                 *([_graph(mi)] if (mi := mobility_images(d, pep)) else [])]),
             html.Div(className="card", children=[
                 html.H2("Competition"),
                 html.H3(f"All candidates on this ion (within {ION_PPM} ppm)"), _small_table(ion),
