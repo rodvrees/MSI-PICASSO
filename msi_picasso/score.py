@@ -185,18 +185,19 @@ def profile_features(Q, prof2, offset):
     return Q
 
 
-def terms(c, Q, pair_r, offset=0.0, slot_r=None):
+def terms(c, Q, pair_r, offset=0.0):
     """The term columns (raw values, before z-scoring) of candidates c (with qi = their Q row): TERMS, then the EXTRA
     profile terms when Q has profile_features' columns. Per-run (label-blind) fills: store NaNs -> the median over all
     rows; a no-signal row without coloc -> the pooled minimum coloc. flank: max(0, |dgrad| - 1) when Q has dgrad,
-    else the centroid form (|centroid - offset| ppm, hinge 2). slot_r (extract.slot_r_fn): the coloc pairs of a query
-    with Q.mob_switch read its best mobility component's image (isogate1)."""
+    else the centroid form (|centroid - offset| ppm, hinge 2; mz_offset needs it, before the profile features).
+    Bench 2 coloc (isogate1): pass extract.slot_r_fn as pair_r."""
     q = c.qi.to_numpy()
     d = pd.DataFrame(index=c.index)
+    bench2 = "dgrad" in Q
     d["iso"] = _filled(Q.iso_r.to_numpy()[q])
     d["kl"] = averagine_kl(Q.mz.to_numpy(), Q[["env0", "env1", "env2"]].to_numpy(float))[q]  # per query m/z
     d["mm1"] = np.maximum(0.0, _filled(Q.mm1_r.to_numpy()[q]) - MM1_HINGE)
-    if "dgrad" in Q:
+    if bench2:
         d["flank"] = _filled(np.maximum(0.0, np.abs(Q.dgrad.to_numpy()) - DGRAD_HINGE)[q])
     else:
         d["flank"] = np.maximum(0.0, _filled(np.abs(Q.cen.to_numpy()[q] - offset)) - FLANK_HINGE)
@@ -206,9 +207,6 @@ def terms(c, Q, pair_r, offset=0.0, slot_r=None):
     ev = pd.Series(sub).rank(pct=True).groupby(c.feature_mz.to_numpy()).mean()
     pairs = partner_pairs(c, Q.valid.to_numpy())
     pairs["r"] = pair_r(pairs.qi.to_numpy(), pairs.pqi.to_numpy())
-    if slot_r is not None:
-        sw = Q.mob_switch.to_numpy()[pairs.qi.to_numpy()]
-        pairs.loc[sw, "r"] = slot_r(pairs.qi.to_numpy()[sw], pairs.pqi.to_numpy()[sw])
     p90 = Q.p90.to_numpy(float)
     w = np.sqrt(np.nan_to_num(p90[pairs.qi.to_numpy()]).clip(0) * np.nan_to_num(p90[pairs.pqi.to_numpy()]).clip(0))
     w = w * np.nan_to_num(pairs.partner_mz.map(ev).to_numpy(float))
@@ -224,7 +222,7 @@ def terms(c, Q, pair_r, offset=0.0, slot_r=None):
     d["coloc"] = x.where(n < 1, (n * x + SHRINK * x.median()) / (n + SHRINK))
     d["n_partners"] = n
     extra = []
-    if "crat" in Q:
+    if bench2:
         d["crat"] = _filled((1.0 - Q.crat.to_numpy())[q])
         d["m1c"] = _filled(np.maximum(0.0, Q.m1c.to_numpy() - M1C_HINGE)[q])
         d["m1g"] = _filled(np.maximum(0.0, M1G_HINGE - Q.m1g.to_numpy())[q])
@@ -316,11 +314,11 @@ def _picked_qvalues(best):
     return out
 
 
-def score_run(c, Q, pair_r, offset=0.0, slot_r=None):
+def score_run(c, Q, pair_r, offset=0.0):
     """The adopted score of one run: (rows with terms, score s0 and final s and the `removed` flag, peptide table,
     protein table). k = decoy / target peptides before the per-ion competition. Q with profile_features' columns and
-    slot_r give the bench 2 score; without them, the bench 1 score."""
-    T = terms(c, Q, pair_r, offset, slot_r)
+    pair_r = extract.slot_r_fn give the bench 2 score; without them, the bench 1 score."""
+    T = terms(c, Q, pair_r, offset)
     s0 = m1(T)
     dec, mz = c.is_decoy.to_numpy(bool), c.feature_mz.to_numpy(float)
     pk = c.groupby("peptide").is_decoy.first()

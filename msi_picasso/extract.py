@@ -14,6 +14,7 @@ Intensities are integer counts, so float32 sums are exact. From these, per query
 and the coloc matrix: on-tissue M images, optionally TIC-normalised per pixel, minus the mean image over all queries
 (common mode), centred and scaled to unit norm; r = row dot product.
 """
+import functools
 import sqlite3
 import sys
 import time
@@ -62,6 +63,7 @@ def _windows(lo, hi, tof_mz):
     return np.cumsum(ptr), w[np.argsort(t, kind="stable")].astype(np.int64)
 
 
+@functools.cache  # one JIT per process
 def _kernels():
     import numba
 
@@ -201,9 +203,9 @@ class _Progress:
 
 def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None, threads=32, log=print):
     """Evidence table Q (one row per query m/z in mzs, sorted), the unit-norm coloc rows X (valid rows only, float32),
-    the on-tissue images (n_q, 3 windows M-1 / M / M+1, n_on), the top-decile-pixel M m/z profiles (n_q, 51 bins,
-    -25..25 ppm), the image layout (grid index of each on-tissue pixel, grid shape), the M-1 / M profiles (n_q, 2,
-    121 bins, -60..60 ppm) and the switched queries' best-slot coloc rows XS (n_switch, n_on).
+    the on-tissue images (n_q, 3 windows M-1 / M / M+1, n_on), the top-decile-pixel M-1 / M m/z profiles (n_q, 2,
+    121 bins, -60..60 ppm; the M -25..25 ppm part is prof2[:, 1, PW - CEN_PPM:PW + CEN_PPM + 1]), the image layout
+    (grid index of each on-tissue pixel, grid shape) and the switched queries' best-slot coloc rows XS (n_switch, n_on).
     mask: optional (H * W,) bool on-tissue mask (bench parity); default tissue_mask(frame TIC, tic_quantile)."""
     import warnings
     import alphatims.bruker as atb
@@ -228,7 +230,7 @@ def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None,
     frames = frames[np.argsort(grid[frames], kind="stable")]  # pixel (grid) order
     on = mask[grid[frames]] if mask is not None else tissue_mask(tic.reindex(frames).fillna(0).to_numpy(), tic_quantile)
     log(f"{len(tof):,} events, {len(frames):,} pixels ({int(on.sum()):,} on tissue), {time.time() - t0:.0f} s")
-    frame_sums, profile, mobilograms, slot_moments, slot_image = _kernels()
+    frame_sums, profile = _kernels()[:2]
     # pass 1: windows w = 4 q + c, c = 0 (M-1), 1 (M), 2 (M+1), 3 (M+2)
     cm = (mzs[:, None] + NEUTRON * np.arange(-1, 3)[None]).ravel()
     ptr, win = _windows(cm * (1 - ppm * 1e-6), cm * (1 + ppm * 1e-6), tof_mz)
@@ -281,12 +283,12 @@ def extract(d, mzs, ppm=10.0, tic_quantile=0.25, tic_normalize=False, mask=None,
     # image to that component's image (isogate1)
     k0 = np.asarray(tims.mobility_values, np.float64)
     sw, XS = mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames[on], mzs, ppm, Q.iso_r.to_numpy(),
-                            img[:, 1], tic_normalize, threads, (mobilograms, slot_moments, slot_image))
+                            img[:, 1], tic_normalize, threads)
     Q["mob_switch"] = sw
     log(f"mobility components: {int(sw.sum()):,} queries switch to their best component, {time.time() - t0:.0f} s")
     del tims, tof, inten, indptr  # the event arrays: not needed past the mobility passes
     X, Q["valid"] = coloc_rows(img[:, 1], tic_normalize)
-    return Q, X, img, prof, (grid[frames[on]], shape), prof2, XS
+    return Q, X, img, prof2, (grid[frames[on]], shape), XS
 
 
 def mob_fit(y, x):
@@ -330,8 +332,7 @@ def slot_gate(slots, siso, iso_r):
     return slots.any(1) & (sb > iso_full + SLOT_GATE), best
 
 
-def mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames, mzs, ppm, iso_r, full, tic_normalize, threads,
-                   kernels):
+def mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames, mzs, ppm, iso_r, full, tic_normalize, threads):
     """isogate1 (bench 2, 2026-11-19). Per query, label-blind: fixed-width components of its on-tissue M mobilogram
     (mob_fit, within the apex +-MOB_BAND); every M and M+1 event split over them by responsibility
     a_k g_k / (sum_j a_j g_j + MOB_BASE max height); best slot = highest M / M+1 image r. The query switches when that
@@ -339,7 +340,7 @@ def mobility_slots(indptr, tof, inten, tof_mz, k0, n_scan, frames, mzs, ppm, iso
     switched queries' best-slot M images transformed as coloc rows: TIC per pixel when tic_normalize, minus the common
     mode scaled by the slot's share of the window, centred, unit norm)."""
     from scipy.ndimage import gaussian_filter1d
-    mobilograms, slot_moments, slot_image = kernels
+    mobilograms, slot_moments, slot_image = _kernels()[2:]
     nq = len(mzs)
     nb = (n_scan + MOB_BIN - 1) // MOB_BIN
     kb = k0[np.minimum(np.arange(nb) * MOB_BIN + MOB_BIN // 2, n_scan - 1)]  # 1/K0 of each bin
@@ -423,13 +424,14 @@ def pair_r_fn(X, valid):
 
 
 def slot_r_fn(XS, switch, X, valid):
-    """slot_r(i, j) for a switched Q row i and a valid Q row j: r of i's best-slot image (XS) with j's coloc row."""
-    srow, row = np.cumsum(switch) - 1, np.cumsum(valid) - 1
+    """pair_r (pair_r_fn) with isogate1: a switched Q row i reads its best-slot image (XS) against j's coloc row."""
+    srow, row, pair_r = np.cumsum(switch) - 1, np.cumsum(valid) - 1, pair_r_fn(X, valid)
 
     def slot_r(i, j):
-        r = np.empty(len(i))
-        for s in range(0, len(i), CHUNK):
-            r[s:s + CHUNK] = np.einsum("ij,ij->i", XS[srow[i[s:s + CHUNK]]], X[row[j[s:s + CHUNK]]], dtype=np.float64)
+        r, s = pair_r(i, j), np.flatnonzero(switch[i])
+        for k in range(0, len(s), CHUNK):
+            t = s[k:k + CHUNK]
+            r[t] = np.einsum("ij,ij->i", XS[srow[i[t]]], X[row[j[t]]], dtype=np.float64)
         return r
     return slot_r
 

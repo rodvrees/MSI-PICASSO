@@ -22,7 +22,7 @@ ROOT = "/home/robbe/MALDI_MSI_score"
 TAGS = {"amyloidosis": "sO", "kidney": "sS", "her2": "sHM"}
 
 
-def bench_features(ds, st, Q, o):
+def bench_features(ds, st):
     """The bench's per-query features: flankx (dgrad, crat) and r2_profile (m1c, m1g)."""
     f = np.load(f"{st}/flankx_feat.npz")
     m = pd.read_parquet(f"{ROOT}/bench2/r2_profile/out/{ds}_m1c.parquet")
@@ -44,15 +44,15 @@ def score_draws(st, Q, X):
     cfg = json.load(open(f"{st}/cfg.json"))
     pr = pair_r_fn(X, Q.valid.to_numpy())
     o = S.mz_offset(draws[0], Q, pr)[0] if cfg["mz_offset_ppm"] == "auto" else float(cfg["mz_offset_ppm"])
-    return o, draws, pr
+    return o, draws, cfg
 
 
-def compare(ds, tag, Qf, draws, pr, o, slot_r):
+def compare(ds, tag, Qf, draws, o, slot_r):
     ref = pd.read_csv(f"{ROOT}/bench2/results/worlds/{ds}_ref_{tag}.tsv", sep="\t")
     ref = ref[ref.world == "real"].set_index("k")
     bad = 0
     for r, c in enumerate(draws):
-        rows, pt, prt = S.score_run(c, Qf, pr, o, slot_r)
+        rows, pt, prt = S.score_run(c, Qf, slot_r, o)
         tg = pt[~pt.is_decoy]
         ids = [S.ids(pt, a) for a in (.01, .05, .1)]
         cut = float(tg.s[tg.q <= .05].min()) if (tg.q <= .05).any() else np.nan
@@ -63,7 +63,6 @@ def compare(ds, tag, Qf, draws, pr, o, slot_r):
         print(f"  draw {r:2d}: IDs {ids} ref {[int(ref.ids1[r]), int(ref.ids5[r]), int(ref.ids10[r])]}, "
               f"5% set {'same' if same else 'DIFFERENT'}, |cut diff| {dc:.1e}", flush=True)
     print(f"{ds}: {20 - bad}/20 draws identical", flush=True)
-    return bad
 
 
 def main(mode, dss):
@@ -75,35 +74,32 @@ def main(mode, dss):
         slots, siso = np.load(f"{st}/comp/slots.npy"), np.load(f"{st}/comp/iso.npy")
         sw_b, best_b = slot_gate(slots, siso, Q.iso_r.to_numpy())
         P_b = np.load(f"{st}/r2prof.npz")["P"][:, :2]
-        o, draws, pr = score_draws(st, Q, X)
+        o, draws, cfg = score_draws(st, Q, X)
+        C = np.load(f"{st}/comp/C.npy", mmap_mode="r")
         print(f"{ds}: offset {o:+.4f} ppm, {int(sw_b.sum())} switched queries (bench comp/)", flush=True)
         if mode == "A":
-            C = np.load(f"{st}/comp/C.npy", mmap_mode="r")
             qs = np.flatnonzero(sw_b)
             XS = np.stack([C[q, best_b[q]] for q in qs])
             Qf = S.profile_features(Q.assign(mob_switch=sw_b), P_b, o)
         else:
-            cfg = json.load(open(f"{st}/cfg.json"))
             mask = np.load(cfg["tissue_mask"]) if cfg.get("tissue_mask") else None
-            Qp, Xp, img, prof, layout, P, XS = extract(cfg["maldi_d"], Q.mz.to_numpy(), cfg["extraction_ppm"],
-                                                       cfg["tic_quantile"], cfg["tic_normalize"], mask, 64, print)
+            Qp, Xp, img, P, layout, XS = extract(cfg["maldi_d"], Q.mz.to_numpy(), cfg["extraction_ppm"],
+                                                 cfg["tic_quantile"], cfg["tic_normalize"], mask, 64, print)
             cols = [k for k in Q.columns if k in Qp]
             print("  Q columns", "identical" if Qp[cols].equals(Q[cols]) else
                   {k: diff(Qp[k], Q[k]) for k in cols if not Qp[k].equals(Q[k]) and k != "valid"})
             print("  X", diff(Xp, X), "| M-1 / M profiles vs r2prof:", diff(P.astype(np.float32), P_b))
             sw = Qp.mob_switch.to_numpy()
             print(f"  switched: package {int(sw.sum())}, bench {int(sw_b.sum())}, differ {int((sw != sw_b).sum())}")
-            C = np.load(f"{st}/comp/C.npy", mmap_mode="r")
             both = np.flatnonzero(sw & sw_b)
             srow = np.cumsum(sw) - 1
             print("  slot rows vs bench C:", diff(XS[srow[both]], np.stack([C[q, best_b[q]] for q in both])))
             Q, X, P_b = Qp, Xp, P
             Qf = S.profile_features(Q, P, o)
-        B = bench_features(ds, st, Q, o)
+        B = bench_features(ds, st)
         for k, v in B.items():
             print(f"  {k}: {diff(Qf[k], v)}")
-        compare(ds, tag, Qf, draws, pr if mode == "A" else pair_r_fn(X, Q.valid.to_numpy()), o,
-                slot_r_fn(XS, Qf.mob_switch.to_numpy(), X, Qf.valid.to_numpy()))
+        compare(ds, tag, Qf, draws, o, slot_r_fn(XS, Qf.mob_switch.to_numpy(), X, Qf.valid.to_numpy()))
 
 
 if __name__ == "__main__":
