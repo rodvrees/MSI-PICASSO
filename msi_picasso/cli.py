@@ -94,8 +94,8 @@ def save_viewer(out, cfg, rows, pt, prt, Q, img, prof, layout):
 def run(cfg, log=print):
     from importlib.metadata import version
     from msi_picasso.candidates import read_targets, world
-    from msi_picasso.extract import extract, pair_r_fn, tdf_meta
-    from msi_picasso.score import ids, mz_offset, score_run
+    from msi_picasso.extract import extract, pair_r_fn, slot_r_fn, tdf_meta
+    from msi_picasso.score import ids, mz_offset, profile_features, score_run
     out = Path(cfg["output_dir"])
     out.mkdir(parents=True, exist_ok=True)
     steps, t, t0 = [], time.time(), time.time()
@@ -127,8 +127,8 @@ def run(cfg, log=print):
                      f"{len(cfg['decoy_seeds'])} seeds); {len(mzs):,} m/z to read")
     mask = np.load(cfg["tissue_mask"]) if cfg["tissue_mask"] else None
     say(3, "Evidence", f"reading {Path(cfg['maldi_d']).name}")
-    Q, X, img, prof, layout = extract(cfg["maldi_d"], mzs, cfg["extraction_ppm"], cfg["tic_quantile"], cfg["tic_normalize"],
-                              mask, cfg["threads"], more)
+    Q, X, img, prof, layout, prof2, XS = extract(cfg["maldi_d"], mzs, cfg["extraction_ppm"], cfg["tic_quantile"],
+                                                 cfg["tic_normalize"], mask, cfg["threads"], more)
     c["qi"] = np.searchsorted(Q.mz.to_numpy(), c.feature_mz.to_numpy())
     assert (Q.mz.to_numpy()[c.qi] == c.feature_mz.to_numpy()).all(), "candidate without its own query m/z"
     pair_r = pair_r_fn(X, Q.valid.to_numpy())
@@ -142,7 +142,8 @@ def run(cfg, log=print):
     else:
         say(4, "m/z offset", f"{o:+.2f} ppm (estimate {o_auto[1]:+.2f} ppm, z {o_auto[2]:.1f}, "
                              f"{'accepted' if o != 0 else 'not accepted: needs z > 6 and at least 1 ppm'})")
-    rows, pt, prt = score_run(c, Q, pair_r, o)
+    Q = profile_features(Q, prof2, o)  # needs the offset
+    rows, pt, prt = score_run(c, Q, pair_r, o, slot_r_fn(XS, Q.mob_switch.to_numpy(), X, Q.valid.to_numpy()))
     step("score")
     say(5, "Score", f"{len(rows):,} candidates scored; {int(rows.removed.sum()):,} lost their ion to a better target")
     gt = gt_set(cfg["gt_peptides"]) if cfg["gt_peptides"] else set()
