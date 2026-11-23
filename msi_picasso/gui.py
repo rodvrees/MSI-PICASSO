@@ -188,8 +188,7 @@ def make_layout():
         html.Div(id="pane-log", children=_tab_log(), hidden=True),
         html.Div(id="pane-res", children=gui_results.layout(), hidden=True),
         html.Div(id="fb-modal-wrap"),
-        html.Div(className="footer", children="Fonts: Silkscreen and Departure Mono (SIL OFL); "
-                 "Px437 IBM VGA 8x16 by VileR, int10h.org (CC BY-SA 4.0)."),
+        html.Div(className="footer", children="Font: Px437 IBM VGA 8x16 by VileR, int10h.org (CC BY-SA 4.0)."),
     ])
 
 

@@ -21,7 +21,7 @@ from msi_picasso.score import CRAT_PPM, ION_PPM, _z, averagine_dist3, term_weigh
 
 NAVY, PURPLE, BLUE, CYAN = "#001050", "#3d0f8f", "#0060c0", "#00a0b0"
 GREEN, YELLOW, ORANGE, RED, GREY = "#4fb020", "#f0b000", "#f08000", "#d82814", "#9aa3b8"
-HEAD, TEXT = "Silkscreen, monospace", "Departure Mono, monospace"
+HEAD = TEXT = "IBM VGA, monospace"
 ION_SCALE = "Viridis"  # as the CLI's figures/
 PAGES = ("overview", "proteins", "peptides", "qc")
 QS = (0.01, 0.05, 0.1)
@@ -37,7 +37,7 @@ TEMPLATE = go.layout.Template(layout=go.Layout(
     legend=dict(bgcolor="rgba(255,255,255,0.8)", bordercolor=NAVY, borderwidth=1)))
 
 GRID_THEME = {"function": "themeQuartz.withParams(" + json.dumps(dict(
-    fontFamily="Departure Mono, monospace", headerFontFamily="Silkscreen, monospace", fontSize=13, headerFontSize=12,
+    fontFamily=TEXT, headerFontFamily=HEAD, fontSize=13, headerFontSize=12,
     foregroundColor=NAVY, headerTextColor="#ffffff", headerBackgroundColor=NAVY, borderColor="#c8d0e0",
     accentColor=ORANGE, selectedRowBackgroundColor="#ffe2b8", rowHoverColor="#e6f6f8", borderRadius=0,
     wrapperBorderRadius=0, spacing=5)) + ")"}
@@ -476,8 +476,9 @@ def mobility_fig(d, pep):
     sw = bool(d["Q"].mob_switch[qi])
     f = _fig(f"Mobilogram: {'switched to component' if sw else 'full window'} (iso r {d['Q'].iso_r[qi]:.2f}); "
              "click a component for its image",
-             xaxis_title="1/K0 (V s / cm²)", yaxis_title="intensity", height=330, legend=LEGEND_TOP,
-             margin=dict(t=80))
+             xaxis_title="1/K0 (V s / cm²)", yaxis_title="intensity", height=360,
+             # long title + one legend entry per component: legend below the axis so they never collide
+             legend=dict(LEGEND_TOP, x=0, xanchor="left", y=-0.3, yanchor="top"), margin=dict(t=60))
     f.add_trace(go.Scatter(x=kb, y=y, mode="lines", name="M", line=dict(color=NAVY, width=2), fill="tozeroy",
                            fillcolor="rgba(0,16,80,0.08)"))
     a = int(np.argmax(y))
